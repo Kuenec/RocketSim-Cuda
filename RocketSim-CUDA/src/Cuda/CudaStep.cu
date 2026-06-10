@@ -24,6 +24,7 @@
 
 #include "CudaStep.h"
 #include "CudaMath.cuh"
+#include "CudaRaycast.cuh"
 #include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
@@ -61,6 +62,12 @@ struct GpuBatch {
 	GpuCarControls* dSchedule;  // [numArenas * numCars * scheduleTicks]
 	int scheduleTicks;
 	uint64_t tickCount;
+
+	// static world geometry (device buffers + descriptor passed to kernels by value)
+	GpuPlane* dPlanes;
+	GpuMeshInfo* dMeshes;
+	GpuVec3* dTris;
+	GpuWorldGeo geo; // holds device pointers
 };
 
 // Capture this CPU's RSQRTSS into the device emulation table; verify the emulation
@@ -107,7 +114,52 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dCars);
 	cudaFree(b->dPads);
 	cudaFree(b->dSchedule);
+	cudaFree(b->dPlanes);
+	cudaFree(b->dMeshes);
+	cudaFree(b->dTris);
 	delete b;
+}
+
+void UploadWorldGeo(GpuBatch* b,
+	const GpuPlane* planes, int numPlanes,
+	const GpuMeshInfo* meshes, int numMeshes,
+	const GpuVec3* tris, int numTris) {
+	CudaCheck(cudaMalloc(&b->dPlanes, sizeof(GpuPlane) * numPlanes), "alloc planes");
+	CudaCheck(cudaMalloc(&b->dMeshes, sizeof(GpuMeshInfo) * numMeshes), "alloc meshes");
+	CudaCheck(cudaMalloc(&b->dTris, sizeof(GpuVec3) * 3 * numTris), "alloc tris");
+	CudaCheck(cudaMemcpy(b->dPlanes, planes, sizeof(GpuPlane) * numPlanes, cudaMemcpyHostToDevice), "upload planes");
+	CudaCheck(cudaMemcpy(b->dMeshes, meshes, sizeof(GpuMeshInfo) * numMeshes, cudaMemcpyHostToDevice), "upload meshes");
+	CudaCheck(cudaMemcpy(b->dTris, tris, sizeof(GpuVec3) * 3 * numTris, cudaMemcpyHostToDevice), "upload tris");
+	b->geo.planes = b->dPlanes;
+	b->geo.numPlanes = numPlanes;
+	b->geo.meshes = b->dMeshes;
+	b->geo.numMeshes = numMeshes;
+	b->geo.meshTris = b->dTris;
+}
+
+__global__ void RayFuzzKernel(GpuWorldGeo geo, const GpuVec3* fromTo, int numRays,
+	int cbGroup, int cbMask, GpuRayFuzzResult* results) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= numRays) return;
+	GpuRayHit hit;
+	CuRayTestStatic(geo, GV(fromTo[i * 2]), GV(fromTo[i * 2 + 1]), cbGroup, cbMask, hit);
+	results[i].hitKind = hit.hitKind;
+	results[i].fraction = hit.fraction;
+	results[i].normal = { hit.normalWorld.x, hit.normalWorld.y, hit.normalWorld.z };
+}
+
+void RunRayFuzz(GpuBatch* b, const GpuVec3* fromTo, int numRays,
+	int cbGroup, int cbMask, GpuRayFuzzResult* results) {
+	GpuVec3* dRays;
+	GpuRayFuzzResult* dRes;
+	CudaCheck(cudaMalloc(&dRays, sizeof(GpuVec3) * 2 * numRays), "alloc rays");
+	CudaCheck(cudaMalloc(&dRes, sizeof(GpuRayFuzzResult) * numRays), "alloc ray results");
+	CudaCheck(cudaMemcpy(dRays, fromTo, sizeof(GpuVec3) * 2 * numRays, cudaMemcpyHostToDevice), "upload rays");
+	RayFuzzKernel<<<(numRays + 127) / 128, 128>>>(b->geo, dRays, numRays, cbGroup, cbMask, dRes);
+	CudaCheck(cudaGetLastError(), "rayfuzz launch");
+	CudaCheck(cudaMemcpy(results, dRes, sizeof(GpuRayFuzzResult) * numRays, cudaMemcpyDeviceToHost), "download ray results");
+	cudaFree(dRays);
+	cudaFree(dRes);
 }
 
 void UploadArenaState(GpuBatch* b, int arenaIdx,

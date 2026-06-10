@@ -23,6 +23,7 @@
 #include "DataStream/DataStreamIn.h"
 #include "DataStream/DataStreamOut.h"
 #include "Profiling.h"
+#include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btStridingMeshInterface.h"
 
 #ifdef RS_CUDA
 #include "Cuda/CudaStep.h"
@@ -91,6 +92,7 @@ struct Args {
 	bool profile = false;           // print per-phase timing breakdown after the run
 	bool gpuStep = false;           // GPU produces the simulation result (monolithic kernel)
 	int gpuCompare = 0;             // lockstep-validate ported GPU phases for N ticks
+	int rayFuzz = 0;                // validate device static raycast vs CPU for N rays
 	std::string trigTable = "glibc_trig_fix.bin"; // libm correction table (see CudaMath.cuh)
 };
 
@@ -135,6 +137,9 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 		} else if (!strcmp(argv[i], "--gpu-compare")) {
 			const char* v = need("--gpu-compare"); if (!v) return false;
 			out.gpuCompare = atoi(v);
+		} else if (!strcmp(argv[i], "--ray-fuzz")) {
+			const char* v = need("--ray-fuzz"); if (!v) return false;
+			out.rayFuzz = atoi(v);
 		} else if (!strcmp(argv[i], "--trig-table")) {
 			const char* v = need("--trig-table"); if (!v) return false;
 			out.trigTable = v;
@@ -477,6 +482,131 @@ static void UploadConsts(rscuda::GpuBatch* batch, Arena* arena, std::vector<CarS
 	rscuda::UploadBodyConsts(batch, consts.data());
 }
 
+// Extract the arena's static collision geometry (mesh triangles + planes, with their
+// broadphase filters) for upload. _worldCollisionRBs is in creation order: meshes
+// first, then planes - same order the device ray test iterates.
+static void ExtractWorldGeo(Arena* arena,
+	std::vector<rscuda::GpuPlane>& planes,
+	std::vector<rscuda::GpuMeshInfo>& meshes,
+	std::vector<rscuda::GpuVec3>& tris) {
+	for (btRigidBody* rb : arena->_worldCollisionRBs) {
+		const btCollisionShape* shape = rb->getCollisionShape();
+		const btBroadphaseProxy* proxy = rb->getBroadphaseProxy();
+		if (shape->getShapeType() == TRIANGLE_MESH_SHAPE_PROXYTYPE) {
+			auto* meshShape = (const btBvhTriangleMeshShape*)shape;
+			const unsigned char* vertBase;
+			int numVerts, vertStride;
+			const unsigned char* idxBase;
+			int idxStride, numFaces;
+			meshShape->getMeshInterface()->getLockedReadOnlyVertexIndexBase(
+				&vertBase, numVerts, vertStride, &idxBase, idxStride, numFaces);
+			rscuda::GpuMeshInfo mi;
+			mi.triStart = (int)(tris.size() / 3);
+			mi.triCount = numFaces;
+			mi.group = proxy->m_collisionFilterGroup;
+			mi.mask = proxy->m_collisionFilterMask;
+			meshes.push_back(mi);
+			for (int f = 0; f < numFaces; f++) {
+				const int* idx = (const int*)(idxBase + (size_t)f * idxStride);
+				for (int c = 0; c < 3; c++) {
+					const float* v = (const float*)(vertBase + (size_t)idx[c] * vertStride);
+					tris.push_back({ v[0], v[1], v[2] });
+				}
+			}
+		} else if (shape->getShapeType() == STATIC_PLANE_PROXYTYPE) {
+			auto* planeShape = (const btStaticPlaneShape*)shape;
+			rscuda::GpuPlane pl;
+			pl.normal = ToGpuB(planeShape->getPlaneNormal());
+			pl.planeConst = planeShape->getPlaneConstant();
+			pl.origin = ToGpuB(rb->getWorldTransform().getOrigin());
+			pl.group = proxy->m_collisionFilterGroup;
+			pl.mask = proxy->m_collisionFilterMask;
+			planes.push_back(pl);
+		}
+	}
+}
+
+// ---- static-world raycast validation (--ray-fuzz N) ----
+// Random rays through the arena volume; CPU bullet rayTest (filtered to statics) vs
+// the device CuRayTestStatic, bitwise.
+static int RunRayFuzz(const Args& args, int numRays) {
+	std::vector<CarSlot> slots;
+	Arena* arena = SetupArena(args, 0, slots);
+
+	std::vector<rscuda::GpuPlane> planes;
+	std::vector<rscuda::GpuMeshInfo> meshes;
+	std::vector<rscuda::GpuVec3> tris;
+	ExtractWorldGeo(arena, planes, meshes, tris);
+	printf("RAY_FUZZ: world geo: %zu planes, %zu meshes, %zu tris\n",
+		planes.size(), meshes.size(), tris.size() / 3);
+
+	rscuda::GpuBatch* batch = rscuda::CreateBatch(1, args.cars, (int)arena->GetBoostPads().size());
+	rscuda::UploadWorldGeo(batch, planes.data(), (int)planes.size(),
+		meshes.data(), (int)meshes.size(), tris.data(), (int)(tris.size() / 3));
+
+	Rng rng(MixSeed(args.seed, 0x52A1ull));
+	std::vector<rscuda::GpuVec3> fromTo((size_t)numRays * 2);
+	for (int i = 0; i < numRays; i++) {
+		// positions across the arena volume (BT units; arena ~ +-82 x +-102 x 0..41)
+		float x = rng.NextSigned() * 90.0f;
+		float y = rng.NextSigned() * 110.0f;
+		float z = (rng.NextSigned() * 0.5f + 0.5f) * 45.0f;
+		// direction: downward-biased (suspension-like) or fully random; varied length
+		float dx = rng.NextSigned(), dy = rng.NextSigned();
+		float dz = (rng.Next() % 4 == 0) ? rng.NextSigned() : -(float)(rng.Next() % 1025) / 1024.0f;
+		float len = 0.25f + (float)(rng.Next() % 1025) / 1024.0f * ((rng.Next() % 8 == 0) ? 40.0f : 2.0f);
+		fromTo[i * 2] = { x, y, z };
+		fromTo[i * 2 + 1] = { x + dx * len, y + dy * len, z + dz * len };
+	}
+
+	std::vector<rscuda::GpuRayFuzzResult> gpuRes(numRays);
+	rscuda::RunRayFuzz(batch, fromTo.data(), numRays, btBroadphaseProxy::DefaultFilter,
+		btBroadphaseProxy::StaticFilter, gpuRes.data());
+
+	int bad = 0;
+	for (int i = 0; i < numRays; i++) {
+		btVector3 from(fromTo[i * 2].x, fromTo[i * 2].y, fromTo[i * 2].z);
+		btVector3 to(fromTo[i * 2 + 1].x, fromTo[i * 2 + 1].y, fromTo[i * 2 + 1].z);
+		btCollisionWorld::ClosestRayResultCallback cb(from, to, nullptr);
+		cb.m_collisionFilterMask = btBroadphaseProxy::StaticFilter; // statics only
+		arena->_bulletWorld.rayTest(from, to, cb);
+
+		bool cpuHit = cb.hasHit();
+		bool gpuHit = gpuRes[i].hitKind >= 0;
+		uint32_t cf, gf;
+		memcpy(&cf, &cb.m_closestHitFraction, 4);
+		memcpy(&gf, &gpuRes[i].fraction, 4);
+		bool fracOk = !cpuHit || cf == gf;
+		bool normOk = true;
+		if (cpuHit && gpuHit) {
+			float cn[3] = { cb.m_hitNormalWorld.x(), cb.m_hitNormalWorld.y(), cb.m_hitNormalWorld.z() };
+			float gn[3] = { gpuRes[i].normal.x, gpuRes[i].normal.y, gpuRes[i].normal.z };
+			normOk = memcmp(cn, gn, 12) == 0;
+		}
+		if (cpuHit != gpuHit || !fracOk || !normOk) {
+			if (bad < 5) {
+				int cpuShapeType = cpuHit ? cb.m_collisionObject->getCollisionShape()->getShapeType() : -1;
+				printf("RAY_FUZZ: MISMATCH ray %d from(%g,%g,%g) to(%g,%g,%g): "
+					"cpuHit=%d gpuHit=%d cpuFrac=0x%08X gpuFrac=0x%08X cpuShape=%d\n"
+					"  cpuN(%.9g,%.9g,%.9g) gpuN(%.9g,%.9g,%.9g)\n",
+					i, from.x(), from.y(), from.z(), to.x(), to.y(), to.z(),
+					cpuHit, gpuHit, cf, gf, cpuShapeType,
+					cb.m_hitNormalWorld.x(), cb.m_hitNormalWorld.y(), cb.m_hitNormalWorld.z(),
+					gpuRes[i].normal.x, gpuRes[i].normal.y, gpuRes[i].normal.z);
+			}
+			bad++;
+		}
+	}
+	rscuda::DestroyBatch(batch);
+	delete arena;
+	if (bad) {
+		printf("RAY_FUZZ: FAIL (%d/%d rays differ)\n", bad, numRays);
+		return 1;
+	}
+	printf("RAY_FUZZ: PASS (%d rays bit-exact: hit/fraction/normal)\n", numRays);
+	return 0;
+}
+
 // ---- lockstep phase validation (--gpu-compare N) ----
 // Per tick: run the CPU step with capture enabled, then for each ported phase upload
 // the CPU pre-phase state, run JUST that phase on the GPU, and bit-compare the result
@@ -708,6 +838,14 @@ int main(int argc, char** argv) {
 		return RunGpuCompare(args);
 #else
 		fprintf(stderr, "GPU_COMPARE: FAIL (built without CUDA toolkit)\n");
+		return 2;
+#endif
+	}
+	if (args.rayFuzz > 0) {
+#ifdef RS_CUDA
+		return RunRayFuzz(args, args.rayFuzz);
+#else
+		fprintf(stderr, "RAY_FUZZ: FAIL (built without CUDA toolkit)\n");
 		return 2;
 #endif
 	}

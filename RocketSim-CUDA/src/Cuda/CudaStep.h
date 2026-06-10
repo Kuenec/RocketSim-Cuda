@@ -23,6 +23,22 @@ void UploadArenaState(GpuBatch* batch, int arenaIdx,
 // Per-body-slot constants (shared by all arenas), uploaded once after CreateBatch
 void UploadBodyConsts(GpuBatch* batch, const GpuBodyConsts* consts);
 
+// Static world geometry (identical for all arenas), uploaded once. Tris are 3 verts
+// per triangle, mesh-relative indexing via GpuMeshInfo::triStart.
+void UploadWorldGeo(GpuBatch* batch,
+	const GpuPlane* planes, int numPlanes,
+	const GpuMeshInfo* meshes, int numMeshes,
+	const GpuVec3* tris, int numTris);
+
+// Diagnostic: closest-hit static-world raycast for ray-fuzz validation vs CPU rayTest.
+struct GpuRayFuzzResult {
+	int hitKind;       // -1 = none, 0 = static
+	float fraction;
+	GpuVec3 normal;
+};
+void RunRayFuzz(GpuBatch* batch, const GpuVec3* fromTo /*2 per ray*/, int numRays,
+	int cbGroup, int cbMask, GpuRayFuzzResult* results);
+
 // Load the glibc trig correction table (see CudaMath.cuh). Must be called before any
 // stepping; returns false if the file is missing/corrupt.
 bool LoadTrigFix(const char* path);

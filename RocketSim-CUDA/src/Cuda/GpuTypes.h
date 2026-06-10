@@ -119,4 +119,19 @@ struct GpuPadState {
 	int32_t lockedCarIdx;           // -1 = none (mirrors BoostPadState::curLockedCar)
 };
 
+// ---- Static world geometry (host-extracted from the arena's bullet world) ----
+
+struct GpuPlane {
+	GpuVec3 normal;     // shape normal (unit)
+	float planeConst;   // shape plane constant (0 for RocketSim arenas)
+	GpuVec3 origin;     // object world transform origin (basis = identity)
+	int group, mask;    // broadphase proxy filters
+};
+
+struct GpuMeshInfo {
+	int triStart;       // first triangle index in the tri vertex buffer
+	int triCount;
+	int group, mask;
+};
+
 } // namespace rscuda
