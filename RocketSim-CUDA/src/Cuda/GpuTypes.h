@@ -46,17 +46,20 @@ struct GpuBodyConsts {
 	float linSleepThreshSq;  // m_linearSleepingThreshold^2 (host-precomputed product)
 	float angSleepThreshSq;
 	uint8_t noRot;           // btRigidBody::m_noRot (RocketSim extension)
+	GpuVec3 gravityForce;    // btRigidBody m_gravity (FORCE = acceleration * mass)
 };
 
 // Phase IDs for the monolithic kernel, in CPU reference order within a tick.
 // Dev-only phase windows let --gpu-compare validate one phase at a time; production
 // runs the full range.
 enum GpuPhase : int {
-	GPU_PHASE_PREDICT = 0,    // btDiscreteDynamicsWorld::predictUnconstraintMotion
-	GPU_PHASE_COLLISION = 1,  // performDiscreteCollisionDetection (not ported yet)
-	GPU_PHASE_SOLVE = 2,      // islands + solveConstraints (not ported yet)
-	GPU_PHASE_INTEGRATE = 3,  // integrateTransforms
-	GPU_PHASE_ACTIVATION = 4, // updateActivationState
+	GPU_PHASE_GAME_PRE = 0,   // ball sleep check + car pre-ticks + pad pre + applyGravity
+	GPU_PHASE_PREDICT = 1,    // btDiscreteDynamicsWorld::predictUnconstraintMotion
+	GPU_PHASE_COLLISION = 2,  // performDiscreteCollisionDetection
+	GPU_PHASE_SOLVE = 3,      // islands + solveConstraints
+	GPU_PHASE_INTEGRATE = 4,  // integrateTransforms
+	GPU_PHASE_ACTIVATION = 5, // updateActivationState
+	GPU_PHASE_GAME_POST = 6,  // clearForces + car post/finish + pads + ball finish
 	GPU_PHASE_COUNT
 };
 
@@ -339,6 +342,29 @@ struct GpuManifoldOut {
 // Ball game state touched by collision callbacks (soccar scope)
 struct GpuBallGameState {
 	GpuVec3 velocityImpulseCache;  // Ball::_velocityImpulseCache (BT units)
+};
+
+// Boost pad constants (pad order = arena _boostPads order, identical all arenas)
+struct GpuPadConfig {
+	GpuVec3 posBT;             // BoostPad::_posBT
+	GpuVec3 boxMinBT, boxMaxBT;
+	float cylRadBT;            // (CYL_RAD_BIG/SMALL) * UU_TO_BT
+	uint8_t isBig;
+};
+
+// Game-tail constants (Arena::Step phases outside bullet; shared by all arenas)
+struct GpuTailConsts {
+	float supersonicStartSpeed, supersonicMaintainMinSpeed, supersonicMaintainMaxTime;
+	float carMaxSpeedBT, carMaxAngSpeed;
+	float ballMaxSpeedBT, ballMaxAngSpeed;
+	float boostMax, boostAmountBig, boostAmountSmall;
+	float padCooldownBig, padCooldownSmall;
+	// BoostPadGrid (soccar: 8x10 cells)
+	float padGridExtentZ;
+	int padGridCellSizeX, padGridCellSizeY; // int consts (float division by int on CPU)
+	int padGridCellsX, padGridCellsY;
+	int16_t padGridMap[8 * 10];             // [ix * cellsY + iy] -> pad index or -1
+	float cylHeightBT;                       // CYL_HEIGHT * UU_TO_BT
 };
 
 // Constants for the collide phase (shared by all arenas)

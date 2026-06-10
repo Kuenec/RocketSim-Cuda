@@ -520,7 +520,10 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 			CuMat3 dynBasis = CuLoadBasis(ds.basis);
 			CuVec3 dynPos = GV(ds.pos);
 
-			CuContactBodyInfo staticInfo = { ident, zero, so.friction, so.restitution, true, -1 };
+			// static body world transform: meshes sit at the origin, planes carry
+			// their position in the rigid body origin (basis always identity)
+			CuVec3 staticOrigin = so.kind == 1 ? GV(in.geo.planes[so.shapeIdx].origin) : zero;
+			CuContactBodyInfo staticInfo = { ident, staticOrigin, so.friction, so.restitution, true, -1 };
 			float dynBreaking = d == 0 ? in.cc.ballBreakingThreshold : in.cc.carBreakingThreshold;
 			float breaking = dynBreaking < so.breakingThreshold ? dynBreaking : so.breakingThreshold;
 
@@ -620,8 +623,15 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 							  in.cc.carBoxHalfExtNoMargin.z + in.cc.carBoxMargin } };
 						CuVec3 nrm, pt;
 						float dist;
-						if (CuConvexPlaneCollide(box, childBasis, childOrigin, GV(pl.normal),
-								pl.planeConst, ident, GV(pl.origin), breaking, nrm, pt, dist)) {
+						bool hit = CuConvexPlaneCollide(box, childBasis, childOrigin, GV(pl.normal),
+							pl.planeConst, ident, GV(pl.origin), breaking, nrm, pt, dist);
+						if (in.debug) { // TEMP diagnostic: last car-plane attempt
+							in.debug[120] = h0;
+							in.debug[121] = hit ? 1 : 0;
+							in.debug[122] = __float_as_int(dist);
+							in.debug[123] = __float_as_int(breaking);
+						}
+						if (hit) {
 							// result A ids unset (-1,-1); B ids set by ProcessChildShape (-1, 0)
 							int idx = CuAddContactPoint(m, staticInfo, carInfo, true,
 								nrm, pt, dist, -1, -1, -1, 0);

@@ -97,6 +97,8 @@ struct Args {
 	int gpuCompare = 0;             // lockstep-validate ported GPU phases for N ticks
 	int rayFuzz = 0;                // validate device static raycast vs CPU for N rays
 	int manifoldDump = 0;           // diagnostic: print CPU collision manifolds for N ticks
+	int arenaOffset = 0;            // diagnostic: arena index offset (reproduce arena K standalone)
+	bool noBallMotion = false;      // diagnostic: skip the gpu-compare ball-motion injection
 	std::string trigTable = "glibc_trig_fix.bin"; // libm correction table (see CudaMath.cuh)
 };
 
@@ -147,6 +149,11 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 		} else if (!strcmp(argv[i], "--manifold-dump")) {
 			const char* v = need("--manifold-dump"); if (!v) return false;
 			out.manifoldDump = atoi(v);
+		} else if (!strcmp(argv[i], "--arena-offset")) {
+			const char* v = need("--arena-offset"); if (!v) return false;
+			out.arenaOffset = atoi(v);
+		} else if (!strcmp(argv[i], "--no-ball-motion")) {
+			out.noBallMotion = true;
 		} else if (!strcmp(argv[i], "--trig-table")) {
 			const char* v = need("--trig-table"); if (!v) return false;
 			out.trigTable = v;
@@ -231,7 +238,8 @@ static void UpdateControls(CarSlot& slot) {
 static constexpr float HALF_PI = 1.5707963267948966f;
 
 // Identical arena/car setup for CPU and GPU paths - this is state initialization, not physics.
-static Arena* SetupArena(const Args& args, int arenaIdx, std::vector<CarSlot>& slots) {
+static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>& slots) {
+	int arenaIdx = arenaIdxIn + args.arenaOffset;
 	Arena* arena = Arena::Create(GameMode::SOCCAR);
 
 	// Demos disabled: upstream demo respawn is wall-clock-seeded (see header comment)
@@ -383,6 +391,8 @@ static rscuda::GpuBodyConsts MakeBodyConsts(const btRigidBody& rb, float dt) {
 	c.linSleepThreshSq = rb.getLinearSleepingThreshold() * rb.getLinearSleepingThreshold();
 	c.angSleepThreshSq = rb.getAngularSleepingThreshold() * rb.getAngularSleepingThreshold();
 	c.noRot = rb.m_noRot;
+	// btRigidBody::setGravity: m_gravity (force) = acceleration * (1/invMass)
+	c.gravityForce = ToGpuB(rb.getGravity() * (1.0f / rb.getInvMass()));
 	return c;
 }
 
@@ -432,6 +442,16 @@ static void SnapshotCar(Car* car, rscuda::GpuBodyState& body, rscuda::GpuCarGame
 	g.velocityImpulseCache = ToGpu(car->_velocityImpulseCache);
 	g.carID = car->id;
 	g.team = (uint8_t)car->team;
+	for (int w = 0; w < 4; w++) {
+		const btWheelInfoRL& wi = car->_bulletVehicle.m_wheelInfo[w];
+		g.wheels[w].steerAngle = wi.m_steerAngle;
+		g.wheels[w].engineForce = wi.m_engineForce;
+		g.wheels[w].brake = wi.m_brake;
+		g.wheels[w].latFriction = wi.m_latFriction;
+		g.wheels[w].longFriction = wi.m_longFriction;
+		g.wheels[w].suspensionLength = wi.m_raycastInfo.m_suspensionLength;
+		g.wheels[w].extraPushback = wi.m_extraPushback;
+	}
 }
 
 static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscuda::GpuCarGameState& g) {
@@ -1014,8 +1034,8 @@ static int RunGpuCompare(const Args& args) {
 	const int numPads = (int)arena->GetBoostPads().size();
 	const int numBodies = 1 + args.cars;
 
-	{ // wake the ball with seed-derived motion so collision compare covers
-	  // ball-world and car-ball contacts (kickoff ball is asleep -> no manifolds)
+	if (!args.noBallMotion) { // wake the ball with seed-derived motion so collision compare
+	  // covers ball-world and car-ball contacts (kickoff ball is asleep -> no manifolds)
 		BallState bs = arena->ball->GetState();
 		Rng rng(MixSeed(args.seed, 0xBA11BA11ull));
 		bs.vel = Vec(rng.NextSigned() * 1000.f, rng.NextSigned() * 1000.f,
@@ -1450,6 +1470,11 @@ static int RunGpuCompare(const Args& args) {
 						rscuda::DownloadCollideDebug(batch, 0, dbg2);
 						printf("  gpu last car-mesh walk: handle %d leaves %d triAabbPass %d contactsAdded %d\n",
 							dbg2[110], dbg2[111], dbg2[112], dbg2[113]);
+						float dd, bb2;
+						memcpy(&dd, &dbg2[122], 4);
+						memcpy(&bb2, &dbg2[123], 4);
+						printf("  gpu last car-plane: handle %d hit %d dist %.9g breaking %.9g\n",
+							dbg2[120], dbg2[121], dd, bb2);
 					}
 					bad = true;
 					break;
@@ -1584,6 +1609,83 @@ static int RunGpuCompare(const Args& args) {
 	return 0;
 }
 
+// Game-tail constants + pad configs + dyn shape templates for the full GPU step
+static void ExtractTailData(Arena* arena, std::vector<CarSlot>& slots,
+	rscuda::GpuTailConsts& tc, std::vector<rscuda::GpuPadConfig>& padConfigs,
+	std::vector<rscuda::GpuDynBody>& dynTemplates) {
+	using namespace RLConst;
+	tc = {};
+	tc.supersonicStartSpeed = SUPERSONIC_START_SPEED;
+	tc.supersonicMaintainMinSpeed = SUPERSONIC_MAINTAIN_MIN_SPEED;
+	tc.supersonicMaintainMaxTime = SUPERSONIC_MAINTAIN_MAX_TIME;
+	tc.carMaxSpeedBT = CAR_MAX_SPEED * UU_TO_BT;
+	tc.carMaxAngSpeed = CAR_MAX_ANG_SPEED;
+	const MutatorConfig& mc = arena->GetMutatorConfig();
+	tc.ballMaxSpeedBT = mc.ballMaxSpeed * UU_TO_BT;
+	tc.ballMaxAngSpeed = BALL_MAX_ANG_SPEED;
+	tc.boostMax = BOOST_MAX;
+	tc.boostAmountBig = BoostPads::BOOST_AMOUNT_BIG;
+	tc.boostAmountSmall = BoostPads::BOOST_AMOUNT_SMALL;
+	tc.padCooldownBig = mc.boostPadCooldown_Big;
+	tc.padCooldownSmall = mc.boostPadCooldown_Small;
+	tc.padGridExtentZ = BoostPadGrid::EXTENT_Z;
+	tc.padGridCellSizeX = BoostPadGrid::CELL_SIZE_X;
+	tc.padGridCellSizeY = BoostPadGrid::CELL_SIZE_Y;
+	tc.padGridCellsX = BoostPadGrid::CELLS_X;
+	tc.padGridCellsY = BoostPadGrid::CELLS_Y;
+	tc.cylHeightBT = BoostPads::CYL_HEIGHT * UU_TO_BT;
+
+	const auto& padList = arena->GetBoostPads();
+	for (BoostPad* pad : padList) {
+		rscuda::GpuPadConfig pc = {};
+		pc.posBT = ToGpu(pad->_posBT);
+		pc.boxMinBT = ToGpu(pad->_boxMinBT);
+		pc.boxMaxBT = ToGpu(pad->_boxMaxBT);
+		pc.cylRadBT = (pad->config.isBig ? BoostPads::CYL_RAD_BIG : BoostPads::CYL_RAD_SMALL) * UU_TO_BT;
+		pc.isBig = pad->config.isBig;
+		padConfigs.push_back(pc);
+	}
+	for (int i = 0; i < BoostPadGrid::CELLS_X; i++) {
+		for (int j = 0; j < BoostPadGrid::CELLS_Y; j++) {
+			BoostPad* p = arena->_boostPadGrid.pads[i][j];
+			int idx = -1;
+			if (p)
+				for (size_t k = 0; k < padList.size(); k++)
+					if (padList[k] == p) { idx = (int)k; break; }
+			tc.padGridMap[i * BoostPadGrid::CELLS_Y + j] = (int16_t)idx;
+		}
+	}
+
+	{ // dyn shape/filter templates (transforms filled per tick on device)
+		rscuda::GpuDynBody t = {};
+		btRigidBody& rb = arena->ball->_rigidBody;
+		t.kind = 1;
+		t.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		t.group = rb.getBroadphaseProxy()->m_collisionFilterGroup;
+		t.mask = rb.getBroadphaseProxy()->m_collisionFilterMask;
+		t.invMass = rb.getInvMass();
+		t.invInertiaDiagLocal = ToGpuB(rb.getInvInertiaDiagLocal());
+		t.hasContactResponse = rb.hasContactResponse();
+		dynTemplates.push_back(t);
+		for (CarSlot& slot : slots) {
+			rscuda::GpuDynBody c = {};
+			btRigidBody& crb = slot.car->_rigidBody;
+			c.kind = 2;
+			const btBoxShape& box = slot.car->_childHitboxShape;
+			btVector3 he = box.getHalfExtentsWithoutMargin();
+			float m = box.getMargin();
+			c.boxHalfExtWithMargin = { he.x() + m, he.y() + m, he.z() + m };
+			c.childOffset = ToGpuB(slot.car->_compoundShape.getChildTransform(0).getOrigin());
+			c.group = crb.getBroadphaseProxy()->m_collisionFilterGroup;
+			c.mask = crb.getBroadphaseProxy()->m_collisionFilterMask;
+			c.invMass = crb.getInvMass();
+			c.invInertiaDiagLocal = ToGpuB(crb.getInvInertiaDiagLocal());
+			c.hasContactResponse = crb.hasContactResponse();
+			dynTemplates.push_back(c);
+		}
+	}
+}
+
 static uint64_t RunGpu(const Args& args, double& elapsedS) {
 	if (!rscuda::Available()) {
 		fprintf(stderr, "GPU_STEP: FAIL (no usable CUDA device)\n");
@@ -1600,6 +1702,76 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 	rscuda::GpuBatch* batch = rscuda::CreateBatch(args.arenas, args.cars, numPads);
 	RequireTrigTable(args);
 	UploadConsts(batch, arenas[0], slotsPerArena[0]);
+	rscuda::UploadCarConsts(batch, ExtractCarConsts(arenas[0], slotsPerArena[0][0].car));
+
+	// world geometry + collision orchestration data (identical across arenas).
+	// updateAabbs() first: statics reach their steady-state proxy aabbs/cell smear.
+	for (int a = 0; a < args.arenas; a++)
+		arenas[a]->_bulletWorld.updateAabbs();
+	{
+		std::vector<rscuda::GpuPlane> planes;
+		std::vector<rscuda::GpuMeshInfo> meshes;
+		std::vector<rscuda::GpuVec3> tris;
+		ExtractWorldGeo(arenas[0], planes, meshes, tris);
+		rscuda::UploadWorldGeo(batch, planes.data(), (int)planes.size(),
+			meshes.data(), (int)meshes.size(), tris.data(), (int)(tris.size() / 3));
+		std::vector<rscuda::GpuMeshBvh> bvhs;
+		std::vector<rscuda::GpuBvhNode> bvhNodes;
+		std::vector<rscuda::GpuBvhSubtree> bvhSubtrees;
+		std::vector<rscuda::GpuTriInfo> triInfos;
+		std::vector<float> meshMargins;
+		ExtractMeshBvhs(arenas[0], bvhs, bvhNodes, bvhSubtrees, triInfos, meshMargins);
+		rscuda::UploadMeshBvhs(batch, bvhs.data(), (int)bvhs.size(),
+			bvhNodes.data(), (int)bvhNodes.size(),
+			bvhSubtrees.data(), (int)bvhSubtrees.size(),
+			triInfos.data(), (int)triInfos.size(), meshMargins.data());
+
+		rscuda::GpuGridParams grid = {};
+		auto* bp = (btRSBroadphase*)arenas[0]->_bulletWorldParams.broadphase;
+		grid.minPos = ToGpuB(bp->minPos);
+		grid.cellSize = bp->cellSize;
+		grid.cellSizeSq = bp->cellSizeSq;
+		grid.cellsX = bp->cellsX;
+		grid.cellsY = bp->cellsY;
+		grid.cellsZ = bp->cellsZ;
+		rscuda::GpuCollideConsts ccons;
+		std::vector<rscuda::GpuStaticObj> statics;
+		std::vector<int> cellStart, cellList;
+		std::vector<rscuda::GpuDynProxy> proxies0;
+		int regCounter0 = 0;
+		ExtractCollideData(arenas[0], slotsPerArena[0], ccons, statics, cellStart, cellList,
+			proxies0, regCounter0);
+		rscuda::UploadCollideData(batch, ccons, statics.data(), (int)statics.size(),
+			cellStart.data(), (int)cellStart.size() - 1,
+			cellList.data(), (int)cellList.size(), grid);
+
+		rscuda::GpuTailConsts tc;
+		std::vector<rscuda::GpuPadConfig> padConfigs;
+		std::vector<rscuda::GpuDynBody> dynTemplates;
+		ExtractTailData(arenas[0], slotsPerArena[0], tc, padConfigs, dynTemplates);
+		rscuda::UploadTailData(batch, tc, padConfigs.data(), numPads, dynTemplates.data());
+	}
+	// per-arena: dyn proxies, ball game state, car iteration order (_cars set order)
+	for (int a = 0; a < args.arenas; a++) {
+		rscuda::GpuCollideConsts ccUnused;
+		std::vector<rscuda::GpuStaticObj> sUnused;
+		std::vector<int> aUnused, bUnused;
+		std::vector<rscuda::GpuDynProxy> proxies;
+		int regCounter = 0;
+		ExtractCollideData(arenas[a], slotsPerArena[a], ccUnused, sUnused, aUnused, bUnused,
+			proxies, regCounter);
+		rscuda::UploadDynProxies(batch, a, proxies.data(), regCounter);
+		rscuda::GpuBallGameState bs = {};
+		bs.velocityImpulseCache = ToGpu(arenas[a]->ball->_velocityImpulseCache);
+		rscuda::UploadBallState(batch, a, bs);
+		std::vector<int> order;
+		for (Car* car : arenas[a]->_cars)
+			for (int c = 0; c < args.cars; c++)
+				if (slotsPerArena[a][c].car == car)
+					order.push_back(c);
+		rscuda::UploadCarOrder(batch, a, order.data());
+	}
+	rscuda::SetTickCount(batch, 0);
 
 	// Precompute the full control schedule (identical Rng sequence to the CPU path)
 	std::vector<rscuda::GpuCarControls> schedule((size_t)args.arenas * args.cars * args.ticks);
@@ -1664,6 +1836,10 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 			ps.curLockedCar = (pads[p].lockedCarIdx >= 0) ? slotsPerArena[a][pads[p].lockedCarIdx].car : nullptr;
 			padList[p]->SetState(ps);
 		}
+		rscuda::GpuBallGameState bs;
+		rscuda::DownloadBallState(batch, a, &bs);
+		arenas[a]->ball->_velocityImpulseCache = FromGpu(bs.velocityImpulseCache);
+		arenas[a]->ball->_internalState.tickCountSinceUpdate += args.ticks;
 		arenas[a]->tickCount += args.ticks;
 	}
 

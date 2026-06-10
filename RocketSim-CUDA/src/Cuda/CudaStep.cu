@@ -29,6 +29,7 @@
 #include "CudaCollision.cuh"
 #include "CudaCollideWorld.cuh"
 #include "CudaSolver.cuh"
+#include "CudaGameTail.cuh"
 #include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
@@ -100,6 +101,13 @@ struct GpuBatch {
 	int* dNumPairs;               // [numArenas]
 	CuSolveCtx* dSolveScratch;    // [numArenas] (too large for device stack)
 	bool hasCollideData;
+
+	// game-tail data (full-step mode)
+	GpuTailConsts* dTailConsts;
+	GpuPadConfig* dPadConfigs;
+	GpuDynBody* dDynTemplates;    // [bodiesPerArena] shape/filter templates
+	int* dCarOrder;               // [numArenas * numCars] CPU _cars iteration order
+	bool hasTailData;
 };
 #define COLLIDE_DEBUG_INTS (2 * 96 + 1)
 
@@ -186,6 +194,10 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dPairs);
 	cudaFree(b->dNumPairs);
 	cudaFree(b->dSolveScratch);
+	cudaFree(b->dTailConsts);
+	cudaFree(b->dPadConfigs);
+	cudaFree(b->dDynTemplates);
+	cudaFree(b->dCarOrder);
 	delete b;
 }
 
@@ -237,8 +249,31 @@ void UploadBallState(GpuBatch* b, int arenaIdx, const GpuBallGameState& state) {
 		cudaMemcpyHostToDevice), "up ball state");
 }
 
+void DownloadBallState(GpuBatch* b, int arenaIdx, GpuBallGameState* state) {
+	CudaCheck(cudaMemcpy(state, b->dBallStates + arenaIdx, sizeof(GpuBallGameState),
+		cudaMemcpyDeviceToHost), "down ball state");
+}
+
 void SetTickCount(GpuBatch* b, uint64_t tickCount) {
 	b->tickCount = tickCount;
+}
+
+void UploadTailData(GpuBatch* b, const GpuTailConsts& consts,
+	const GpuPadConfig* padConfigs, int numPads,
+	const GpuDynBody* dynTemplates) {
+	CudaCheck(cudaMalloc(&b->dTailConsts, sizeof(GpuTailConsts)), "alloc tail consts");
+	CudaCheck(cudaMalloc(&b->dPadConfigs, sizeof(GpuPadConfig) * numPads), "alloc pad configs");
+	CudaCheck(cudaMalloc(&b->dDynTemplates, sizeof(GpuDynBody) * b->bodiesPerArena), "alloc dyn templates");
+	CudaCheck(cudaMalloc(&b->dCarOrder, sizeof(int) * b->numArenas * b->numCars), "alloc car order");
+	CudaCheck(cudaMemcpy(b->dTailConsts, &consts, sizeof(GpuTailConsts), cudaMemcpyHostToDevice), "up tail consts");
+	CudaCheck(cudaMemcpy(b->dPadConfigs, padConfigs, sizeof(GpuPadConfig) * numPads, cudaMemcpyHostToDevice), "up pad configs");
+	CudaCheck(cudaMemcpy(b->dDynTemplates, dynTemplates, sizeof(GpuDynBody) * b->bodiesPerArena, cudaMemcpyHostToDevice), "up dyn templates");
+	b->hasTailData = true;
+}
+
+void UploadCarOrder(GpuBatch* b, int arenaIdx, const int* order) {
+	CudaCheck(cudaMemcpy(b->dCarOrder + (size_t)arenaIdx * b->numCars, order,
+		sizeof(int) * b->numCars, cudaMemcpyHostToDevice), "up car order");
 }
 
 void DownloadCollideResults(GpuBatch* b, int arenaIdx,
@@ -578,6 +613,13 @@ struct GpuCollideKernelArgs {
 	int* numPairs;                   // [numArenas]
 	CuSolveCtx* solveScratch;        // [numArenas]
 	uint64_t tickBase;
+	// game-tail (full-step mode)
+	int tailEnabled;
+	const GpuTailConsts* tail;
+	const GpuPadConfig* padConfigs;
+	const GpuDynBody* dynTemplates;  // [bodiesPerArena]
+	const int* carOrder;             // [numArenas * numCars]
+	const GpuCarConsts* carConsts;
 };
 
 __device__ static void StoreVec(GpuVec3& dst, CuVec3 v) { dst = { v.x, v.y, v.z }; }
@@ -615,7 +657,7 @@ __device__ static void EmitManifoldsOut(const CuManifold* src, int n, GpuManifol
 __global__ void GpuStepArenasKernel(
 	GpuBodyState* bodies, const GpuBodyConsts* consts,
 	GpuCarGameState* cars, GpuPadState* pads,
-	const GpuCarControls* schedule,
+	const GpuCarControls* schedule, int scheduleTicks,
 	int numCars, int numPads, int numTicks,
 	int startPhase, int endPhase, float dt,
 	GpuWorldGeo geo, GpuCollideKernelArgs ca) {
@@ -627,10 +669,92 @@ __global__ void GpuStepArenasKernel(
 	GpuBodyState* arenaBodies = bodies + (size_t)arenaIdx * bodiesPerArena;
 	GpuCarGameState* arenaCars = cars + (size_t)arenaIdx * numCars;
 	GpuPadState* arenaPads = pads + (size_t)arenaIdx * numPads;
-	(void)arenaPads; (void)schedule;
 
 	for (int tick = 0; tick < numTicks; tick++) {
-		// Phases 1-4 (game pre-tick) land here.
+		if (ca.tailEnabled && startPhase <= GPU_PHASE_GAME_PRE && GPU_PHASE_GAME_PRE <= endPhase) {
+			if (bodyIdx == 0) {
+				uint64_t tickCount = ca.tickBase + tick;
+				// Arena::Step head: ball zero-vel sleeping
+				CuBallSleepCheck(arenaBodies[0]);
+				// car pre-ticks, in the CPU's _cars iteration order; each car sees
+				// the previous cars' post-pre-tick state (live body reads)
+				for (int oc = 0; oc < numCars; oc++) {
+					int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
+					GpuCarGameState& cst = arenaCars[ci];
+					// bench sets car->controls from the schedule before each tick
+					GpuCarControls ctrl = schedule[
+						((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
+					CuCarTickIO io;
+					{
+						const GpuBodyState& s = arenaBodies[1 + ci];
+						io.body.basis = CuLoadBasis(s.basis);
+						io.body.origin = GV(s.pos);
+						io.body.linVel = GV(s.linVel);
+						io.body.angVel = GV(s.angVel);
+						io.body.invInertiaWorld = CuLoadBasis(s.invInertiaWorld);
+						io.body.invInertiaDiagLocal = GV(consts[1 + ci].invInertiaLocal);
+						io.body.invMass = consts[1 + ci].invMass;
+						io.totalForce = GV(s.totalForce);
+						io.totalTorque = GV(s.totalTorque);
+					}
+					io.st = cst;
+					for (int w = 0; w < 4; w++)
+						io.wheels[w] = cst.wheels[w];
+					io.controls = ctrl;
+					// solverInfo.m_timeStep: 1/60 ctor default until the first
+					// bullet step assigns the tick time
+					io.solverTimeStep = tickCount == 0 ? (1.0f / 60.0f) : dt;
+
+					// live dyn-body table (templates + current state + proxy aabbMin)
+					GpuDynBody dyn[8];
+					CuBodyDyn dynBodies[8];
+					for (int d = 0; d < bodiesPerArena && d < 8; d++) {
+						dyn[d] = ca.dynTemplates[d];
+						const GpuBodyState& s = arenaBodies[d];
+						dyn[d].basis = s.basis;
+						dyn[d].origin = s.pos;
+						dyn[d].linVel = s.linVel;
+						dyn[d].angVel = s.angVel;
+						dyn[d].invInertiaWorld = s.invInertiaWorld;
+						dyn[d].aabbMin = ca.proxies[(size_t)arenaIdx * bodiesPerArena + d].aabbMin;
+						dynBodies[d] = DynToBody(dyn[d]);
+					}
+					CuWheelScratch W[4];
+					float dbgFwd;
+					CuCarPreTick(io, *ca.carConsts, geo, ca.grid, dyn, bodiesPerArena,
+						1 + ci, dynBodies, dt, W, &dbgFwd);
+					// write back chassis + game state + wheels
+					{
+						GpuBodyState& s = arenaBodies[1 + ci];
+						for (int r = 0; r < 3; r++)
+							s.basis.row[r] = { io.body.basis.r[r].x, io.body.basis.r[r].y, io.body.basis.r[r].z };
+						s.pos = { io.body.origin.x, io.body.origin.y, io.body.origin.z };
+						s.linVel = { io.body.linVel.x, io.body.linVel.y, io.body.linVel.z };
+						s.angVel = { io.body.angVel.x, io.body.angVel.y, io.body.angVel.z };
+						s.totalForce = { io.totalForce.x, io.totalForce.y, io.totalForce.z };
+						s.totalTorque = { io.totalTorque.x, io.totalTorque.y, io.totalTorque.z };
+					}
+					cst = io.st;
+					for (int w = 0; w < 4; w++)
+						cst.wheels[w] = io.wheels[w];
+					// friction impulses on dynamic ground bodies (ball / other cars)
+					for (int d = 0; d < bodiesPerArena && d < 8; d++) {
+						if (d == 1 + ci)
+							continue;
+						GpuBodyState& s = arenaBodies[d];
+						s.linVel = { dynBodies[d].linVel.x, dynBodies[d].linVel.y, dynBodies[d].linVel.z };
+						s.angVel = { dynBodies[d].angVel.x, dynBodies[d].angVel.y, dynBodies[d].angVel.z };
+					}
+				}
+				// pad pre-ticks (ball pre-tick is a no-op in soccar)
+				for (int p = 0; p < numPads; p++)
+					CuPadPreTick(arenaPads[p], dt);
+				// stepSimulation head: applyGravity (active bodies)
+				for (int d = 0; d < bodiesPerArena; d++)
+					CuApplyGravity(arenaBodies[d], consts[d]);
+			}
+		}
+		__syncthreads();
 
 		if (startPhase <= GPU_PHASE_PREDICT && GPU_PHASE_PREDICT <= endPhase) {
 			if (bodyIdx < bodiesPerArena)
@@ -697,7 +821,31 @@ __global__ void GpuStepArenasKernel(
 		}
 		__syncthreads();
 
-		// Phases 10-11 (game post-tick) land here.
+		if (ca.tailEnabled && startPhase <= GPU_PHASE_GAME_POST && GPU_PHASE_GAME_POST <= endPhase) {
+			if (bodyIdx == 0) {
+				uint64_t tickCount = ca.tickBase + tick;
+				// stepSimulation tail: clearForces (all nonstatic bodies)
+				for (int d = 0; d < bodiesPerArena; d++)
+					CuClearForces(arenaBodies[d]);
+				// car post-ticks + finish + boost pad grid, in _cars order
+				for (int oc = 0; oc < numCars; oc++) {
+					int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
+					GpuCarControls ctrl = schedule[
+						((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
+					CuCarPostTick(arenaBodies[1 + ci], arenaCars[ci], *ca.tail, ctrl, dt);
+					CuCarFinish(arenaBodies[1 + ci], arenaCars[ci], *ca.tail);
+					CuPadGridCheck(arenaBodies[1 + ci], arenaCars[ci], ci,
+						arenaPads, ca.padConfigs, *ca.tail, *ca.consts);
+				}
+				// pad post-ticks
+				for (int p = 0; p < numPads; p++)
+					CuPadPostTick(arenaPads[p], ca.padConfigs[p], arenaCars, *ca.tail);
+				// ball finish (goal-score callback is null in the bench)
+				CuBallFinish(arenaBodies[0], ca.ballStates[arenaIdx], *ca.tail);
+				// tickCount++ handled by the tick loop / host counter
+			}
+		}
+		__syncthreads();
 	}
 }
 
@@ -729,9 +877,15 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.numPairs = b->dNumPairs;
 		ca.solveScratch = b->dSolveScratch;
 		ca.tickBase = b->tickCount;
+		ca.tailEnabled = b->hasTailData ? 1 : 0;
+		ca.tail = b->dTailConsts;
+		ca.padConfigs = b->dPadConfigs;
+		ca.dynTemplates = b->dDynTemplates;
+		ca.carOrder = b->dCarOrder;
+		ca.carConsts = b->dCarConsts;
 	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(
-		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule,
+		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule, b->scheduleTicks,
 		b->numCars, b->numPads, numTicks, startPhase, endPhase, TICK_TIME,
 		b->geo, ca);
 	CudaCheck(cudaGetLastError(), "kernel launch");

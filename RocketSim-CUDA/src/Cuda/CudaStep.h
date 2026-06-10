@@ -64,9 +64,19 @@ void UploadDynProxies(GpuBatch* batch, int arenaIdx,
 	const GpuDynProxy* proxies, int regCounter);
 
 void UploadBallState(GpuBatch* batch, int arenaIdx, const GpuBallGameState& state);
+void DownloadBallState(GpuBatch* batch, int arenaIdx, GpuBallGameState* state);
 
 // The arena tick counter the device uses (ball-hit extra-impulse guard etc.)
 void SetTickCount(GpuBatch* batch, uint64_t tickCount);
+
+// Game-tail data for the full GPU step: tail constants, pad configs (pad order =
+// arena _boostPads order), dyn-body shape/filter templates per slot. Once.
+void UploadTailData(GpuBatch* batch, const GpuTailConsts& consts,
+	const GpuPadConfig* padConfigs, int numPads,
+	const GpuDynBody* dynTemplates);
+
+// Per-arena car pre/post-tick iteration order (the CPU's _cars unordered_set order)
+void UploadCarOrder(GpuBatch* batch, int arenaIdx, const int* order);
 
 // Download the collide-phase results of one arena: manifolds in dispatcher order,
 // proxy state, and the ball game state (callback side effects).
