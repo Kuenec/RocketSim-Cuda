@@ -177,10 +177,58 @@ SPS varies a few percent run to run; the hash is the gate, SPS is informational.
 ### Asset Provenance
 - Meshes downloaded from `https://github.com/heresfilly09/rocket-league-collision-meshes` (plain `.cmf`), verified against upstream's known hash set. Game-derived, so NOT committed; re-download to `collision_meshes/soccar/` and the bench's `MESHES: OK (16/16 soccar)` line confirms integrity.
 
+### GPU port progress (CUDA 0% — kernel does not yet produce correct sim output)
+Done so far:
+- Workspace bench forked to `tools/bench_work/main.cpp` with `--profile` and `--gpu-step`.
+  Phase profile on hard gate: car_pre_tick 50% (vehicle sim lives in Car::_PreTickUpdate,
+  NOT bullet updateActions), bt_collision 35%, everything else small.
+- `src/Cuda/`: GpuTypes.h (POD mirrors), CudaStep.h/.cu (batch bridge + monolithic kernel
+  scaffold: ONE launch runs all ticks x all arenas; control schedule precomputed on host
+  and uploaded once), CudaMath.cuh (bit-exact device math, see below).
+- `--gpu-step` machinery works end-to-end (upload -> kernel -> download -> hash),
+  deterministic; phases are still empty so the hash is wrong vs gates (expected, honest).
+
+**Bit-exact device math layer (VERIFIED, the cornerstone):**
+- Bullet on this host compiles with BT_USE_SSE_IN_API: SSE kernels fix specific
+  summation ASSOCIATIONS that differ from scalar fallbacks. CudaMath.cuh encodes the
+  SSE trees: dot3 = (xx+yy)+zz; quat dot4 = (xx+zz)+(yy+ww); quat mul lanes
+  (A0-B1)+(A1+A2); mat mul (a+b)+c; setRotation per-lane trees derived from the SSE
+  shuffles, INCLUDING a final "+0.0f" on off-diagonals (the SSE row-add of v1000/v0100/
+  v0010 canonicalizes -0 to +0 — found via fuzz, 196/4M samples).
+- glibc sinf/cosf are NOT double-rounded sin/cos for ~0.08%/0.002% of inputs. Fix:
+  empirical correction table measured from THIS machine's libm:
+  `cuda_math_test --emit-trig-table glibc_trig_fix.bin` (exhaustive scan of
+  [0, ANGULAR_MOTION_THRESHOLD], 803336 sin + 17882 cos entries, ~6.5MB, gitignored —
+  regenerate per machine). Device CuSinf/CuCosf: double-rounded base + binary-search
+  substitution. `CuLoadTrigFix(path)` binds it (per-TU symbol).
+- `cuda_math_test --samples 4000000 --trig-table glibc_trig_fix.bin --trig-exhaustive`:
+  ALL PASS — 11 op families bit-exact over 4M fuzzed samples each; sinf/cosf bit-exact
+  over the ENTIRE 1.06e9-value domain. This binary is the regression guard for the math
+  layer; run it after any CudaMath change.
+- btVector3::normalize() uses _mm_rsqrt_ss + 1 Newton-Raphson step (CPU-vendor-specific
+  estimate table!). NOT yet needed (predict/integrate/activation avoid it; quat
+  normalize is exact sqrt+div). WILL be needed for Ball::_FinishPhysicsTick
+  (vel.normalized()), suspension, solver friction. Plan: emulate via host-built
+  RSQRTSS table (2x4096 mantissa entries + exponent arithmetic) with startup self-check.
+- Body facts for predict/integrate/activation (verified in source): gravity applied as
+  force pre-step (stepSimulation: applyGravity, then clearForces after); velocity
+  integration happens in SOLVER setup/finish (even contactless bodies form single-body
+  islands -> gravity lands via solver finish, NOT predict); predict = applyDamping +
+  interpolation-transform write (interp transform is write-only in RocketSim - skip);
+  ball linearDamping = ballDrag=0.03 -> btPow(0.97,dt) PRECOMPUTED host-side (constant);
+  cars have zero damping; no CCD (thresholds 0); no additionalDamping; activation per
+  updateDeactivation/wantsSleeping incl. the odd setActivationState(0); sleeping
+  thresholds are bullet defaults (lin 0.8, ang 1.0), gDeactivationTime=2.
+- CUDA arch gotcha: CMAKE_CUDA_ARCHITECTURES must be set BEFORE enable_language(CUDA)
+  or it locks to compiler default (was 75); now `native` (sm_120 here).
+
 ### Next Steps (in order)
-1. Add phase profiling counters to the WORK copy only (`--profile` flag in `rocketsim_bench`; fork `tools/bench/main.cpp` into a workspace-only source at that point so the reference bench stays frozen).
-2. Wire CUDA into the build for the work copy (enable_language(CUDA), arch `120`, host compiler g++-15, `-fmad=false`), keeping the reference targets pure C++.
-3. Begin the GPU port: batch arena state into GPU buffers, start with predict/integrate, validate each phase against CPU per-phase state before adding the next (per Behavioral Requirements).
+1. Implement kernel phases predict/integrate/activation using CudaMath; add CPU capture
+   hooks (work copy, diagnostic) at phase boundaries + `--gpu-compare` lockstep mode in
+   bench_work: per tick upload CPU pre-bullet state, run GPU tick prefix, bit-compare
+   at each phase point, report first divergence (tick/phase/body/field/bits).
+2. Then per profile order: vehicle+car logic (50%), collision (35%), solver, ball/pads.
+3. RSQRTSS emulation when first normalize() call site is ported.
 
 ### Open Questions / Blockers
 - None currently.
