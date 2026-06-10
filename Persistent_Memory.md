@@ -670,10 +670,40 @@ verified in source 2026-06-10):**
    - btSolverBody internalApplyImpulse(linComp, angComp, mag): deltaLin += linComp*
      mag, deltaAng += angComp*mag (SSE per-lane = scalar-identical).
    - rb->getVelocityInLocalPoint(rel) = m_linearVelocity + m_angularVelocity.cross(rel).
-   ALL SOLVER READS COMPLETE - next window: write CudaSolver.cuh (solver body pool,
-   convert bodies/contacts/special, split iterations, 10 main iterations, finish
-   writeback incl position correction), wire GPU_PHASE_SOLVE, extend gpu-compare
-   with AFTER_PREDICT->AFTER_SOLVE chained segment (collision feeds solver in-kernel).
+   SOLVER PORTED + VALIDATED (commit 5154fe6): CudaSolver.cuh (CuSolveTick: union-
+   find islands [path compression, quickSortPairs replicating btAlignedObjectArray
+   quickSortInternal mid-pivot], island sleep/wake, manifold filtering+sort,
+   batched solveGroup: solver body pool, convertContacts + RS special accumulation +
+   convertContactSpecial, split-impulse iterations [early-break residual<=0], 10
+   main iterations [contacts skip isSpecial, friction limits from owning contact],
+   finish writeback incl. split-impulse position integration). GPU_PHASE_SOLVE in
+   the kernel consumes the SAME-RUN collide outputs (manifolds + NEW pairs buffer);
+   CuSolveCtx scratch lives in GLOBAL memory (dSolveScratch - 250KB would blow the
+   64KB device stack: illegal-memory-access root-caused). gpu-compare runs a chained
+   AFTER_PREDICT->(COLLISION+SOLVE) segment vs AFTER_SOLVE snaps: PASS 20000 ticks
+   x seeds 1337/42/7777/123456789; gates PASS.
+   BUGS root-caused during validation (recorded for posterity):
+   - initSolverBody extTorqueImpulse: totalTorque * invInertiaWorld = btVector3 *
+     btMatrix3x3 = COLUMN dots (CuVecMulMat); invInertiaWorld is NOT bitwise
+     symmetric -> row-dot order gave 1-4 ulp angVel drift.
+   - gResolveSingleConstraintRowGeneric_sse2 caches cpAppliedImp AT ENTRY: BOTH
+     clamp deltas (lower-applied / upper-applied) use the ORIGINAL applied impulse,
+     not the lower-clamp-updated one. Wrong order made friction rows diverge wildly
+     once limits clamped (seed 42 tick 980).
+   DIAGNOSTIC INFRA (keep): rscap::CaptureSolver hook in solveGroup (between
+   iterations and finish; pools are public) captures contact/friction rows + solver
+   bodies; rscuda::DownloadSolveDebug dumps the GPU scratch; the bench solve-FAIL
+   block diffs them row by row. Same pattern for future phases.
+   NEXT (task #12, the LAST phases before 100% CUDA): in CPU order per Arena::Step:
+   (1) ball zero-vel sleep check + Ball::_PreTickUpdate (read Ball.cpp + Arena::Step
+   head), (2) pads BoostPad::_PreTickUpdate + _PostTickUpdate (BoostPadGrid::
+   CheckCollision), (3) car _PostTickUpdate (+ _FinishPhysicsTick: velocityImpulse
+   caches, supersonic, rotMat cache write!), (4) ball _FinishPhysicsTick (vel clamps
+   w/ rsqrt, velocityImpulseCache apply), (5) Arena::Step tail (tickCount++, goal
+   scoring soccar = ball y check, _lastCarBumps etc.), then assemble the monolithic
+   kernel phase order incl. car pre-tick (already ported as CuCarPreTick - needs
+   wiring into GpuStepArenasKernel with controls schedule + wheel ray world inputs
+   from GpuDynProxy state), flip --gpu-step, run gates (identical hashes target).
    Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
    already bit-exact feeds the solver in the same kernel run; compare body snaps at
    AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
