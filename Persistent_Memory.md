@@ -721,13 +721,31 @@ verified in source 2026-06-10):**
    refresh pruned the contact via the 2D-distance check. The floor plane (origin
    0,0,0) masked it through every prior validation. Diagnosed with --arena-offset/
    --no-ball-motion flags replaying arena 2 standalone under the per-phase compare.
-   REMAINING WORK (next session): THROUGHPUT. GPU 10.6k SPS @128 arenas / 84 SPS
-   @1 arena vs CPU 58.5k single-thread. The kernel is single-thread-per-arena for
-   most phases -> scale arenas (thousands) and/or parallelize within phases
-   (per-pair narrowphase, per-row batches), profile with nsight. Also possible:
-   remove TEMP debug[100+/120+] diagnostics in CudaCollideWorld.cuh + bench dumps.
-   Correctness caveats for future modes (documented, not gates): demolitions
-   (proxy removal) and non-soccar game modes are not modeled on device.
+   GOAL EXPANDED (2026-06-10, user directive: "no exceptions - everything CUDA"):
+   port ALL remaining game modes + demolitions to device, each validated with NEW
+   CPU-reference gates built the same way (work-CPU vs work-GPU bit-exact).
+   Standard: the CPU performs ZERO simulation computation; host does only file
+   I/O, upload, download. Already true for soccar (ball tickCountSinceUpdate moved
+   on-device, commit 92bbed7; host thread sleeps at 0% CPU during the kernel -
+   blocking-sync flag, commit 8df3f10).
+   ORDER (tasks #13-#17):
+   1. HEATSEEKER (#13): no new assets/shapes; Ball pre-tick steering (Angle::
+      FromVec/RoundAngleUE3/GetForwardVec trees), _OnHit/_OnWorldCollision branches,
+      hsInfo into GpuBallGameState; --game-mode flag + heatseeker gates first.
+   2. DEMOLITIONS (#14): deterministic-seed hook for Math::GetRandEngine in the
+      WORK copy behind a flag (upstream demo respawn is wall-clock-seeded ->
+      bit-exact validation only possible work-CPU vs work-GPU with the same seed;
+      soccar gates must stay untouched/passing). Device: proxy deactivation,
+      respawn flow.
+   3. SNOWDAY (#15): puck cylinder shape (new GJK support + getAabb + narrowphase
+      paths), ground-stick, snowday callback branches.
+   4. HOOPS (#16): hoops meshes (verify obtainable first!), arena setup, launch
+      delay, hoops _OnHit zScale branch.
+   5. DROPSHOT (#17): tile system (per-tile damage state changes collision ->
+      device static world becomes stateful), ball charge, launch delay. Largest.
+   THEN: throughput (GPU 10.6k SPS @128 arenas vs CPU 58.5k single-thread; kernel
+   is single-thread-per-arena -> scale arenas / parallelize within phases).
+   Cleanup candidates: TEMP debug[100+/120+] diagnostics in CudaCollideWorld.cuh.
    Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
    already bit-exact feeds the solver in the same kernel run; compare body snaps at
    AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
