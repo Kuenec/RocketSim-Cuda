@@ -57,10 +57,6 @@ bool Available() {
 	return true;
 }
 
-bool LoadTrigFix(const char* path) {
-	return CuLoadTrigFix(path);
-}
-
 struct GpuBatch {
 	int numArenas;
 	int numCars;        // per arena

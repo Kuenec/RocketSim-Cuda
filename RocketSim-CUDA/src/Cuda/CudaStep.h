@@ -112,10 +112,6 @@ void RunRayFuzz(GpuBatch* batch, const GpuVec3* fromTo /*2 per ray*/, int numRay
 	int cbGroup, int cbMask, const GpuDynBody* dynBodies, int numDyn, int ignoreIdx,
 	const GpuGridParams& grid, GpuRayFuzzResult* results);
 
-// Load the glibc trig correction table (see CudaMath.cuh). Must be called before any
-// stepping; returns false if the file is missing/corrupt.
-bool LoadTrigFix(const char* path);
-
 // Dev/compare API: run ONE tick executing only phases [startPhase, endPhase].
 // Production stepping uses StepTicks (full phase range, all ticks in one launch).
 void RunPhaseSegment(GpuBatch* batch, int startPhase, int endPhase);

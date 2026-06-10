@@ -99,7 +99,6 @@ struct Args {
 	int manifoldDump = 0;           // diagnostic: print CPU collision manifolds for N ticks
 	int arenaOffset = 0;            // diagnostic: arena index offset (reproduce arena K standalone)
 	bool noBallMotion = false;      // diagnostic: skip the gpu-compare ball-motion injection
-	std::string trigTable = "glibc_trig_fix.bin"; // libm correction table (see CudaMath.cuh)
 };
 
 static void PrintUsage(const char* argv0) {
@@ -154,9 +153,6 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 			out.arenaOffset = atoi(v);
 		} else if (!strcmp(argv[i], "--no-ball-motion")) {
 			out.noBallMotion = true;
-		} else if (!strcmp(argv[i], "--trig-table")) {
-			const char* v = need("--trig-table"); if (!v) return false;
-			out.trigTable = v;
 		} else if (!strcmp(argv[i], "--dump-arena-hashes")) {
 			out.dumpArenaHashes = true;
 		} else if (!strcmp(argv[i], "--dump-state-dir")) {
@@ -490,16 +486,6 @@ static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscud
 }
 
 static constexpr float TICK_TIME = 1.0f / 120.0f;
-
-static void RequireTrigTable(const Args& args) {
-	if (!rscuda::LoadTrigFix(args.trigTable.c_str())) {
-		fprintf(stderr, "GPU: FAIL - missing/corrupt trig correction table '%s'.\n"
-			"Generate it once on this machine with:\n"
-			"  ./build/cuda_math_test --samples 1000 --emit-trig-table %s\n",
-			args.trigTable.c_str(), args.trigTable.c_str());
-		exit(2);
-	}
-}
 
 static void UploadConsts(rscuda::GpuBatch* batch, Arena* arena, std::vector<CarSlot>& slots) {
 	std::vector<rscuda::GpuBodyConsts> consts(1 + slots.size());
@@ -1027,7 +1013,6 @@ static int RunGpuCompare(const Args& args) {
 		fprintf(stderr, "GPU_COMPARE: FAIL (no usable CUDA device)\n");
 		return 2;
 	}
-	RequireTrigTable(args);
 
 	std::vector<CarSlot> slots;
 	Arena* arena = SetupArena(args, 0, slots);
@@ -1700,7 +1685,6 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 
 	const int numPads = (int)arenas[0]->GetBoostPads().size();
 	rscuda::GpuBatch* batch = rscuda::CreateBatch(args.arenas, args.cars, numPads);
-	RequireTrigTable(args);
 	UploadConsts(batch, arenas[0], slotsPerArena[0]);
 	rscuda::UploadCarConsts(batch, ExtractCarConsts(arenas[0], slotsPerArena[0][0].car));
 

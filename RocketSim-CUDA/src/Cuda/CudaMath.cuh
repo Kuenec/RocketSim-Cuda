@@ -217,41 +217,7 @@ RSC_HD void CuPlaneSpace1(CuVec3 n, CuVec3& p, CuVec3& q) {
 	}
 }
 
-// ---- Device trig matching glibc sinf/cosf bit-exactly --------------------------------
-// Base value: sin/cos computed in double, rounded once to float. That equals glibc for
-// >99.9% of inputs; the rest (double-rounding cases, ~0.08% for sinf) are fixed by an
-// EMPIRICAL CORRECTION TABLE measured on this machine by
-//   cuda_math_test --emit-trig-table <path>
-// over the entire domain integrateTransform can produce ([0, ANGULAR_MOTION_THRESHOLD]).
-// Entries are (inputBits, glibcResultBits), sorted by inputBits; device does a binary
-// search and substitutes on hit. Measured from the host libm itself, so it is correct
-// regardless of glibc version, build flags, or CPU vendor. cuda_math_test verifies the
-// result exhaustively against the host.
-
-struct TrigFixEntry { uint32_t in, out; };
-struct TrigFixTab {
-	const TrigFixEntry* sinTab; int sinN;
-	const TrigFixEntry* cosTab; int cosN;
-};
-
 #ifdef __CUDACC__
-static __device__ TrigFixTab g_trigFix = {}; // per-TU symbol; each executable binds its own
-
-__device__ __forceinline__ bool CuTrigLookup(const TrigFixEntry* tab, int n, uint32_t key, float& out) {
-	int lo = 0, hi = n - 1;
-	while (lo <= hi) {
-		int mid = (lo + hi) >> 1;
-		uint32_t v = tab[mid].in;
-		if (v == key) {
-			uint32_t ob = tab[mid].out;
-			memcpy(&out, &ob, 4);
-			return true;
-		}
-		if (v < key) lo = mid + 1; else hi = mid - 1;
-	}
-	return false;
-}
-
 // ---- glibc 2.4x sinf/cosf, ported VERBATIM (2026-06-10) ----------------------------
 // From glibc sysdeps/ieee754/flt-32/{s_sinf.c,s_cosf.c,s_sincosf.h,sincosf_poly.h,
 // s_sincosf_data.c} (the !TOINT_INTRINSICS path x86-64 uses). Double arithmetic +
@@ -415,30 +381,6 @@ __device__ __forceinline__ float CuCosf(float y) {
 	return y - y;
 }
 
-// Host-side: load a table file emitted by cuda_math_test and bind it to this TU's
-// g_trigFix symbol. Returns false (with no side effects) if the file is absent.
-inline bool CuLoadTrigFix(const char* path) {
-	FILE* f = fopen(path, "rb");
-	if (!f) return false;
-	uint32_t magic = 0, sinN = 0, cosN = 0;
-	if (fread(&magic, 4, 1, f) != 1 || magic != 0x54464958u /*'TFIX'*/ ||
-		fread(&sinN, 4, 1, f) != 1 || fread(&cosN, 4, 1, f) != 1) {
-		fclose(f);
-		return false;
-	}
-	size_t bytes = (size_t)(sinN + cosN) * sizeof(TrigFixEntry);
-	TrigFixEntry* hostBuf = (TrigFixEntry*)malloc(bytes);
-	bool ok = fread(hostBuf, 1, bytes, f) == bytes;
-	fclose(f);
-	if (!ok) { free(hostBuf); return false; }
-
-	TrigFixEntry* devBuf = nullptr;
-	if (cudaMalloc(&devBuf, bytes) != cudaSuccess) { free(hostBuf); return false; }
-	cudaMemcpy(devBuf, hostBuf, bytes, cudaMemcpyHostToDevice);
-	free(hostBuf);
-	TrigFixTab tab = { devBuf, (int)sinN, devBuf + sinN, (int)cosN };
-	return cudaMemcpyToSymbol(g_trigFix, &tab, sizeof(tab)) == cudaSuccess;
-}
 #endif // __CUDACC__
 
 #ifdef __CUDACC__

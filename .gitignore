@@ -11,4 +11,4 @@
 /collision_meshes/
 
 # Machine-measured libm correction table (regenerate: cuda_math_test --emit-trig-table)
-/glibc_trig_fix.bin
+

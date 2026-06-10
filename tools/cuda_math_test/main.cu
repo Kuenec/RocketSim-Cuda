@@ -203,65 +203,19 @@ static const FieldDef FIELDS[] = {
 	{ "axisAngle", offsetof(Output, axisAngle), 4 },
 };
 
-// Exhaustively scan +/-[0, domHi] comparing glibc sinf/cosf vs double-rounded sin/cos;
-// write all mismatches as (inputBits, glibcBits) pairs sorted by input bits:
-// header TFIX, sinN, cosN. Negative domain needed: steering quats use signed angles.
-static void EmitTrigTable(const char* path, uint32_t domHi) {
-	std::vector<TrigFixEntry> sinFix, cosFix;
-	auto scan = [&](uint32_t signBit) {
-		for (uint64_t u = 0; u <= domHi; u++) {
-			uint32_t ub = signBit | (uint32_t)u;
-			float x;
-			memcpy(&x, &ub, 4);
-			float hs = sinf(x), hc = cosf(x);
-			float ds = (float)sin((double)x), dc = (float)cos((double)x);
-			uint32_t hsb, hcb, dsb, dcb;
-			memcpy(&hsb, &hs, 4); memcpy(&hcb, &hc, 4);
-			memcpy(&dsb, &ds, 4); memcpy(&dcb, &dc, 4);
-			if (hsb != dsb) sinFix.push_back({ ub, hsb });
-			if (hcb != dcb) cosFix.push_back({ ub, hcb });
-		}
-	};
-	scan(0);          // positive domain (already sorted ascending)
-	scan(0x80000000u); // negative domain (bits sort above positives, stays sorted)
-	FILE* f = fopen(path, "wb");
-	if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
-	uint32_t magic = 0x54464958u, sn = (uint32_t)sinFix.size(), cn = (uint32_t)cosFix.size();
-	fwrite(&magic, 4, 1, f); fwrite(&sn, 4, 1, f); fwrite(&cn, 4, 1, f);
-	fwrite(sinFix.data(), sizeof(TrigFixEntry), sn, f);
-	fwrite(cosFix.data(), sizeof(TrigFixEntry), cn, f);
-	fclose(f);
-	printf("TRIG TABLE: wrote %s (%u sin fixes, %u cos fixes)\n", path, sn, cn);
-}
-
 int main(int argc, char** argv) {
 	size_t samples = 4 * 1000 * 1000;
 	bool trigExhaustive = false;
 	bool trigFullRange = false;     // exhaustive over ALL finite floats (2^32-ish)
-	const char* emitPath = nullptr;
-	const char* tablePath = nullptr;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--samples") && i + 1 < argc) samples = strtoull(argv[++i], nullptr, 10);
 		else if (!strcmp(argv[i], "--trig-exhaustive")) trigExhaustive = true;
 		else if (!strcmp(argv[i], "--trig-exhaustive-full")) { trigExhaustive = true; trigFullRange = true; }
-		else if (!strcmp(argv[i], "--emit-trig-table") && i + 1 < argc) emitPath = argv[++i];
-		else if (!strcmp(argv[i], "--trig-table") && i + 1 < argc) tablePath = argv[++i];
 	}
 
 	uint32_t domHiBits;
 	{ float t = CU_ANGULAR_MOTION_THRESHOLD; memcpy(&domHiBits, &t, 4); }
 
-	if (emitPath) {
-		EmitTrigTable(emitPath, domHiBits);
-		tablePath = emitPath;
-	}
-	if (tablePath) {
-		if (!CuLoadTrigFix(tablePath)) {
-			fprintf(stderr, "failed to load trig table %s\n", tablePath);
-			return 2;
-		}
-		printf("TRIG TABLE: loaded %s\n", tablePath);
-	}
 
 	// EPA's expand() recursion needs more than the default 1KB device stack
 	Check(cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024), "stack limit");
