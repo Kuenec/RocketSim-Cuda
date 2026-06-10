@@ -25,6 +25,7 @@
 #include "CudaStep.h"
 #include "CudaMath.cuh"
 #include "CudaRaycast.cuh"
+#include "CudaVehicle.cuh"
 #include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
