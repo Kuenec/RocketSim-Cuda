@@ -47,7 +47,14 @@ static void CudaCheck(cudaError_t err, const char* what) {
 
 bool Available() {
 	int n = 0;
-	return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
+	if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0)
+		return false;
+	// 2026-06-10: make the host thread SLEEP (interrupt-driven) while the step
+	// kernel runs instead of the driver's default spin-poll, so "the CPU does
+	// nothing during simulation" holds at the OS level too. Must run before the
+	// CUDA context exists; harmless no-op error if it already does.
+	cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+	return true;
 }
 
 bool LoadTrigFix(const char* path) {
