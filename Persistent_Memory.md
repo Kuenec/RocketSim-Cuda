@@ -85,7 +85,13 @@ CUDA is either 0% or 100%. There is no in-between for the final deliverable.
    - Commands: `cmake -B build -G Ninja` then `ninja -C build` (Release/-O3 by default).
    - `-ffp-contract=off` is pinned on all targets so the CPU reference defines plain
      mul+add FP semantics the GPU port can reproduce exactly (nvcc `-fmad=false`).
-   - CUDA toolkit (`nvcc`) is NOT yet installed on this machine — required before GPU work can build.
+   - CUDA toolkit installed 2026-06-10: nvcc 13.3 at `/opt/cuda/bin/nvcc` (pacman `cuda` package).
+     Host compiler MUST be g++-15 (`NVCC_CCBIN=/usr/bin/g++-15` is set system-wide via
+     `/etc/profile.d/cuda.sh`, which also adds `/opt/cuda/bin` to PATH on login shells);
+     system g++ 16 is unsupported by nvcc 13.3.
+   - GPU: NVIDIA GeForce RTX 5070 (Blackwell, sm_120), 48 SMs, 12227 MiB, driver 610.43.02.
+     End-to-end verified: trivial mul+add kernel compiled with `-ccbin g++-15 -fmad=false`,
+     ran on the GPU, results exact.
 
 ---
 
@@ -172,11 +178,11 @@ SPS varies a few percent run to run; the hash is the gate, SPS is informational.
 - Meshes downloaded from `https://github.com/heresfilly09/rocket-league-collision-meshes` (plain `.cmf`), verified against upstream's known hash set. Game-derived, so NOT committed; re-download to `collision_meshes/soccar/` and the bench's `MESHES: OK (16/16 soccar)` line confirms integrity.
 
 ### Next Steps (in order)
-1. Install the CUDA toolkit (nvcc missing) and verify a trivial kernel builds/runs on this machine's GPU.
-2. Add phase profiling counters to the WORK copy only (`--profile` flag in `rocketsim_bench`; fork `tools/bench/main.cpp` into a workspace-only source at that point so the reference bench stays frozen).
+1. Add phase profiling counters to the WORK copy only (`--profile` flag in `rocketsim_bench`; fork `tools/bench/main.cpp` into a workspace-only source at that point so the reference bench stays frozen).
+2. Wire CUDA into the build for the work copy (enable_language(CUDA), arch `120`, host compiler g++-15, `-fmad=false`), keeping the reference targets pure C++.
 3. Begin the GPU port: batch arena state into GPU buffers, start with predict/integrate, validate each phase against CPU per-phase state before adding the next (per Behavioral Requirements).
 
 ### Open Questions / Blockers
-- No CUDA toolkit on this machine (blocker for step 1). GPU model unverified — check `nvidia-smi` / install drivers as needed.
+- None currently.
 
 ---
