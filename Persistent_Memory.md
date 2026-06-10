@@ -504,12 +504,47 @@ verified in source 2026-06-10):**
   normal via basis*normal; penetrationDepth = distance - (radius+boxMargin);
   addContactPoint(normal, pointOnBox, depth); refreshContactPoints if contacts.
 
+- Dispatcher glue READ: needsCollision = (body0 active || body1 active) &&
+  checkCollideWith both ways (default true - no custom overrides in RS);
+  dispatchAllCollisionPairs -> processAllOverlappingPairs over the hashed pair cache
+  ARRAY (insertion order; pairs rebuilt each tick so order = RS broadphase add order);
+  defaultNearCallback: needsCollision -> find/create algo from
+  m_doubleDispatchContactPoints[type0][type1] -> algo->processCollision(wrappers).
+  needsResponse (solver-side): both haveContactResponse && not both static.
+
 ### Next Steps (in order)
-1. Finish narrowphase reads (above list), then implement device collision phase in
-   slices with a manifold-compare harness (capture CPU manifolds at AFTER_COLLISION:
-   per pair bodyIds + points (localA/B, worldB, normal, distance, partId/index,
-   friction/restitution/isSpecial) in dispatcher order; GPU from AFTER_PREDICT state).
-2. Solver+islands, ball/pads/tail, assemble monolithic kernel, flip --gpu-step.
+1. PORT-WHILE-READING (fresh window, source side-by-side, faithful trees) the remaining
+   heavy narrowphase into src/Cuda/CudaCollision.cuh slices:
+   (a) btGjkPairDetector::getClosestPointsNonVirtual (959 ln, uses CuSimplexSolver
+       already ported) + btGjkEpaPenetrationDepthSolver/btGjkEpa2 (EPA polytope) -
+       box(+margin special: BOX margin counts in vertices, see convexConvex margin
+       exception) vs triangle supports;
+   (b) btBoxBoxDetector (767 ln ODE SAT, car-car);
+   (c) sphere-triangle + sphere-box (decoded above, small);
+   (d) convex-plane (decoded above, small);
+   (e) btConvexConcaveCollisionAlgorithm + btConvexTriangleCallback: triangle gathering
+       via quantized BVH processAllTriangles over the convex AABB in LOCAL mesh space -
+       TRIANGLE ITERATION ORDER = BVH walk order, affects manifold point order ->
+       replicate the quantized BVH walk (btQuantizedBvh::walkStacklessQuantizedTree)
+       or prove order-equivalence; per-tri manifold via convexConvex GJK; ALSO
+       btInternalEdgeUtility adjust in the contact callback (needs mesh triangleInfoMap
+       - extract host-side);
+   (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
+       partId/index semantics);
+   (g) manifold assembly: per-pair btPersistentManifold (4-pt cache, sortCachedPoints
+       (read tail!), RS no-replacement), btManifoldResult combine rules + Arena
+       contact callbacks (decoded) + refreshContactPoints (read tail!) which prunes
+       points after processCollision per-algo;
+   (h) manifold-compare harness: rscap captures CPU manifolds at AFTER_COLLISION
+       (pair body ids in dispatcher manifold order, per-point localA/B, worldB,
+       normalWorldOnB, distance, partId0/1, index0/1, combinedFriction/Restitution,
+       m_isSpecial, lateralFrictionDirs); GPU runs collision from AFTER_PREDICT
+       uploaded state; bitwise compare.
+2. Solver port (btSequentialImpulseConstraintSolver setup/iterations/finish + islands
+   + RS m_isSpecial handling - READ PENDING) with solver-compare (AFTER_SOLVE vels).
+3. Ball pre/finish (incl rsqrt-normalized vel clamps), pads (BoostPadGrid::CheckCollision
+   exact), Arena tail; assemble monolithic kernel; flip --gpu-step; gates with new
+   deterministic GPU hashes if FP-identical impossible end-to-end (target: identical).
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
