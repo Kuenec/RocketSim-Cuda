@@ -578,13 +578,23 @@ verified in source 2026-06-10):**
    verbatim ODE scalar code; cullPoints2 atan2f = double-rounded stand-in, measure
    later). sphere-box/convex-plane/box-box device ports not yet fuzz-validated
    standalone (manifold-compare will cover);
-   REMAINING UNREAD for collision: btQuantizedBvh::walkStacklessQuantizedTree +
-   quantization (processAllTriangles order for concave), btInternalEdgeUtility
-   (btAdjustInternalEdgeContacts + triangleInfoMap extraction), compound algo file
-   (small), TestTriangleAgainstAabb2/TestAabbAgainstAabb2 trees; then: manifold-compare
-   harness (capture at AFTER_COLLISION) + device collision-phase orchestrator
-   (AABB update -> pair gen -> dispatch loop in pair order -> per-pair algo -> manifold
-   + callbacks (release order!) -> refresh).
+   BVH SEMANTICS READ: processAllTriangles -> reportAabbOverlappingNodex ->
+   quantizeWithClamp(query aabb: clamp to bvh bounds via setMax/setMin, v = (p-min)*
+   m_bvhQuantization, max: (ushort)(v+1)|1 per axis, min: (ushort)v & 0xfffe) ->
+   walkStacklessQuantizedTreeCacheFriendly = iterate m_SubtreeHeaders (READ ITS LOOP
+   NEXT - ~25 ln, headers have quantized aabb + rootNodeIndex + subtreeSize), per
+   overlapping subtree -> walkStacklessQuantizedTree(start,end): LINEAR ARRAY WALK
+   (read in full): test quantized AABB (pure ushort compares), leaf+overlap ->
+   processNode(partId, triangleIndex) in array order; nonoverlap+internal -> skip by
+   escapeIndex. DEVICE NEEDS per mesh: quantized node array (btQuantizedBvhNode:
+   ushort[3]x2 + int escapeOrTriIdx), subtree headers, m_bvhAabbMin/Max,
+   m_bvhQuantization (extract host-side from mesh->getOptimizedBvh()).
+   REMAINING UNREAD for collision: walkStacklessQuantizedTreeCacheFriendly loop,
+   btInternalEdgeUtility (btAdjustInternalEdgeContacts + triangleInfoMap extraction),
+   compound algo file (small), TestTriangleAgainstAabb2/TestAabbAgainstAabb2 trees;
+   then: manifold-compare harness (capture at AFTER_COLLISION) + device collision-phase
+   orchestrator (AABB update -> pair gen -> dispatch loop in pair order -> per-pair
+   algo -> manifold + callbacks (release order!) -> refresh).
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
        partId/index semantics);
    (g) manifold assembly: per-pair btPersistentManifold (4-pt cache, sortCachedPoints
