@@ -371,11 +371,33 @@ suspensionForceScale (+ raycast scratch is intra-tick).
 Capture plan: hooks in Car::_PreTickUpdate around updateVehicleFirst / game block /
 updateVehicleSecond / _UpdateBoost; compare wheel scratch + body forces + car state.
 
+**DONE (2026-06-10): CAR PRE-TICK PHASE BIT-EXACT ON GPU** - the 50%-of-CPU-time phase.
+`--gpu-compare 20000` PASS (also 10k @ seed 99, 10k @ 4 cars seed 555): per car per tick,
+CPU captures (rscap::CaptureCarPreTick hooks at entry/after-updateVehicleFirst/exit in
+Car::_PreTickUpdate) vs device CuCarPreTick (CudaVehicle.cuh) - velocities, force/torque
+accumulators, all CarState scalars/bools, wheel persists, and wheel scratch bit-equal.
+Bench: ExtractCarConsts (RLConst scalars/folded products/curves via ExtractCurve,
+mutators, wheel consts from live btWheelInfoRL, erp, frictionScale=mass/3) +
+RunCarPreTickOnce single-shot kernel (CudaStep). Found+fixed root causes:
+- setCoordinateSystem(1,2,0) OVERRIDES vehicle axis defaults: indexForward=0 (basis
+  COLUMN 0), indexRight=1, indexUp=2 - affects forwardSpeed, basis2 column assembly,
+  friction axleDir (column 1).
+- m_extraPushback is CROSS-TICK PERSISTENT (only written on no-hit (0) or threshold
+  fire; uncompressed contact keeps stale value) -> moved into GpuWheelState.
+- Double jump uses RLConst::JUMP_IMMEDIATE_FORCE, NOT mutatorConfig.jumpImmediateForce.
+- Mat*vec scaled-by-const trees: (inv * v) * scale, scale AFTER the matrix multiply.
+CAVEAT: autoflip atan2f/asinf double-rounded stand-ins (CuAtan2f/CuAsinf) - not yet
+proven to trigger in compare runs; fuzz atan2/asin vs glibc still pending (bounded
+domain |args|<=~1).
+
 ### Next Steps (in order)
-1. Decode remaining items above; extract vehicle/curve consts host-side; implement
-   device UpdateVehicleFirst/Second + car game logic in CudaVehicle.cuh; add CPU
-   capture points; validate via --gpu-compare car pre-tick segments.
-2. Then collision (35%), solver+islands, ball/pads/game tail; flip --gpu-step.
+1. Collision phase port (35% of CPU): btRSBroadphase calculateOverlappingPairs (voxel
+   grid pair gen), narrowphase per pair (box-vs-mesh via btCompoundCollisionAlgorithm/
+   convexTriangle GJK+EPA, sphere-mesh, box-box, sphere-box, plane tests), manifolds +
+   btInternalEdgeUtility adjustment, contact-added callback (Arena::_BulletContactAddedCallback
+   -> car-ball/car-car/car-world events incl worldContact.hasContact for autoflip/autoroll).
+2. Solver+islands (PGS), then ball pre/finish + pads + Arena tail; then assemble the
+   monolithic per-tick pipeline in GpuStepArenasKernel and flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
