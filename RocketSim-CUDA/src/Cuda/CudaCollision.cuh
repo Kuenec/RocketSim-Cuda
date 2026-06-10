@@ -2078,6 +2078,7 @@ __device__ inline void CuConvexVsMesh(
 	const GpuWorldGeo& geo, int meshIdx, const CuBvhView& bvh, float meshMargin,
 	const CuContactBodyInfo& convexBody, const CuContactBodyInfo& meshBody,
 	CuManifold& manifold, float manifoldBreakingThreshold,
+	int partIdConvex, int indexConvex, // result A-side ids: ball (-1,-1), car child (-1,0)
 	FCallback&& onContactAdded /*(insertIndex, triangleIndex)*/) {
 
 	// convexInTriangleSpace = meshWT.inverse() * convexWT (mesh = identity transform:
@@ -2160,7 +2161,7 @@ __device__ inline void CuConvexVsMesh(
 				CuVec3 nW = CuMat3MulVec(ident, normal);
 				CuVec3 pW = CuTransformPoint(ident, { 0, 0, 0 }, point);
 				int idx = CuAddContactPoint(manifold, *(&convexBody), *(&meshBody), false,
-					nW, pW, depth, -1, -1, 0, triIdx);
+					nW, pW, depth, partIdConvex, indexConvex, 0, triIdx);
 				if (idx >= 0)
 					onContactAdded(idx, triIdx);
 			}
@@ -2179,7 +2180,7 @@ __device__ inline void CuConvexVsMesh(
 				maxd * maxd, true, r);
 			if (r.hasContact) {
 				int idx = CuAddContactPoint(manifold, *(&convexBody), *(&meshBody), false,
-					r.normalOnB, r.pointOnBWorld, r.distance, -1, -1, 0, triIdx);
+					r.normalOnB, r.pointOnBWorld, r.distance, partIdConvex, indexConvex, 0, triIdx);
 				if (idx >= 0)
 					onContactAdded(idx, triIdx);
 			}

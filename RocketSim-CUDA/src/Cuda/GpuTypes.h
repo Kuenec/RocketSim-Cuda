@@ -32,6 +32,10 @@ struct GpuBodyState {
 	int activationState;     // bullet ACTIVE_TAG / ISLAND_SLEEPING / etc.
 	float deactivationTime;
 };
+// NOTE (2026-06-10): m_interpolationWorldTransform needs no slot here. RS-modified
+// predictUnconstraintMotion overwrites it UNCONDITIONALLY each tick (all dyn bodies,
+// no isActive check) as predictIntegratedTransform(world, damped vels, dt), and the
+// only reader (updateAabbs) runs right after - so the collide phase recomputes it.
 
 // Per-body-slot constants (identical across arenas; slot 0 = ball, 1.. = cars)
 struct GpuBodyConsts {
@@ -290,6 +294,74 @@ struct GpuTriInfo {
 	int flags;
 	float edgeV0V1Angle, edgeV1V2Angle, edgeV2V0Angle;
 	uint8_t hasInfo;
+};
+
+// ---- collision orchestration (btRSBroadphase + dispatcher replication) ----
+
+// Persistent broadphase proxy state for one dyn body (ball, cars), per arena
+struct GpuDynProxy {
+	GpuVec3 aabbMin, aabbMax;
+	int cellIdx;       // GetCellIdx(aabbMin), updated on every aabb change
+	int i, j, k;       // registered 3x3x3 center (updated only on cell move w/ >1 dyn)
+	int regSeq;        // cell re-registration sequence; cell dyn-list order = ascending
+};
+
+// Static collision object, broadphase handle order (constants; statics never move)
+struct GpuStaticObj {
+	int kind;                  // 0 = triangle mesh, 1 = static plane
+	int shapeIdx;              // into the uploaded mesh / plane arrays
+	GpuVec3 aabbMin, aabbMax;  // proxy aabb == shape world aabb (no expansion)
+	int group, mask;
+	float friction, restitution;  // rigid body material (combine inputs)
+	float breakingThreshold;      // shape->getContactBreakingThreshold(0.02)
+};
+
+// Manifold download mirror (device CuManifold/CuManifoldPoint)
+struct GpuContactOut {
+	GpuVec3 localPointA, localPointB;
+	GpuVec3 positionWorldOnA, positionWorldOnB, normalWorldOnB;
+	GpuVec3 lateralFrictionDir1, lateralFrictionDir2;
+	float distance, combinedFriction, combinedRestitution;
+	int partId0, partId1, index0, index1;
+	uint8_t isSpecial;
+};
+struct GpuManifoldOut {
+	int bodyA, bodyB;          // >= 0: dyn slot (0 = ball); < 0: static handle -1-v
+	int numContacts;
+	GpuContactOut pts[4];
+};
+// Capacity == pair capacity (<= 1 manifold per pair, so overflow is impossible)
+#define GPU_MAX_MANIFOLDS 96
+
+// Ball game state touched by collision callbacks (soccar scope)
+struct GpuBallGameState {
+	GpuVec3 velocityImpulseCache;  // Ball::_velocityImpulseCache (BT units)
+};
+
+// Constants for the collide phase (shared by all arenas)
+struct GpuCollideConsts {
+	// btCompoundShape::getAabb inputs (m_localAabb includes the child box margin)
+	GpuVec3 carLocalAabbMin, carLocalAabbMax;
+	float carCompoundMargin;
+	float ballRadius;
+	GpuVec3 carBoxHalfExtNoMargin;
+	float carBoxMargin;
+	GpuVec3 carChildOffset;            // compound child transform origin (basis = I)
+	float ballBreakingThreshold, carBreakingThreshold; // getAngularMotionDisc()*0.02
+	float ballFriction, ballRestitution, carFriction, carRestitution;
+	int ballFilterGroup, ballFilterMask, carFilterGroup, carFilterMask;
+	int numStatics;
+	int gameMode;                      // RocketSim GameMode (0 = soccar)
+	int demoMode;                      // MutatorConfig (gates: DISABLED)
+	uint8_t enableTeamDemos;
+	float respawnDelay, bumpCooldownTime, bumpForceScale, ballHitExtraForceScale;
+	float carWorldFriction, carWorldRestitution;
+	float carBallFriction, carBallRestitution;   // CARBALL_COLLISION_*
+	float carCarFriction, carCarRestitution;     // CARCAR_COLLISION_*
+	float bumpMinForwardDist;                    // BUMP_MIN_FORWARD_DIST (UU)
+	float ballCarExtraZScale, ballCarExtraForwardScale, ballCarExtraMaxDeltaVelUU;
+	GpuCurve ballExtraImpulseFactorCurve;
+	GpuCurve bumpVelGroundCurve, bumpVelAirCurve, bumpUpwardVelCurve;
 };
 
 } // namespace rscuda

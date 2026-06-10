@@ -27,6 +27,7 @@
 #include "CudaRaycast.cuh"
 #include "CudaVehicle.cuh"
 #include "CudaCollision.cuh"
+#include "CudaCollideWorld.cuh"
 #include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
@@ -79,6 +80,21 @@ struct GpuBatch {
 	GpuBvhSubtree* dBvhSubtrees;
 	GpuTriInfo* dTriInfos;
 	float* dMeshMargins;
+
+	// collision orchestration (uploaded once / persistent per arena)
+	GpuCollideConsts* dCollideConsts;
+	GpuStaticObj* dStatics;
+	int numStatics;
+	int* dCellStaticStart;
+	int* dCellStaticList;
+	GpuGridParams grid;
+	GpuDynProxy* dDynProxies;     // [numArenas * bodiesPerArena]
+	int* dRegCounters;            // [numArenas]
+	GpuBallGameState* dBallStates;// [numArenas]
+	CuManifold* dManifolds;       // [numArenas * GPU_MAX_MANIFOLDS]
+	int* dNumManifolds;           // [numArenas]
+	GpuManifoldOut* dManifoldsOut;// [numArenas * GPU_MAX_MANIFOLDS] (download mirror)
+	bool hasCollideData;
 };
 
 // Capture this CPU's RSQRTSS into the device emulation table; verify the emulation
@@ -104,6 +120,9 @@ static void InitRsqrtEmulation() {
 
 GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	InitRsqrtEmulation();
+	// EPA penetration (collision phase GJK fallback) recurses deeply; the default
+	// 1KB device stack overflows (proven in cuda_math_test).
+	CudaCheck(cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024), "set stack size");
 	GpuBatch* b = new GpuBatch{};
 	b->numArenas = numArenas;
 	b->numCars = numCarsPerArena;
@@ -116,6 +135,14 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	CudaCheck(cudaMalloc(&b->dCars, sizeof(GpuCarGameState) * numArenas * numCarsPerArena), "alloc cars");
 	CudaCheck(cudaMalloc(&b->dPads, sizeof(GpuPadState) * numArenas * numPads), "alloc pads");
 	b->dSchedule = nullptr;
+	CudaCheck(cudaMalloc(&b->dDynProxies, sizeof(GpuDynProxy) * numArenas * b->bodiesPerArena), "alloc proxies");
+	CudaCheck(cudaMalloc(&b->dRegCounters, sizeof(int) * numArenas), "alloc regctr");
+	CudaCheck(cudaMalloc(&b->dBallStates, sizeof(GpuBallGameState) * numArenas), "alloc ballstates");
+	CudaCheck(cudaMemset(b->dBallStates, 0, sizeof(GpuBallGameState) * numArenas), "zero ballstates");
+	CudaCheck(cudaMalloc(&b->dManifolds, sizeof(CuManifold) * numArenas * GPU_MAX_MANIFOLDS), "alloc manifolds");
+	CudaCheck(cudaMalloc(&b->dNumManifolds, sizeof(int) * numArenas), "alloc nummanifolds");
+	CudaCheck(cudaMemset(b->dNumManifolds, 0, sizeof(int) * numArenas), "zero nummanifolds");
+	CudaCheck(cudaMalloc(&b->dManifoldsOut, sizeof(GpuManifoldOut) * numArenas * GPU_MAX_MANIFOLDS), "alloc manifoldsout");
 	return b;
 }
 
@@ -134,6 +161,16 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dBvhSubtrees);
 	cudaFree(b->dTriInfos);
 	cudaFree(b->dMeshMargins);
+	cudaFree(b->dCollideConsts);
+	cudaFree(b->dStatics);
+	cudaFree(b->dCellStaticStart);
+	cudaFree(b->dCellStaticList);
+	cudaFree(b->dDynProxies);
+	cudaFree(b->dRegCounters);
+	cudaFree(b->dBallStates);
+	cudaFree(b->dManifolds);
+	cudaFree(b->dNumManifolds);
+	cudaFree(b->dManifoldsOut);
 	delete b;
 }
 
@@ -153,6 +190,53 @@ void UploadMeshBvhs(GpuBatch* b,
 	CudaCheck(cudaMemcpy(b->dBvhSubtrees, subtrees, sizeof(GpuBvhSubtree) * numSubtrees, cudaMemcpyHostToDevice), "up bvh subtrees");
 	CudaCheck(cudaMemcpy(b->dTriInfos, triInfos, sizeof(GpuTriInfo) * numTris, cudaMemcpyHostToDevice), "up tri infos");
 	CudaCheck(cudaMemcpy(b->dMeshMargins, meshMargins, sizeof(float) * numMeshes, cudaMemcpyHostToDevice), "up mesh margins");
+}
+
+void UploadCollideData(GpuBatch* b, const GpuCollideConsts& consts,
+	const GpuStaticObj* statics, int numStatics,
+	const int* cellStaticStart, int numCells,
+	const int* cellStaticList, int listLen,
+	const GpuGridParams& grid) {
+	CudaCheck(cudaMalloc(&b->dCollideConsts, sizeof(GpuCollideConsts)), "alloc collide consts");
+	CudaCheck(cudaMalloc(&b->dStatics, sizeof(GpuStaticObj) * numStatics), "alloc statics");
+	CudaCheck(cudaMalloc(&b->dCellStaticStart, sizeof(int) * (numCells + 1)), "alloc cell start");
+	CudaCheck(cudaMalloc(&b->dCellStaticList, sizeof(int) * listLen), "alloc cell list");
+	CudaCheck(cudaMemcpy(b->dCollideConsts, &consts, sizeof(GpuCollideConsts), cudaMemcpyHostToDevice), "up collide consts");
+	CudaCheck(cudaMemcpy(b->dStatics, statics, sizeof(GpuStaticObj) * numStatics, cudaMemcpyHostToDevice), "up statics");
+	CudaCheck(cudaMemcpy(b->dCellStaticStart, cellStaticStart, sizeof(int) * (numCells + 1), cudaMemcpyHostToDevice), "up cell start");
+	CudaCheck(cudaMemcpy(b->dCellStaticList, cellStaticList, sizeof(int) * listLen, cudaMemcpyHostToDevice), "up cell list");
+	b->numStatics = numStatics;
+	b->grid = grid;
+	b->hasCollideData = true;
+}
+
+void UploadDynProxies(GpuBatch* b, int arenaIdx, const GpuDynProxy* proxies, int regCounter) {
+	CudaCheck(cudaMemcpy(b->dDynProxies + (size_t)arenaIdx * b->bodiesPerArena, proxies,
+		sizeof(GpuDynProxy) * b->bodiesPerArena, cudaMemcpyHostToDevice), "up proxies");
+	CudaCheck(cudaMemcpy(b->dRegCounters + arenaIdx, &regCounter, sizeof(int),
+		cudaMemcpyHostToDevice), "up regctr");
+}
+
+void UploadBallState(GpuBatch* b, int arenaIdx, const GpuBallGameState& state) {
+	CudaCheck(cudaMemcpy(b->dBallStates + arenaIdx, &state, sizeof(GpuBallGameState),
+		cudaMemcpyHostToDevice), "up ball state");
+}
+
+void SetTickCount(GpuBatch* b, uint64_t tickCount) {
+	b->tickCount = tickCount;
+}
+
+void DownloadCollideResults(GpuBatch* b, int arenaIdx,
+	GpuManifoldOut* manifolds, int* numManifolds,
+	GpuDynProxy* proxies, GpuBallGameState* ball) {
+	CudaCheck(cudaMemcpy(numManifolds, b->dNumManifolds + arenaIdx, sizeof(int),
+		cudaMemcpyDeviceToHost), "down nummanifolds");
+	CudaCheck(cudaMemcpy(manifolds, b->dManifoldsOut + (size_t)arenaIdx * GPU_MAX_MANIFOLDS,
+		sizeof(GpuManifoldOut) * GPU_MAX_MANIFOLDS, cudaMemcpyDeviceToHost), "down manifolds");
+	CudaCheck(cudaMemcpy(proxies, b->dDynProxies + (size_t)arenaIdx * b->bodiesPerArena,
+		sizeof(GpuDynProxy) * b->bodiesPerArena, cudaMemcpyDeviceToHost), "down proxies");
+	CudaCheck(cudaMemcpy(ball, b->dBallStates + arenaIdx, sizeof(GpuBallGameState),
+		cudaMemcpyDeviceToHost), "down ball state");
 }
 
 void UploadCarConsts(GpuBatch* b, const GpuCarConsts& consts) {
@@ -339,18 +423,8 @@ void UploadControlSchedule(GpuBatch* b, const GpuCarControls* schedule, int numT
 }
 
 // ============================== DEVICE-SIDE PHASES ==============================
-// Bullet activation state constants (btCollisionObject.h)
-#define CU_ACTIVE_TAG 1
-#define CU_ISLAND_SLEEPING 2
-#define CU_WANTS_DEACTIVATION 3
-#define CU_DISABLE_DEACTIVATION 4
-#define CU_DISABLE_SIMULATION 5
-#define CU_DEACTIVATION_TIME 2.0f // gDeactivationTime global default
-
-__device__ __forceinline__ bool CuIsActive(int state) {
-	// btCollisionObject::isActive(): != FIXED_BASE_MULTI_BODY(6) && != ISLAND_SLEEPING && != DISABLE_SIMULATION
-	return state != 6 && state != CU_ISLAND_SLEEPING && state != CU_DISABLE_SIMULATION;
-}
+// (activation constants + CuIsActive live in CudaCollideWorld.cuh - the collide
+// phase needs them too)
 
 // btCollisionObject::setActivationState (respects DISABLE_* lock-in)
 __device__ __forceinline__ void CuSetActivationState(int& cur, int newState) {
@@ -434,12 +508,68 @@ __device__ __forceinline__ void PhaseActivation(GpuBodyState& s, const GpuBodyCo
 
 // ============================== MONOLITHIC KERNEL ==============================
 
+// Collision-phase buffers/constants, bundled to keep the kernel signature sane.
+struct GpuCollideKernelArgs {
+	int enabled;
+	GpuDynProxy* proxies;            // [numArenas * bodiesPerArena]
+	int* regCounters;                // [numArenas]
+	GpuBallGameState* ballStates;    // [numArenas]
+	const GpuCollideConsts* consts;
+	const GpuStaticObj* statics;
+	int numStatics;
+	const int* cellStaticStart;
+	const int* cellStaticList;
+	GpuGridParams grid;
+	const GpuMeshBvh* bvhs;
+	const GpuBvhNode* bvhNodes;
+	const GpuBvhSubtree* bvhSubtrees;
+	const GpuTriInfo* triInfos;
+	const float* meshMargins;
+	CuManifold* manifolds;           // [numArenas * GPU_MAX_MANIFOLDS]
+	int* numManifolds;               // [numArenas]
+	GpuManifoldOut* manifoldsOut;    // [numArenas * GPU_MAX_MANIFOLDS]
+	uint64_t tickBase;
+};
+
+__device__ static void StoreVec(GpuVec3& dst, CuVec3 v) { dst = { v.x, v.y, v.z }; }
+
+// Convert the device manifolds of one arena into the host download mirror.
+__device__ static void EmitManifoldsOut(const CuManifold* src, int n, GpuManifoldOut* dst) {
+	for (int i = 0; i < n; i++) {
+		const CuManifold& m = src[i];
+		GpuManifoldOut& o = dst[i];
+		o.bodyA = m.bodyA;
+		o.bodyB = m.bodyB;
+		o.numContacts = m.numContacts;
+		for (int c = 0; c < m.numContacts; c++) {
+			const CuManifoldPoint& p = m.pts[c];
+			GpuContactOut& po = o.pts[c];
+			StoreVec(po.localPointA, p.localPointA);
+			StoreVec(po.localPointB, p.localPointB);
+			StoreVec(po.positionWorldOnA, p.positionWorldOnA);
+			StoreVec(po.positionWorldOnB, p.positionWorldOnB);
+			StoreVec(po.normalWorldOnB, p.normalWorldOnB);
+			StoreVec(po.lateralFrictionDir1, p.lateralFrictionDir1);
+			StoreVec(po.lateralFrictionDir2, p.lateralFrictionDir2);
+			po.distance = p.distance1;
+			po.combinedFriction = p.combinedFriction;
+			po.combinedRestitution = p.combinedRestitution;
+			po.partId0 = p.partId0;
+			po.partId1 = p.partId1;
+			po.index0 = p.index0;
+			po.index1 = p.index1;
+			po.isSpecial = p.isSpecial;
+		}
+	}
+}
+
 __global__ void GpuStepArenasKernel(
 	GpuBodyState* bodies, const GpuBodyConsts* consts,
 	GpuCarGameState* cars, GpuPadState* pads,
 	const GpuCarControls* schedule,
 	int numCars, int numPads, int numTicks,
-	int startPhase, int endPhase, float dt) {
+	int startPhase, int endPhase, float dt,
+	GpuWorldGeo geo, GpuCollideKernelArgs ca) {
 
 	const int arenaIdx = blockIdx.x;
 	const int bodiesPerArena = 1 + numCars;
@@ -448,7 +578,7 @@ __global__ void GpuStepArenasKernel(
 	GpuBodyState* arenaBodies = bodies + (size_t)arenaIdx * bodiesPerArena;
 	GpuCarGameState* arenaCars = cars + (size_t)arenaIdx * numCars;
 	GpuPadState* arenaPads = pads + (size_t)arenaIdx * numPads;
-	(void)arenaCars; (void)arenaPads; (void)schedule;
+	(void)arenaPads; (void)schedule;
 
 	for (int tick = 0; tick < numTicks; tick++) {
 		// Phases 1-4 (game pre-tick) land here.
@@ -459,7 +589,40 @@ __global__ void GpuStepArenasKernel(
 		}
 		__syncthreads();
 
-		// Phase 6 collision + phase 7 islands/solver land here.
+		if (ca.enabled && startPhase <= GPU_PHASE_COLLISION && GPU_PHASE_COLLISION <= endPhase) {
+			if (bodyIdx == 0) {
+				CuCollideIn cin;
+				cin.bodies = arenaBodies;
+				cin.bodyConsts = consts;
+				cin.numBodies = bodiesPerArena;
+				cin.cars = arenaCars;
+				cin.ball = ca.ballStates + arenaIdx;
+				cin.proxies = ca.proxies + (size_t)arenaIdx * bodiesPerArena;
+				cin.regCounter = ca.regCounters + arenaIdx;
+				cin.statics = ca.statics;
+				cin.numStatics = ca.numStatics;
+				cin.cellStaticStart = ca.cellStaticStart;
+				cin.cellStaticList = ca.cellStaticList;
+				cin.grid = ca.grid;
+				cin.geo = geo;
+				cin.bvhs = ca.bvhs;
+				cin.bvhNodes = ca.bvhNodes;
+				cin.bvhSubtrees = ca.bvhSubtrees;
+				cin.triInfos = ca.triInfos;
+				cin.meshMargins = ca.meshMargins;
+				cin.cc = *ca.consts;
+				cin.tickCount = ca.tickBase + tick;
+				cin.dt = dt;
+				cin.manifolds = ca.manifolds + (size_t)arenaIdx * GPU_MAX_MANIFOLDS;
+				cin.numManifolds = ca.numManifolds + arenaIdx;
+				CuCollideTick(cin);
+				EmitManifoldsOut(cin.manifolds, *cin.numManifolds,
+					ca.manifoldsOut + (size_t)arenaIdx * GPU_MAX_MANIFOLDS);
+			}
+		}
+		__syncthreads();
+
+		// Phase 7 islands/solver lands here.
 
 		if (startPhase <= GPU_PHASE_INTEGRATE && GPU_PHASE_INTEGRATE <= endPhase) {
 			if (bodyIdx < bodiesPerArena)
@@ -480,9 +643,32 @@ __global__ void GpuStepArenasKernel(
 static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 	constexpr float TICK_TIME = 1.0f / 120.0f;
 	int threads = b->bodiesPerArena > 32 ? 64 : 32;
+	GpuCollideKernelArgs ca = {};
+	ca.enabled = b->hasCollideData ? 1 : 0;
+	if (b->hasCollideData) {
+		ca.proxies = b->dDynProxies;
+		ca.regCounters = b->dRegCounters;
+		ca.ballStates = b->dBallStates;
+		ca.consts = b->dCollideConsts;
+		ca.statics = b->dStatics;
+		ca.numStatics = b->numStatics;
+		ca.cellStaticStart = b->dCellStaticStart;
+		ca.cellStaticList = b->dCellStaticList;
+		ca.grid = b->grid;
+		ca.bvhs = b->dMeshBvhs;
+		ca.bvhNodes = b->dBvhNodes;
+		ca.bvhSubtrees = b->dBvhSubtrees;
+		ca.triInfos = b->dTriInfos;
+		ca.meshMargins = b->dMeshMargins;
+		ca.manifolds = b->dManifolds;
+		ca.numManifolds = b->dNumManifolds;
+		ca.manifoldsOut = b->dManifoldsOut;
+		ca.tickBase = b->tickCount;
+	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(
 		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule,
-		b->numCars, b->numPads, numTicks, startPhase, endPhase, TICK_TIME);
+		b->numCars, b->numPads, numTicks, startPhase, endPhase, TICK_TIME,
+		b->geo, ca);
 	CudaCheck(cudaGetLastError(), "kernel launch");
 	CudaCheck(cudaDeviceSynchronize(), "kernel run");
 }

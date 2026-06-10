@@ -51,6 +51,29 @@ void UploadMeshBvhs(GpuBatch* batch,
 	const GpuTriInfo* triInfos, int numTris,
 	const float* meshMargins);
 
+// Collision-phase constants: static object table (broadphase handle order), static
+// per-cell CSR lists, grid params, and the collide consts. Uploaded once.
+void UploadCollideData(GpuBatch* batch, const GpuCollideConsts& consts,
+	const GpuStaticObj* statics, int numStatics,
+	const int* cellStaticStart, int numCells,
+	const int* cellStaticList, int listLen,
+	const GpuGridParams& grid);
+
+// Per-arena persistent broadphase proxy state (initial values from the CPU proxies)
+void UploadDynProxies(GpuBatch* batch, int arenaIdx,
+	const GpuDynProxy* proxies, int regCounter);
+
+void UploadBallState(GpuBatch* batch, int arenaIdx, const GpuBallGameState& state);
+
+// The arena tick counter the device uses (ball-hit extra-impulse guard etc.)
+void SetTickCount(GpuBatch* batch, uint64_t tickCount);
+
+// Download the collide-phase results of one arena: manifolds in dispatcher order,
+// proxy state, and the ball game state (callback side effects).
+void DownloadCollideResults(GpuBatch* batch, int arenaIdx,
+	GpuManifoldOut* manifolds, int* numManifolds,
+	GpuDynProxy* proxies, GpuBallGameState* ball);
+
 // Diagnostic: closest-hit static-world raycast for ray-fuzz validation vs CPU rayTest.
 struct GpuRayFuzzResult {
 	int hitKind;       // -1 = none, 0 = static
