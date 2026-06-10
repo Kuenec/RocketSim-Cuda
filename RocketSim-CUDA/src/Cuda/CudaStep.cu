@@ -69,6 +69,8 @@ struct GpuBatch {
 	GpuMeshInfo* dMeshes;
 	GpuVec3* dTris;
 	GpuWorldGeo geo; // holds device pointers
+
+	GpuCarConsts* dCarConsts; // per-car-slot constants (uploaded once)
 };
 
 // Capture this CPU's RSQRTSS into the device emulation table; verify the emulation
@@ -118,7 +120,115 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dPlanes);
 	cudaFree(b->dMeshes);
 	cudaFree(b->dTris);
+	cudaFree(b->dCarConsts);
 	delete b;
+}
+
+void UploadCarConsts(GpuBatch* b, const GpuCarConsts& consts) {
+	if (!b->dCarConsts)
+		CudaCheck(cudaMalloc(&b->dCarConsts, sizeof(GpuCarConsts)), "alloc car consts");
+	CudaCheck(cudaMemcpy(b->dCarConsts, &consts, sizeof(GpuCarConsts), cudaMemcpyHostToDevice), "upload car consts");
+}
+
+// ---- car pre-tick single-shot (compare harness) ----
+
+__device__ __forceinline__ CuBodyDyn DynToBody(const GpuDynBody& d) {
+	CuBodyDyn b;
+	b.basis = GM(d.basis);
+	b.origin = GV(d.origin);
+	b.linVel = GV(d.linVel);
+	b.angVel = GV(d.angVel);
+	b.invInertiaWorld = GM(d.invInertiaWorld);
+	b.invInertiaDiagLocal = GV(d.invInertiaDiagLocal);
+	b.invMass = d.invMass;
+	return b;
+}
+
+__global__ void CarPreTickOnceKernel(
+	GpuWorldGeo geo, GpuGridParams grid,
+	const GpuCarConsts* cc, GpuCarTickState* state,
+	const GpuDynBody* dyn,
+	int numDyn, int selfDynIdx, float tickTime,
+	GpuWheelScratchOut* wheelsOut) {
+
+	CuCarTickIO io;
+	io.body.basis = GM(state->basis);
+	io.body.origin = GV(state->origin);
+	io.body.linVel = GV(state->linVel);
+	io.body.angVel = GV(state->angVel);
+	io.body.invInertiaWorld = GM(state->invInertiaWorld);
+	io.body.invInertiaDiagLocal = GV(state->invInertiaDiagLocal);
+	io.body.invMass = state->invMass;
+	io.totalForce = GV(state->totalForce);
+	io.totalTorque = GV(state->totalTorque);
+	io.st = state->st;
+	for (int i = 0; i < 4; i++) io.wheels[i] = state->wheels[i];
+	io.controls = state->controls;
+	io.solverTimeStep = state->solverTimeStep;
+
+	// dynamic body impulse views (ground bodies for friction)
+	CuBodyDyn dynBodies[8];
+	for (int i = 0; i < numDyn && i < 8; i++)
+		dynBodies[i] = DynToBody(dyn[i]);
+
+	CuWheelScratch W[4];
+	float dbgFwd = 0;
+	CuCarPreTick(io, *cc, geo, grid, dyn, numDyn, selfDynIdx, dynBodies, tickTime, W, &dbgFwd);
+	state->dbgForwardSpeedUU = dbgFwd;
+
+	// write back
+	for (int r = 0; r < 3; r++)
+		state->basis.row[r] = { io.body.basis.r[r].x, io.body.basis.r[r].y, io.body.basis.r[r].z };
+	state->origin = { io.body.origin.x, io.body.origin.y, io.body.origin.z };
+	state->linVel = { io.body.linVel.x, io.body.linVel.y, io.body.linVel.z };
+	state->angVel = { io.body.angVel.x, io.body.angVel.y, io.body.angVel.z };
+	state->totalForce = { io.totalForce.x, io.totalForce.y, io.totalForce.z };
+	state->totalTorque = { io.totalTorque.x, io.totalTorque.y, io.totalTorque.z };
+	state->st = io.st;
+	for (int i = 0; i < 4; i++) state->wheels[i] = io.wheels[i];
+	state->controls = io.controls;
+
+	for (int i = 0; i < 4; i++) {
+		GpuWheelScratchOut& o = wheelsOut[i];
+		for (int r = 0; r < 3; r++)
+			o.worldBasis.row[r] = { W[i].worldBasis.r[r].x, W[i].worldBasis.r[r].y, W[i].worldBasis.r[r].z };
+		o.hardPointWS = { W[i].hardPointWS.x, W[i].hardPointWS.y, W[i].hardPointWS.z };
+		o.contactPointWS = { W[i].contactPointWS.x, W[i].contactPointWS.y, W[i].contactPointWS.z };
+		o.contactNormalWS = { W[i].contactNormalWS.x, W[i].contactNormalWS.y, W[i].contactNormalWS.z };
+		o.isInContact = W[i].isInContact;
+		o.isInContactWithWorld = W[i].isInContactWithWorld;
+		o.groundIdx = W[i].groundIdx;
+		o.suspensionRelativeVelocity = W[i].suspensionRelativeVelocity;
+		o.clippedInvContactDotSuspension = W[i].clippedInvContactDotSuspension;
+		o.extraPushback = W[i].extraPushback;
+		o.impulse = { W[i].impulse.x, W[i].impulse.y, W[i].impulse.z };
+		o.dbgWheelTraceLen = W[i].dbgWheelTraceLen;
+		o.dbgPushThresh = W[i].dbgPushThresh;
+		o.dbgResolveRaw = W[i].dbgResolveRaw;
+	}
+}
+
+void RunCarPreTickOnce(GpuBatch* b, const GpuCarTickState& in,
+	const GpuDynBody* dynBodies, int numDyn, int selfDynIdx,
+	const GpuGridParams& grid, float tickTime,
+	GpuCarTickState& out, GpuWheelScratchOut wheelsOut[4]) {
+
+	static GpuCarTickState* dState = nullptr;
+	static GpuDynBody* dDyn = nullptr;
+	static GpuWheelScratchOut* dWheels = nullptr;
+	if (!dState) {
+		CudaCheck(cudaMalloc(&dState, sizeof(GpuCarTickState)), "alloc tick state");
+		CudaCheck(cudaMalloc(&dDyn, sizeof(GpuDynBody) * 8), "alloc dyn8");
+		CudaCheck(cudaMalloc(&dWheels, sizeof(GpuWheelScratchOut) * 4), "alloc wheels out");
+	}
+	CudaCheck(cudaMemcpy(dState, &in, sizeof(in), cudaMemcpyHostToDevice), "upload tick state");
+	CudaCheck(cudaMemcpy(dDyn, dynBodies, sizeof(GpuDynBody) * numDyn, cudaMemcpyHostToDevice), "upload dyn");
+
+	CarPreTickOnceKernel<<<1, 1>>>(b->geo, grid, b->dCarConsts, dState, dDyn,
+		numDyn, selfDynIdx, tickTime, dWheels);
+	CudaCheck(cudaGetLastError(), "car pretick launch");
+	CudaCheck(cudaMemcpy(&out, dState, sizeof(out), cudaMemcpyDeviceToHost), "download tick state");
+	CudaCheck(cudaMemcpy(wheelsOut, dWheels, sizeof(GpuWheelScratchOut) * 4, cudaMemcpyDeviceToHost), "download wheels");
 }
 
 void UploadWorldGeo(GpuBatch* b,

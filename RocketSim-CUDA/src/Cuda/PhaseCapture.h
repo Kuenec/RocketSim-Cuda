@@ -3,6 +3,7 @@
 #include <vector>
 
 class btDiscreteDynamicsWorld;
+namespace RocketSim { class Car; }
 
 // 2026-06-10: CPU-side phase-boundary state capture (work copy only, diagnostic).
 // Used by rocketsim_bench --gpu-compare to validate each ported GPU phase bit-exactly:
@@ -36,5 +37,58 @@ extern bool enabled;
 extern std::vector<BodySnap> points[POINT_COUNT]; // refreshed every captured tick
 
 void Capture(Point p, btDiscreteDynamicsWorld* world);
+
+// ---- per-car pre-tick capture (hooks in Car::_PreTickUpdate) ----
+// One entry per car per tick, in CPU execution order (unordered_set iteration), so the
+// GPU compare can replay each car's pre-tick from its exact input state - including
+// the post-pre-tick state of cars processed earlier in the same tick.
+
+struct WheelSnap {
+	float steerAngle, engineForce, brake, latFriction, longFriction, suspensionLength;
+	// intra-tick scratch after updateVehicleFirst:
+	float worldBasis[9];
+	float hardPointWS[3], contactPointWS[3], contactNormalWS[3];
+	uint8_t isInContact, isInContactWithWorld;
+	int groundIsStatic;     // 1 static, 0 dynamic, -1 none
+	const void* groundRb;   // identity of ground object (for dyn mapping)
+	float suspensionRelativeVelocity, clippedInvContactDotSuspension, extraPushback;
+	float impulse[3];
+};
+
+// Dynamic-body view at capture time (ray candidates + friction ground bodies)
+struct DynSnap {
+	const void* rb;
+	float basis[9], origin[3], linVel[3], angVel[3];
+	float invInertiaWorld[9], invInertiaDiagLocal[3];
+	float invMass;
+	float aabbMin[3];       // broadphase proxy (voxel cell gate)
+	uint8_t hasContactResponse;
+};
+
+struct CarPreTickSnap {
+	uint32_t carId;
+	int stage;              // 0 = entry, 1 = after updateVehicleFirst, 2 = exit
+	BodySnap body;          // own chassis (forces included)
+	DynSnap dyn[8];         // all nonstatic bodies at this moment (entry stage)
+	int numDyn;
+	WheelSnap wheels[4];
+	// game-state fields (CarState scalars the phase touches)
+	float handbrakeVal, boost, boostingTime, timeSinceBoosted, jumpTime, flipTime;
+	float airTime, airTimeSinceJump, autoFlipTimer, autoFlipTorqueScale;
+	float flipRelTorque[3], worldContactNormal[3];
+	uint8_t isOnGround, wheelsWithContact[4], hasJumped, hasDoubleJumped, hasFlipped;
+	uint8_t isFlipping, isJumping, isBoosting, isAutoFlipping, worldContactHasContact;
+	uint8_t isDemoed;
+	float solverTimeStep;   // solverInfo.m_timeStep at this moment
+	// inputs (entry stage): raw controls + last tick's controls (jumpPressed edge)
+	float ctrlThrottle, ctrlSteer, ctrlPitch, ctrlYaw, ctrlRoll;
+	uint8_t ctrlJump, ctrlBoost, ctrlHandbrake;
+	uint8_t lastCtrlJump;
+	float forwardSpeedUU; // getForwardSpeed()*BT_TO_UU as the CPU computes it
+};
+
+extern std::vector<CarPreTickSnap> carSnaps; // cleared at PRE car loop, appended per car/stage
+
+void CaptureCarPreTick(RocketSim::Car* car, int stage, float solverTimeStep);
 
 } // namespace rscap

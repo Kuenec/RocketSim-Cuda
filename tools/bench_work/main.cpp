@@ -662,6 +662,110 @@ static int RunRayFuzz(const Args& args, int numRays) {
 	return 0;
 }
 
+static rscuda::GpuCurve ExtractCurve(const LinearPieceCurve& c) {
+	rscuda::GpuCurve g = {};
+	int i = 0;
+	for (auto& p : c.valueMappings) {
+		g.xs[i] = p.first;
+		g.ys[i] = p.second;
+		i++;
+	}
+	g.n = i;
+	return g;
+}
+
+static rscuda::GpuCarConsts ExtractCarConsts(Arena* arena, Car* car) {
+	using namespace RLConst;
+	rscuda::GpuCarConsts cc = {};
+	for (int i = 0; i < 4; i++) {
+		auto& wi = car->_bulletVehicle.m_wheelInfo[i];
+		auto& wc = cc.wheels[i];
+		wc.connectionPointCS = ToGpuB(wi.m_chassisConnectionPointCS);
+		wc.suspensionRestLength = wi.getSuspensionRestLength();
+		wc.wheelRadius = wi.m_wheelsRadius;
+		wc.maxSuspensionTravelCm = wi.m_maxSuspensionTravelCm;
+		wc.suspensionStiffness = wi.m_suspensionStiffness;
+		wc.dampingCompression = wi.m_wheelsDampingCompression;
+		wc.dampingRelaxation = wi.m_wheelsDampingRelaxation;
+		wc.suspensionForceScale = wi.m_suspensionForceScale;
+	}
+	cc.wheelDirectionCS = ToGpuB(car->_bulletVehicle.m_wheelInfo[0].m_wheelDirectionCS);
+	cc.wheelAxleCS = ToGpuB(car->_bulletVehicle.m_wheelInfo[0].m_wheelAxleCS);
+	cc.massBT = CAR_MASS_BT;
+	cc.frictionScale = car->_rigidBody.getMass() / 3; // calcFrictionImpulses expression
+	cc.dodgeDeadzone = car->config.dodgeDeadzone;
+	cc.rayCastGroup = btBroadphaseProxy::DefaultFilter | CollisionMasks::DROPSHOT_FLOOR;
+	cc.erp = arena->_bulletWorld.getSolverInfo().m_erp;
+	cc.uuToBT = UU_TO_BT;
+	cc.btToUU = BT_TO_UU;
+
+	const MutatorConfig& mc = arena->GetMutatorConfig();
+	cc.jumpAccel = mc.jumpAccel;
+	cc.jumpImmediateForce = mc.jumpImmediateForce;
+	cc.jumpImmediateForceRL = JUMP_IMMEDIATE_FORCE;
+	cc.boostAccelGround = mc.boostAccelGround;
+	cc.boostAccelAir = mc.boostAccelAir;
+	cc.boostUsedPerSecond = mc.boostUsedPerSecond;
+	cc.rechargeBoostEnabled = mc.rechargeBoostEnabled;
+	cc.rechargeBoostDelay = mc.rechargeBoostDelay;
+	cc.rechargeBoostPerSecond = mc.rechargeBoostPerSecond;
+	cc.unlimitedFlips = mc.unlimitedFlips;
+	cc.unlimitedDoubleJumps = mc.unlimitedDoubleJumps;
+
+	cc.powerslideRiseRate = POWERSLIDE_RISE_RATE;
+	cc.powerslideFallRate = POWERSLIDE_FALL_RATE;
+	cc.throttleDeadzone = THROTTLE_DEADZONE;
+	cc.stoppingForwardVel = STOPPING_FORWARD_VEL;
+	cc.coastingBrakeFactor = COASTING_BRAKE_FACTOR;
+	cc.brakingNoThrottleSpeedThresh = BRAKING_NO_THROTTLE_SPEED_THRESH;
+	cc.throttleAirAccel = THROTTLE_AIR_ACCEL;
+	cc.jumpMinTime = JUMP_MIN_TIME;
+	cc.jumpMaxTime = JUMP_MAX_TIME;
+	cc.jumpResetTimePad = JUMP_RESET_TIME_PAD;
+	cc.doublejumpMaxDelay = DOUBLEJUMP_MAX_DELAY;
+	cc.flipZDamp120 = FLIP_Z_DAMP_120;
+	cc.flipZDampStart = FLIP_Z_DAMP_START;
+	cc.flipZDampEnd = FLIP_Z_DAMP_END;
+	cc.flipTorqueTime = FLIP_TORQUE_TIME;
+	cc.flipPitchlockExtraTime = FLIP_PITCHLOCK_EXTRA_TIME;
+	cc.flipInitialVelScale = FLIP_INITIAL_VEL_SCALE;
+	cc.flipTorqueX = FLIP_TORQUE_X;
+	cc.flipTorqueY = FLIP_TORQUE_Y;
+	cc.flipForwardImpulseMaxSpeedScale = FLIP_FORWARD_IMPULSE_MAX_SPEED_SCALE;
+	cc.flipSideImpulseMaxSpeedScale = FLIP_SIDE_IMPULSE_MAX_SPEED_SCALE;
+	cc.flipBackwardImpulseMaxSpeedScale = FLIP_BACKWARD_IMPULSE_MAX_SPEED_SCALE;
+	cc.flipBackwardImpulseScaleX = FLIP_BACKWARD_IMPULSE_SCALE_X;
+	cc.carTorqueScale = CAR_TORQUE_SCALE;
+	cc.carAirControlTorque = ToGpu(CAR_AIR_CONTROL_TORQUE);
+	cc.carAirControlDamping = ToGpu(CAR_AIR_CONTROL_DAMPING);
+	cc.carAutoflipImpulse = CAR_AUTOFLIP_IMPULSE;
+	cc.carAutoflipTorque = CAR_AUTOFLIP_TORQUE;
+	cc.carAutoflipTime = CAR_AUTOFLIP_TIME;
+	cc.carAutoflipNormZThresh = CAR_AUTOFLIP_NORMZ_THRESH;
+	cc.carAutoflipRollThresh = CAR_AUTOFLIP_ROLL_THRESH;
+	cc.carAutorollForce = CAR_AUTOROLL_FORCE;
+	cc.carAutorollTorque = CAR_AUTOROLL_TORQUE;
+	cc.boostMinTime = BOOST_MIN_TIME;
+	cc.boostMax = BOOST_MAX;
+	cc.carMaxSpeed = CAR_MAX_SPEED;
+	cc.suspensionSubtraction = BTVehicle::SUSPENSION_SUBTRACTION;
+
+	cc.throttleTorqueBT = THROTTLE_TORQUE_AMOUNT * UU_TO_BT;
+	cc.brakeTorqueBT = BRAKE_TORQUE_AMOUNT * UU_TO_BT;
+	cc.gravityZBT = GRAVITY_Z * UU_TO_BT;
+	cc.flipZDampFactor = powf(1 - FLIP_Z_DAMP_120, TICK_TIME / (1 / 120.f));
+
+	cc.driveSpeedTorqueFactor = ExtractCurve(DRIVE_SPEED_TORQUE_FACTOR_CURVE);
+	cc.steerAngleFromSpeed = ExtractCurve(STEER_ANGLE_FROM_SPEED_CURVE);
+	cc.powerslideSteerAngleFromSpeed = ExtractCurve(POWERSLIDE_STEER_ANGLE_FROM_SPEED_CURVE);
+	cc.nonStickyFrictionFactor = ExtractCurve(NON_STICKY_FRICTION_FACTOR_CURVE);
+	cc.latFriction = ExtractCurve(LAT_FRICTION_CURVE);
+	cc.longFriction = ExtractCurve(LONG_FRICTION_CURVE);
+	cc.handbrakeLatFrictionFactor = ExtractCurve(HANDBRAKE_LAT_FRICTION_FACTOR_CURVE);
+	cc.handbrakeLongFrictionFactor = ExtractCurve(HANDBRAKE_LONG_FRICTION_FACTOR_CURVE);
+	return cc;
+}
+
 // ---- lockstep phase validation (--gpu-compare N) ----
 // Per tick: run the CPU step with capture enabled, then for each ported phase upload
 // the CPU pre-phase state, run JUST that phase on the GPU, and bit-compare the result
@@ -741,12 +845,226 @@ static int RunGpuCompare(const Args& args) {
 		{ rscap::AFTER_INTEGRATE, rscap::AFTER_ACTIVATION, rscuda::GPU_PHASE_ACTIVATION, "activation" },
 	};
 
+	// world geo + car consts + dyn template table for the car pre-tick segment
+	{
+		std::vector<rscuda::GpuPlane> planes;
+		std::vector<rscuda::GpuMeshInfo> meshes;
+		std::vector<rscuda::GpuVec3> tris;
+		ExtractWorldGeo(arena, planes, meshes, tris);
+		rscuda::UploadWorldGeo(batch, planes.data(), (int)planes.size(),
+			meshes.data(), (int)meshes.size(), tris.data(), (int)(tris.size() / 3));
+		rscuda::UploadCarConsts(batch, ExtractCarConsts(arena, slots[0].car));
+	}
+	rscuda::GpuGridParams grid = {};
+	{
+		auto* bp = (btRSBroadphase*)arena->_bulletWorldParams.broadphase;
+		grid.minPos = ToGpuB(bp->minPos);
+		grid.cellSize = bp->cellSize;
+		grid.cellSizeSq = bp->cellSizeSq;
+		grid.cellsX = bp->cellsX;
+		grid.cellsY = bp->cellsY;
+		grid.cellsZ = bp->cellsZ;
+	}
+	// rb -> shape/filter template (transforms/dynamics filled per snap)
+	struct DynTemplate { const void* rb; rscuda::GpuDynBody base; };
+	std::vector<DynTemplate> dynTemplates;
+	{
+		DynTemplate t = {};
+		btRigidBody& rb = arena->ball->_rigidBody;
+		t.rb = &rb;
+		t.base.kind = 1;
+		t.base.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		t.base.group = rb.getBroadphaseProxy()->m_collisionFilterGroup;
+		t.base.mask = rb.getBroadphaseProxy()->m_collisionFilterMask;
+		dynTemplates.push_back(t);
+		for (CarSlot& slot : slots) {
+			DynTemplate c = {};
+			c.rb = &slot.car->_rigidBody;
+			c.base.kind = 2;
+			const btBoxShape& box = slot.car->_childHitboxShape;
+			btVector3 he = box.getHalfExtentsWithoutMargin();
+			float m = box.getMargin();
+			c.base.boxHalfExtWithMargin = { he.x() + m, he.y() + m, he.z() + m };
+			c.base.childOffset = ToGpuB(slot.car->_compoundShape.getChildTransform(0).getOrigin());
+			c.base.group = slot.car->_rigidBody.getBroadphaseProxy()->m_collisionFilterGroup;
+			c.base.mask = slot.car->_rigidBody.getBroadphaseProxy()->m_collisionFilterMask;
+			dynTemplates.push_back(c);
+		}
+	}
+
 	for (int tick = 0; tick < args.gpuCompare; tick++) {
 		for (CarSlot& slot : slots)
 			UpdateControls(slot);
+		rscap::carSnaps.clear();
 		rscap::enabled = true;
 		arena->Step(1);
 		rscap::enabled = false;
+
+		// ---- car pre-tick segment (one compare per car, in CPU execution order) ----
+		for (size_t k = 0; k + 2 < rscap::carSnaps.size(); k += 3) {
+			const rscap::CarPreTickSnap& entry = rscap::carSnaps[k];
+			const rscap::CarPreTickSnap& afterFirst = rscap::carSnaps[k + 1];
+			const rscap::CarPreTickSnap& exitSnap = rscap::carSnaps[k + 2];
+
+			// build dyn array in entry.dyn order, merging shape templates
+			rscuda::GpuDynBody dyn[8] = {};
+			int selfIdx = -1;
+			for (int i = 0; i < entry.numDyn; i++) {
+				const rscap::DynSnap& ds = entry.dyn[i];
+				for (auto& t : dynTemplates)
+					if (t.rb == ds.rb)
+						dyn[i] = t.base;
+				memcpy(&dyn[i].basis, ds.basis, 36);
+				memcpy(&dyn[i].origin, ds.origin, 12);
+				memcpy(&dyn[i].aabbMin, ds.aabbMin, 12);
+				memcpy(&dyn[i].linVel, ds.linVel, 12);
+				memcpy(&dyn[i].angVel, ds.angVel, 12);
+				memcpy(&dyn[i].invInertiaWorld, ds.invInertiaWorld, 36);
+				memcpy(&dyn[i].invInertiaDiagLocal, ds.invInertiaDiagLocal, 12);
+				dyn[i].invMass = ds.invMass;
+				dyn[i].hasContactResponse = ds.hasContactResponse;
+				if (ds.rb == entry.body.rb)
+					selfIdx = i;
+			}
+
+			rscuda::GpuCarTickState in = {};
+			memcpy(&in.basis, entry.body.basis, 36);
+			memcpy(&in.origin, entry.body.pos, 12);
+			memcpy(&in.linVel, entry.body.linVel, 12);
+			memcpy(&in.angVel, entry.body.angVel, 12);
+			memcpy(&in.totalForce, entry.body.totalForce, 12);
+			memcpy(&in.totalTorque, entry.body.totalTorque, 12);
+			memcpy(&in.invInertiaWorld, entry.body.invInertiaWorld, 36);
+			memcpy(&in.invInertiaDiagLocal, entry.dyn[selfIdx].invInertiaDiagLocal, 12);
+			in.invMass = entry.dyn[selfIdx].invMass;
+			in.solverTimeStep = entry.solverTimeStep;
+
+			auto fillState = [](rscuda::GpuCarGameState& g, const rscap::CarPreTickSnap& s) {
+				g.handbrakeVal = s.handbrakeVal;
+				g.boost = s.boost;
+				g.boostingTime = s.boostingTime;
+				g.timeSinceBoosted = s.timeSinceBoosted;
+				g.jumpTime = s.jumpTime;
+				g.flipTime = s.flipTime;
+				g.airTime = s.airTime;
+				g.airTimeSinceJump = s.airTimeSinceJump;
+				g.autoFlipTimer = s.autoFlipTimer;
+				g.autoFlipTorqueScale = s.autoFlipTorqueScale;
+				memcpy(&g.flipRelTorque, s.flipRelTorque, 12);
+				memcpy(&g.worldContact_normal, s.worldContactNormal, 12);
+				g.isOnGround = s.isOnGround;
+				for (int w = 0; w < 4; w++) g.wheelsWithContact[w] = s.wheelsWithContact[w];
+				g.hasJumped = s.hasJumped;
+				g.hasDoubleJumped = s.hasDoubleJumped;
+				g.hasFlipped = s.hasFlipped;
+				g.isFlipping = s.isFlipping;
+				g.isJumping = s.isJumping;
+				g.isBoosting = s.isBoosting;
+				g.isAutoFlipping = s.isAutoFlipping;
+				g.worldContact_hasContact = s.worldContactHasContact;
+				g.isDemoed = s.isDemoed;
+			};
+			fillState(in.st, entry);
+			in.st.lastControls.jump = entry.lastCtrlJump;
+			in.controls.throttle = entry.ctrlThrottle;
+			in.controls.steer = entry.ctrlSteer;
+			in.controls.pitch = entry.ctrlPitch;
+			in.controls.yaw = entry.ctrlYaw;
+			in.controls.roll = entry.ctrlRoll;
+			in.controls.jump = entry.ctrlJump;
+			in.controls.boost = entry.ctrlBoost;
+			in.controls.handbrake = entry.ctrlHandbrake;
+			for (int w = 0; w < 4; w++) {
+				in.wheels[w].steerAngle = entry.wheels[w].steerAngle;
+				in.wheels[w].engineForce = entry.wheels[w].engineForce;
+				in.wheels[w].brake = entry.wheels[w].brake;
+				in.wheels[w].latFriction = entry.wheels[w].latFriction;
+				in.wheels[w].longFriction = entry.wheels[w].longFriction;
+				in.wheels[w].suspensionLength = entry.wheels[w].suspensionLength;
+				in.wheels[w].extraPushback = entry.wheels[w].extraPushback;
+			}
+
+			rscuda::GpuCarTickState out;
+			rscuda::GpuWheelScratchOut wOut[4];
+			rscuda::RunCarPreTickOnce(batch, in, dyn, entry.numDyn, selfIdx, grid, TICK_TIME, out, wOut);
+
+			// compare against exit snap
+			auto failF = [&](const char* what, int wheelIdx, float cpu, float gpu) -> bool {
+				uint32_t cb, gb;
+				memcpy(&cb, &cpu, 4);
+				memcpy(&gb, &gpu, 4);
+				if (cb == gb) return false;
+				printf("GPU_COMPARE: FAIL tick %d car %u pretick %s%s%d: cpu %.9g (0x%08X) gpu %.9g (0x%08X)\n",
+					tick, entry.carId, what, wheelIdx >= 0 ? " wheel " : "", wheelIdx >= 0 ? wheelIdx : 0,
+					cpu, cb, gpu, gb);
+				return true;
+			};
+			bool bad = false;
+			bad |= failF("dbgForwardSpeedUU", -1, afterFirst.forwardSpeedUU, out.dbgForwardSpeedUU);
+			const float* cv;
+			cv = exitSnap.body.linVel;
+			bad |= failF("linVel.x", -1, cv[0], out.linVel.x) || failF("linVel.y", -1, cv[1], out.linVel.y) || failF("linVel.z", -1, cv[2], out.linVel.z);
+			cv = exitSnap.body.angVel;
+			bad |= failF("angVel.x", -1, cv[0], out.angVel.x) || failF("angVel.y", -1, cv[1], out.angVel.y) || failF("angVel.z", -1, cv[2], out.angVel.z);
+			cv = exitSnap.body.totalForce;
+			bad |= failF("force.x", -1, cv[0], out.totalForce.x) || failF("force.y", -1, cv[1], out.totalForce.y) || failF("force.z", -1, cv[2], out.totalForce.z);
+			cv = exitSnap.body.totalTorque;
+			bad |= failF("torque.x", -1, cv[0], out.totalTorque.x) || failF("torque.y", -1, cv[1], out.totalTorque.y) || failF("torque.z", -1, cv[2], out.totalTorque.z);
+			bad |= failF("handbrakeVal", -1, exitSnap.handbrakeVal, out.st.handbrakeVal);
+			bad |= failF("boost", -1, exitSnap.boost, out.st.boost);
+			bad |= failF("boostingTime", -1, exitSnap.boostingTime, out.st.boostingTime);
+			bad |= failF("timeSinceBoosted", -1, exitSnap.timeSinceBoosted, out.st.timeSinceBoosted);
+			bad |= failF("jumpTime", -1, exitSnap.jumpTime, out.st.jumpTime);
+			bad |= failF("flipTime", -1, exitSnap.flipTime, out.st.flipTime);
+			bad |= failF("airTime", -1, exitSnap.airTime, out.st.airTime);
+			bad |= failF("airTimeSinceJump", -1, exitSnap.airTimeSinceJump, out.st.airTimeSinceJump);
+			bad |= failF("autoFlipTimer", -1, exitSnap.autoFlipTimer, out.st.autoFlipTimer);
+			bad |= failF("flipRelTorque.x", -1, exitSnap.flipRelTorque[0], out.st.flipRelTorque.x);
+			bad |= failF("flipRelTorque.y", -1, exitSnap.flipRelTorque[1], out.st.flipRelTorque.y);
+			auto failB = [&](const char* what, int cpu, int gpu) -> bool {
+				if (cpu == gpu) return false;
+				printf("GPU_COMPARE: FAIL tick %d car %u pretick %s: cpu %d gpu %d\n", tick, entry.carId, what, cpu, gpu);
+				return true;
+			};
+			bad |= failB("isOnGround", exitSnap.isOnGround, out.st.isOnGround);
+			bad |= failB("hasJumped", exitSnap.hasJumped, out.st.hasJumped);
+			bad |= failB("hasDoubleJumped", exitSnap.hasDoubleJumped, out.st.hasDoubleJumped);
+			bad |= failB("hasFlipped", exitSnap.hasFlipped, out.st.hasFlipped);
+			bad |= failB("isFlipping", exitSnap.isFlipping, out.st.isFlipping);
+			bad |= failB("isJumping", exitSnap.isJumping, out.st.isJumping);
+			bad |= failB("isBoosting", exitSnap.isBoosting, out.st.isBoosting);
+			bad |= failB("isAutoFlipping", exitSnap.isAutoFlipping, out.st.isAutoFlipping);
+			for (int w = 0; w < 4; w++) {
+				bad |= failF("steerAngle", w, exitSnap.wheels[w].steerAngle, out.wheels[w].steerAngle);
+				bad |= failF("engineForce", w, exitSnap.wheels[w].engineForce, out.wheels[w].engineForce);
+				bad |= failF("brake", w, exitSnap.wheels[w].brake, out.wheels[w].brake);
+				bad |= failF("latFriction", w, exitSnap.wheels[w].latFriction, out.wheels[w].latFriction);
+				bad |= failF("longFriction", w, exitSnap.wheels[w].longFriction, out.wheels[w].longFriction);
+				bad |= failF("suspensionLength", w, exitSnap.wheels[w].suspensionLength, out.wheels[w].suspensionLength);
+				// localize with after-vehicleFirst scratch
+				bad |= failF("scr.contactNormal.x", w, afterFirst.wheels[w].contactNormalWS[0], wOut[w].contactNormalWS.x);
+				bad |= failF("scr.contactNormal.y", w, afterFirst.wheels[w].contactNormalWS[1], wOut[w].contactNormalWS.y);
+				bad |= failF("scr.contactNormal.z", w, afterFirst.wheels[w].contactNormalWS[2], wOut[w].contactNormalWS.z);
+				bad |= failF("scr.contactPoint.x", w, afterFirst.wheels[w].contactPointWS[0], wOut[w].contactPointWS.x);
+				bad |= failF("scr.impulse.x", w, afterFirst.wheels[w].impulse[0], wOut[w].impulse.x);
+				bad |= failF("scr.impulse.y", w, afterFirst.wheels[w].impulse[1], wOut[w].impulse.y);
+				bad |= failF("scr.impulse.z", w, afterFirst.wheels[w].impulse[2], wOut[w].impulse.z);
+				if (memcmp(&afterFirst.wheels[w].extraPushback, &wOut[w].extraPushback, 4) != 0) {
+					// derive CPU-side branch inputs from the capture for localization
+					btVector3 hp(afterFirst.wheels[w].hardPointWS[0], afterFirst.wheels[w].hardPointWS[1], afterFirst.wheels[w].hardPointWS[2]);
+					btVector3 cp(afterFirst.wheels[w].contactPointWS[0], afterFirst.wheels[w].contactPointWS[1], afterFirst.wheels[w].contactPointWS[2]);
+					btVector3 up(entry.body.basis[2], entry.body.basis[5], entry.body.basis[8]);
+					float cpuTrace = (hp - cp).dot(up);
+					printf("  pushback dbg wheel %d: cpuTrace %.9g gpuTrace %.9g gpuThresh %.9g gpuResolveRaw %.9g groundStatic cpu=%d gpu=%d\n",
+						w, cpuTrace, wOut[w].dbgWheelTraceLen, wOut[w].dbgPushThresh, wOut[w].dbgResolveRaw,
+						afterFirst.wheels[w].groundIsStatic, wOut[w].groundIdx == -1 ? 1 : (wOut[w].groundIdx >= 0 ? 0 : -1));
+				}
+				bad |= failF("scr.extraPushback", w, afterFirst.wheels[w].extraPushback, wOut[w].extraPushback);
+				bad |= failB("scr.isInContact", afterFirst.wheels[w].isInContact, wOut[w].isInContact);
+			}
+			if (bad)
+				return 1;
+		}
 
 		for (const Segment& seg : SEGMENTS) {
 			mapSnaps(rscap::points[seg.pre], preState);
@@ -768,7 +1086,7 @@ static int RunGpuCompare(const Args& args) {
 		}
 	}
 
-	printf("GPU_COMPARE: PASS (%d ticks, phases: predict, integrate, activation; %d bodies bit-exact)\n",
+	printf("GPU_COMPARE: PASS (%d ticks, phases: car-pretick, predict, integrate, activation; %d bodies bit-exact)\n",
 		args.gpuCompare, numBodies);
 	rscuda::DestroyBatch(batch);
 	delete arena;

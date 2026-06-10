@@ -176,6 +176,7 @@ struct CuWheelScratch {
 	float clippedInvContactDotSuspension;
 	float extraPushback;
 	CuVec3 impulse;
+	float dbgWheelTraceLen, dbgPushThresh, dbgResolveRaw;
 };
 
 // updateWheelTransformsWS (btVehicleRL.cpp:110)
@@ -189,7 +190,9 @@ __device__ __forceinline__ void CuUpdateWheelTransformsWS(
 	w.axleWS = CuMat3MulVec(chassis.basis, { cc.wheelAxleCS.x, cc.wheelAxleCS.y, cc.wheelAxleCS.z });
 }
 
-// updateWheelTransform (btVehicleRL.cpp:66); indexRight=0, indexUp=2, indexForward=1
+// updateWheelTransform (btVehicleRL.cpp:66). Car::_BulletSetup calls
+// setCoordinateSystem(1, 2, 0): indexRight=1, indexUp=2, indexForward=0
+// ("X forward, Y right, Z up")
 __device__ __forceinline__ void CuUpdateWheelTransform(
 	const CuBodyDyn& chassis, const GpuWheelConsts& wc, const GpuCarConsts& cc,
 	float steerAngle, float prevSuspensionLength, CuWheelScratch& w) {
@@ -203,10 +206,10 @@ __device__ __forceinline__ void CuUpdateWheelTransform(
 	CuMat3 steeringMat = CuMat3SetRotation(steeringOrn);
 
 	CuMat3 basis2;
-	// columns: [right axis 0] = -right, [up axis 2] = up, [forward axis 1] = fwd
-	basis2.r[0] = { -right.x, fwd.x, up.x };
-	basis2.r[1] = { -right.y, fwd.y, up.y };
-	basis2.r[2] = { -right.z, fwd.z, up.z };
+	// columns: [forward axis 0] = fwd, [right axis 1] = -right, [up axis 2] = up
+	basis2.r[0] = { fwd.x, -right.x, up.x };
+	basis2.r[1] = { fwd.y, -right.y, up.y };
+	basis2.r[2] = { fwd.z, -right.z, up.z };
 	w.worldBasis = CuMat3Mul(steeringMat, basis2);
 	// origin = hardPoint + wheelDir * prevSuspensionLength (physics-dead, basis matters)
 	(void)prevSuspensionLength;
@@ -293,9 +296,15 @@ __device__ __forceinline__ void CuWheelRayCast(
 			w.clippedInvContactDotSuspension = 10.0f;
 		}
 
-		w.extraPushback = 0.0f;
+		// NOTE: m_extraPushback is NOT reset here - it persists from previous ticks
+		// unless this branch overwrites it (w.extraPushback was pre-seeded from the
+		// persistent wheel state by the caller)
+		w.dbgWheelTraceLen = wheelTraceLen;
+		w.dbgPushThresh = 0;
+		w.dbgResolveRaw = 0;
 		if (groundIdx == -1) { // static ground
 			float rayPushbackThresh = (wc.suspensionRestLength + wc.wheelRadius) - cc.suspensionSubtraction;
+			w.dbgPushThresh = rayPushbackThresh;
 			if (wheelTraceLen < rayPushbackThresh) {
 				float wheelTraceDistDelta = wheelTraceLen - rayPushbackThresh;
 				CuBodyDyn staticBody = {};
@@ -303,6 +312,7 @@ __device__ __forceinline__ void CuWheelRayCast(
 				float collisionResult = CuResolveSingleCollision(
 					chassis, staticBody, false,
 					hitPoint, hitNormal, cc.erp, solverTimeStep, wheelTraceDistDelta);
+				w.dbgResolveRaw = collisionResult;
 				w.extraPushback = collisionResult / 4.0f; // getNumWheels()
 			}
 		}
@@ -333,8 +343,8 @@ __device__ __forceinline__ void CuCalcFrictionImpulse(
 
 	float frictionScale = cc.frictionScale; // chassis mass / 3 (host-evaluated)
 
-	// axle = wheel world basis column 0 (m_indexRightAxis)
-	CuVec3 axleDir = CuGetColumn(w.worldBasis, 0);
+	// axle = wheel world basis column 1 (m_indexRightAxis after setCoordinateSystem)
+	CuVec3 axleDir = CuGetColumn(w.worldBasis, 1);
 	CuVec3 surfNormalWS = w.contactNormalWS;
 	float proj = CuDot3(axleDir, surfNormalWS);
 	axleDir = axleDir - surfNormalWS * proj;
@@ -425,7 +435,8 @@ __device__ __forceinline__ void CuCarPreTick(
 	const GpuDynBody* dyn, int numDyn, int selfDynIdx,
 	const CuBodyDyn* dynBodies,
 	float tickTime,
-	CuWheelScratch* W /*[4] out, for capture compare*/) {
+	CuWheelScratch* W /*[4] out, for capture compare*/,
+	float* dbgForwardSpeedUU = nullptr) {
 
 	// controls.ClampFix()
 	io.controls.throttle = io.controls.throttle < -1 ? -1 : (io.controls.throttle > 1 ? 1 : io.controls.throttle);
@@ -441,15 +452,19 @@ __device__ __forceinline__ void CuCarPreTick(
 	for (int i = 0; i < 4; i++)
 		CuUpdateWheelTransform(io.body, cc.wheels[i], cc, io.wheels[i].steerAngle,
 			io.wheels[i].suspensionLength, W[i]);
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 4; i++) {
+		W[i].extraPushback = io.wheels[i].extraPushback; // persistent unless overwritten
 		CuWheelRayCast(io.body, selfDynIdx, cc.wheels[i], cc, geo, grid, dyn, numDyn,
 			dynBodies, io.solverTimeStep, W[i]);
+	}
 	for (int i = 0; i < 4; i++)
 		CuCalcFrictionImpulse(io.body, cc, io.wheels[i], dynBodies, W[i]);
 
-	// persist new suspension lengths (m_raycastInfo.m_suspensionLength)
-	for (int i = 0; i < 4; i++)
+	// persist wheel raycast state (m_raycastInfo.m_suspensionLength, m_extraPushback)
+	for (int i = 0; i < 4; i++) {
 		io.wheels[i].suspensionLength = W[i].suspensionLengthNew;
+		io.wheels[i].extraPushback = W[i].extraPushback;
+	}
 
 	bool jumpPressed = io.controls.jump && !io.st.lastControls.jump;
 
@@ -460,8 +475,10 @@ __device__ __forceinline__ void CuCarPreTick(
 	}
 	io.st.isOnGround = numWheelsInContact >= 3;
 
-	// forwardSpeed_UU = (linVel dot basis column 1) * BT_TO_UU
-	float forwardSpeed_UU = CuDot3(io.body.linVel, CuGetColumn(io.body.basis, 1)) * cc.btToUU;
+	// forwardSpeed_UU = (linVel dot basis column 0 [m_indexForwardAxis]) * BT_TO_UU
+	float forwardSpeed_UU = CuDot3(io.body.linVel, CuGetColumn(io.body.basis, 0)) * cc.btToUU;
+	if (dbgForwardSpeedUU)
+		*dbgForwardSpeedUU = forwardSpeed_UU;
 
 	// ---- _UpdateWheels ----
 	{
@@ -828,7 +845,8 @@ __device__ __forceinline__ void CuCarPreTick(
 							CuApplyCentralImpulseBody(io, (finalDeltaVel * cc.uuToBT) * cc.massBT);
 						}
 					} else {
-						CuVec3 jumpStartForce = ((CuGetColumn(io.body.basis, 2) * cc.jumpImmediateForce) * cc.uuToBT) * cc.massBT;
+						// double jump uses RLConst::JUMP_IMMEDIATE_FORCE (not the mutator value)
+						CuVec3 jumpStartForce = ((CuGetColumn(io.body.basis, 2) * cc.jumpImmediateForceRL) * cc.uuToBT) * cc.massBT;
 						CuApplyCentralImpulseBody(io, jumpStartForce);
 						io.st.hasDoubleJumped = 1;
 					}

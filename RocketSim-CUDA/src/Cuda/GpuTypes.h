@@ -80,6 +80,7 @@ struct GpuWheelState {
 	float brake;
 	float latFriction, longFriction;
 	float suspensionLength;
+	float extraPushback; // NOT reset on uncompressed contact - carries across ticks
 };
 
 // Mirror of RocketSim CarState game fields + car-internal persistent extras
@@ -157,6 +158,7 @@ struct GpuCarConsts {
 
 	// mutator config
 	float jumpAccel, jumpImmediateForce;
+	float jumpImmediateForceRL; // RLConst::JUMP_IMMEDIATE_FORCE (double jump uses the CONST, not the mutator)
 	float boostAccelGround, boostAccelAir, boostUsedPerSecond;
 	uint8_t rechargeBoostEnabled;
 	float rechargeBoostDelay, rechargeBoostPerSecond;
@@ -208,6 +210,37 @@ struct GpuDynBody {
 	GpuVec3 aabbMin;          // broadphase proxy AABB min (drives voxel cell membership)
 	int group, mask;
 	int hasContactResponse;
+	// dynamics (friction ground-body math; zero for ray-only uses)
+	GpuVec3 linVel, angVel;
+	GpuMat3 invInertiaWorld;
+	GpuVec3 invInertiaDiagLocal;
+	float invMass;
+};
+
+// Host<->device car pre-tick state bundle (compare harness + production phase I/O)
+struct GpuCarTickState {
+	GpuMat3 basis;
+	GpuVec3 origin, linVel, angVel;
+	GpuVec3 totalForce, totalTorque;
+	GpuMat3 invInertiaWorld;
+	GpuVec3 invInertiaDiagLocal;
+	float invMass;
+	GpuCarGameState st;
+	GpuWheelState wheels[4];
+	GpuCarControls controls;
+	float solverTimeStep;
+	float dbgForwardSpeedUU; // out: device-computed forwardSpeed_UU (compare diagnostics)
+};
+
+// Wheel intra-tick scratch results, downloadable for compare localization
+struct GpuWheelScratchOut {
+	GpuMat3 worldBasis;
+	GpuVec3 hardPointWS, contactPointWS, contactNormalWS;
+	uint8_t isInContact, isInContactWithWorld;
+	int32_t groundIdx; // -2 none, -1 static, >=0 dyn index
+	float suspensionRelativeVelocity, clippedInvContactDotSuspension, extraPushback;
+	GpuVec3 impulse;
+	float dbgWheelTraceLen, dbgPushThresh, dbgResolveRaw; // pushback-branch diagnostics
 };
 
 // btRSBroadphase voxel grid parameters. Dynamic proxies register in the 3x3x3 cells
