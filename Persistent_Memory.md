@@ -275,12 +275,23 @@ precomputed host-side; sleep thresholds squared; noRot). Kernel supports phase w
 - resolveSingleCollision + resolveSingleBilateral (btContactConstraint.cpp) still to
   read/port (used by extraPushback + side friction impulse).
 
+**DONE (2026-06-10): static-world device raycast bit-exact.** CudaRaycast.cuh
+(CuRayTestStatic: meshes brute-force + planes synthesized-quad), world geo extraction/
+upload in bench_work + CudaStep (ExtractWorldGeo: 16 meshes/8020 tris/4 planes with
+proxy filters). Validated: `--ray-fuzz 200000` PASS on seeds 1337 & 99 (hit/fraction/
+normal bitwise vs CPU world rayTest filtered to statics).
+KEY LESSON: identity-basis transforms are NOT bitwise no-ops - bullet's mat*vec dot
+tree (1*x+0*y)+0*z canonicalizes -0 to +0; CPU applies it to ray endpoints and hit
+normals (colObjWorldTransform). Device must run the same trees (CuMat3MulVec/
+CuTransformPoint with explicit identity). Found via ray-fuzz: 4% mismatches, all and
+only +-0 sign on normal components.
+NOTE: RocketSim uses a custom btRSBroadphase ("voxel broadphase", warns on rays >7.4uu)
+- relevant for the collision-phase port later.
+
 ### Next Steps (in order)
-1. Write src/Cuda/CudaRaycast.cuh: device RayTestClosest replicating the above
-   (planes+meshes first, then sphere/box subsimplex+voronoi solver); upload world geo
-   (mesh tris from btBvhTriangleMeshShape getLockedReadOnlyVertexIndexBase, plane
-   normal/origin/filters) at batch init; fuzz-test rays vs CPU rayTest (new tool or op
-   in cuda_math_test comparing against work-lib world).
+1. Dynamic-shape ray path: port btVoronoiSimplexSolver (closest-pt) + btSubsimplexConvexCast
+   + sphere/box/compound supports for ball/car ray hits; extend ray-fuzz with ball+cars
+   in candidate set (CPU mask AllFilter vs device with dynamic shapes).
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
