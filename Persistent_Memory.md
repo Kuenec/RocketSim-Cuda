@@ -345,15 +345,21 @@ damping rate compress/relax; *suspensionForceScale; max(0); applyImpulse(normal*
 (force*dt + extraPushback), contactPoint-origin); friction: applyImpulse(impulse*dt,
 contactOffset - upDir*(upDir dot contactOffset))] -> _UpdateBoost [state machine,
 BOOST_MIN_TIME, applyCentralForce fwd*boostAccel(Ground|Air)*UU_TO_BT*CAR_MASS].
-STILL TO DECODE: btMatrix3x3::inverse() tree (cofactor/det), Angle::FromRotMat
-(atan2f - port glibc atan2f or correction approach over bounded domain),
-Vec::Normalized (RocketSim Vec - check which sqrt path), applyTorque/applyCentralForce
-accumulator trees (m_totalForce += force*linearFactor etc.), LinearPieceCurve data
-extraction (RLConst curves -> sorted (in,out) arrays; GetOutput lerp tree already read),
-wheel consts extraction (btWheelInfoRL fields incl. m_suspensionRestLength1,
-SUSPENSION_SUBTRACTION, chassis connection points after MAX_SUSPENSION_TRAVEL
-adjustment), forwardSpeed = linVel dot forwardVector (getForwardVector = basis column
-via m_indexForwardAxis=1?? check getForwardVector impl).
+DECODED ADDITIONS: btMatrix3x3::inverse = cofac(r1,c1,r2,c2)=m[r1][c1]*m[r2][c2]-
+m[r1][c2]*m[r2][c1]; co=(cofac(1,1,2,2),cofac(1,2,2,0),cofac(1,0,2,1)); det=row0.dot(co)
+[SSE dot3 tree]; s=1/det; elements = cofac(...)*s per btMatrix3x3.h:1093.
+Vec::Normalized() (RocketSim Vec): length=sqrtf(LengthSq incl _w: ((x*x+y*y)+z*z)+w*w
+left-assoc... VERIFY exact LengthSq tree + operator/ form in MathTypes.h); if len >
+FLT_EPSILON^2: v/length else zero.
+getForwardVector = basis COLUMN 1 (indexForward=1); getUpVector = COLUMN 2.
+STILL TO DECODE: getEulerYPR/getEulerZYX (autoflip needs roll: ATAN2F+ASINF exact ports
+needed - bounded domain, fuzz-verify; only on autoflip trigger path),
+applyTorque/applyCentralForce accumulator trees (m_totalForce += force*m_linearFactor,
+m_totalTorque += torque*m_angularFactor - confirm in btRigidBody.h), LinearPieceCurve
+data extraction (RLConst curves -> arrays; GetOutput lerp tree read: Math.cpp:5),
+wheel consts extraction (connection points = config offsets *UU_TO_BT with restLength
+-= MAX_SUSPENSION_TRAVEL, m_suspensionRestLength1 = addWheel's value, radius per
+front/back, SUSPENSION_SUBTRACTION const in RLConst::BTVehicle).
 GpuWheelState persists: steerAngle, engineForce, brake, latFriction, longFriction,
 suspensionForceScale (+ raycast scratch is intra-tick).
 Capture plan: hooks in Car::_PreTickUpdate around updateVehicleFirst / game block /
