@@ -269,4 +269,20 @@ struct GpuMeshInfo {
 	int group, mask;
 };
 
+// Quantized BVH mirror (btQuantizedBvhNode / btBvhSubtreeInfo layouts)
+struct GpuBvhNode {
+	uint16_t qmin[3], qmax[3];
+	int32_t escapeIndexOrTriangleIndex; // >=0 leaf (triangleIndex), <0 internal (-escape)
+};
+struct GpuBvhSubtree {
+	uint16_t qmin[3], qmax[3];
+	int32_t rootNodeIndex, subtreeSize;
+};
+struct GpuMeshBvh {
+	int nodeStart;      // into shared node buffer
+	int subtreeStart;   // into shared subtree buffer
+	int numSubtrees;
+	GpuVec3 bvhAabbMin, bvhAabbMax, bvhQuantization;
+};
+
 } // namespace rscuda

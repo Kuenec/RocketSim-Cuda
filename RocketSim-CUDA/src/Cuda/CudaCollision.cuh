@@ -1969,6 +1969,227 @@ __device__ inline void CuBoxBoxClosestPoints(
 	CuDBoxBox2(p1, R1, side1, p2, R2, side2, out);
 }
 
+// ================== Quantized BVH walk + convex-vs-mesh (btConvexConcave) ==========
+
+struct CuBvhView {
+	const GpuBvhNode* nodes;
+	const GpuBvhSubtree* subtrees;
+	int numSubtrees;
+	CuVec3 aabbMin, aabbMax, quantization;
+};
+
+// btQuantizedBvh::quantizeWithClamp: clamp (setMax(min)/setMin(max)), v = (p-min)*q,
+// max: (ushort)(v+1)|1, min: (ushort)v & 0xfffe (v>=0 after clamp; C trunc cast)
+__device__ __forceinline__ void CuBvhQuantizeClamp(const CuBvhView& b, CuVec3 point, int isMax, uint16_t out[3]) {
+	CuVec3 c = point;
+	c.x = fmaxf(c.x, b.aabbMin.x); c.y = fmaxf(c.y, b.aabbMin.y); c.z = fmaxf(c.z, b.aabbMin.z);
+	c.x = fminf(c.x, b.aabbMax.x); c.y = fminf(c.y, b.aabbMax.y); c.z = fminf(c.z, b.aabbMax.z);
+	CuVec3 v = (c - b.aabbMin) * b.quantization;
+	if (isMax) {
+		out[0] = (uint16_t)(((uint16_t)(v.x + 1.0f)) | 1);
+		out[1] = (uint16_t)(((uint16_t)(v.y + 1.0f)) | 1);
+		out[2] = (uint16_t)(((uint16_t)(v.z + 1.0f)) | 1);
+	} else {
+		out[0] = (uint16_t)(((uint16_t)(v.x)) & 0xfffe);
+		out[1] = (uint16_t)(((uint16_t)(v.y)) & 0xfffe);
+		out[2] = (uint16_t)(((uint16_t)(v.z)) & 0xfffe);
+	}
+}
+
+__device__ __forceinline__ bool CuTestQuantAabb(
+	const uint16_t* min1, const uint16_t* max1, const uint16_t* min2, const uint16_t* max2) {
+	bool overlap = true;
+	overlap = (min1[0] > max2[0] || max1[0] < min2[0]) ? false : overlap;
+	overlap = (min1[2] > max2[2] || max1[2] < min2[2]) ? false : overlap;
+	overlap = (min1[1] > max2[1] || max1[1] < min2[1]) ? false : overlap;
+	return overlap;
+}
+
+// walkStacklessQuantizedTreeCacheFriendly + walkStacklessQuantizedTree: triangles
+// stream to the functor in EXACT CPU order (subtree-header order, then array order)
+template <typename F>
+__device__ inline void CuBvhWalk(const CuBvhView& b, const uint16_t qmin[3], const uint16_t qmax[3], F&& processTriangle) {
+	for (int s = 0; s < b.numSubtrees; s++) {
+		const GpuBvhSubtree& st = b.subtrees[s];
+		if (CuTestQuantAabb(qmin, qmax, st.qmin, st.qmax)) {
+			int curIndex = st.rootNodeIndex;
+			int endIndex = st.rootNodeIndex + st.subtreeSize;
+			const GpuBvhNode* node = &b.nodes[curIndex];
+			while (curIndex < endIndex) {
+				bool overlap = CuTestQuantAabb(qmin, qmax, node->qmin, node->qmax);
+				bool isLeaf = node->escapeIndexOrTriangleIndex >= 0;
+				if (isLeaf && overlap) {
+					// triangleIndex = e & ~(~0u << 21); partId = e >> 21 (0 for our meshes)
+					int triIdx = node->escapeIndexOrTriangleIndex & ~((~0u) << (31 - 10));
+					processTriangle(triIdx);
+				}
+				if (overlap || isLeaf) {
+					node++;
+					curIndex++;
+				} else {
+					int escape = -node->escapeIndexOrTriangleIndex;
+					node += escape;
+					curIndex += escape;
+				}
+			}
+		}
+	}
+}
+
+// TestTriangleAgainstAabb2 (btAabbUtil2.h:54): Z, X, Y order, min/max trees
+__device__ __forceinline__ bool CuTestTriangleAabb(
+	CuVec3 p1, CuVec3 p2, CuVec3 p3, CuVec3 aabbMin, CuVec3 aabbMax) {
+	const float* v1 = &p1.x;
+	const float* v2 = &p2.x;
+	const float* v3 = &p3.x;
+	const float* mn = &aabbMin.x;
+	const float* mx = &aabbMax.x;
+	const int order[3] = { 2, 0, 1 };
+	for (int k = 0; k < 3; k++) {
+		int i = order[k];
+		float lo = fminf(fminf(v1[i], v2[i]), v3[i]);
+		if (lo > mx[i]) return false;
+		float hi = fmaxf(fmaxf(v1[i], v2[i]), v3[i]);
+		if (hi < mn[i]) return false;
+	}
+	return true;
+}
+
+// Contact sink for the concave path: accumulates into the shared per-pair manifold
+// via CuAddContactPoint, recording the triangle index for callback/internal-edge use.
+struct CuConcaveContactCtx {
+	CuManifold* manifold;
+	const CuContactBodyInfo* convexBody; // body0 (dyn)
+	const CuContactBodyInfo* meshBody;   // body1 (static)
+	int lastInsertIndex;
+	int lastTriangleIndex;
+};
+
+// btConvexConcaveCollisionAlgorithm::processCollision per pair (convex vs one mesh).
+// Mirrors btConvexTriangleCallback: AABB gather via BVH, per-tri early-out, dispatch
+// (sphere -> SphereTriangleDetector, box -> convexConvex GJK), accumulate into the
+// SHARED manifold, no per-triangle refresh. The Arena contact callback + internal-edge
+// adjustment hooks are invoked by the CALLER per inserted point (CPU order preserved:
+// callback fires inside addContactPoint per triangle).
+template <typename FCallback>
+__device__ inline void CuConvexVsMesh(
+	const CuGjkShape& convex, // box or sphere (margins set)
+	const CuMat3& convexBasis, CuVec3 convexOrigin,
+	const GpuWorldGeo& geo, int meshIdx, const CuBvhView& bvh, float meshMargin,
+	const CuContactBodyInfo& convexBody, const CuContactBodyInfo& meshBody,
+	CuManifold& manifold, float manifoldBreakingThreshold,
+	FCallback&& onContactAdded /*(insertIndex, triangleIndex)*/) {
+
+	// convexInTriangleSpace = meshWT.inverse() * convexWT (mesh = identity transform:
+	// canon trees). Identity inverse: basisT = I, invOrigin = I * -(0,0,0)
+	const CuMat3 ident = CuIdentity3();
+	CuVec3 meshInvOrigin = CuMat3MulVec(ident, CuNeg({ 0, 0, 0 }));
+	CuMat3 convexInTriBasis = CuMat3Mul(ident, convexBasis);
+	CuVec3 convexInTriOrigin = CuTransformPoint(ident, meshInvOrigin, convexOrigin);
+
+	// convexShape->getAabb(convexInTriangleSpace) +- (meshMargin + 0)
+	CuVec3 aabbMin, aabbMax;
+	CuShapeAabb(convex, convexInTriBasis, convexInTriOrigin, aabbMin, aabbMax);
+	CuVec3 extra = { meshMargin, meshMargin, meshMargin };
+	aabbMax = aabbMax + extra;
+	aabbMin = aabbMin - extra;
+
+	uint16_t qmin[3], qmax[3];
+	CuBvhQuantizeClamp(bvh, aabbMin, 0, qmin);
+	CuBvhQuantizeClamp(bvh, aabbMax, 1, qmax);
+
+	const GpuMeshInfo& mi = geo.meshes[meshIdx];
+	const GpuVec3* tv = geo.meshTris + (size_t)mi.triStart * 3;
+
+	CuBvhWalk(bvh, qmin, qmax, [&](int triIdx) {
+		CuVec3 t0 = GV(tv[triIdx * 3]);
+		CuVec3 t1 = GV(tv[triIdx * 3 + 1]);
+		CuVec3 t2 = GV(tv[triIdx * 3 + 2]);
+
+		// btConvexTriangleCallback::processTriangle
+		if (!CuTestTriangleAabb(t0, t1, t2, aabbMin, aabbMax))
+			return;
+
+		{ // early-out: support projection on both sides of the world triangle plane
+			// (mesh world transform = identity: tri verts already world, but CPU runs
+			// the transform trees - identity canon)
+			CuVec3 v0 = CuTransformPoint(ident, { 0, 0, 0 }, t0);
+			CuVec3 v1 = CuTransformPoint(ident, { 0, 0, 0 }, t1);
+			CuVec3 v2 = CuTransformPoint(ident, { 0, 0, 0 }, t2);
+
+			CuVec3 triangle_normal_world = CuCross(v1 - v0, v2 - v0);
+			triangle_normal_world = CuNormalize3(triangle_normal_world); // rsqrt path
+
+			// localGetSupportingVertex(basis.inverse() * n) WITH margin
+			CuMat3 basisInv = CuMat3Inverse(convexBasis);
+			float contact_threshold = manifoldBreakingThreshold; // + closestPoint(0)
+
+			for (int side = 0; side < 2; side++) {
+				CuVec3 dirLocal = CuMat3MulVec(basisInv, triangle_normal_world);
+				CuVec3 localPt;
+				if (convex.kind == CU_SHAPE_BOX) {
+					CuVec3 heWithMargin = {
+						convex.boxHalfExtNoMargin.x + convex.margin,
+						convex.boxHalfExtNoMargin.y + convex.margin,
+						convex.boxHalfExtNoMargin.z + convex.margin };
+					localPt = CuSupportBox(heWithMargin, dirLocal);
+				} else {
+					localPt = CuSupportSphere(convex.margin, dirLocal);
+				}
+				CuVec3 worldPt = CuTransformPoint(convexBasis, convexOrigin, localPt);
+				float proj_distPt = CuDot3(triangle_normal_world, worldPt);
+				float proj_distTr = CuDot3(triangle_normal_world, v0);
+				float dist = proj_distTr - proj_distPt;
+				if (dist > contact_threshold)
+					return;
+				triangle_normal_world = triangle_normal_world * -1.0f;
+			}
+		}
+
+		// dispatch: triangle shape with margin = meshMargin, at mesh transform (identity)
+		if (convex.kind == CU_SHAPE_SPHERE) {
+			// btSphereTriangleCollisionAlgorithm: detector threshold = manifold breaking
+			// sphereInTr = triWT.inverseTimes(sphereWT): identity tri -> canon trees
+			CuVec3 centerLocal = CuVecMulMat(convexOrigin - CuVec3{ 0, 0, 0 }, ident);
+			CuGjkShape triShape;
+			(void)triShape;
+			CuVec3 point, normal;
+			float depth;
+			if (CuSphereTriangleCollide(centerLocal, convex.margin /*radius*/,
+					t0, t1, t2, manifoldBreakingThreshold, point, normal, depth)) {
+				CuVec3 nW = CuMat3MulVec(ident, normal);
+				CuVec3 pW = CuTransformPoint(ident, { 0, 0, 0 }, point);
+				int idx = CuAddContactPoint(manifold, *(&convexBody), *(&meshBody), false,
+					nW, pW, depth, -1, -1, 0, triIdx);
+				if (idx >= 0)
+					onContactAdded(idx, triIdx);
+			}
+		} else {
+			// convexConvex plain GJK (box vs triangle); maxDistSq = (marginA+marginB+
+			// manifold breaking threshold)^2
+			CuGjkShape tri;
+			tri.kind = CU_SHAPE_TRIANGLE;
+			tri.triV[0] = t0;
+			tri.triV[1] = t1;
+			tri.triV[2] = t2;
+			tri.margin = meshMargin;
+			float maxd = convex.margin + tri.margin + manifoldBreakingThreshold;
+			CuGjkResult r;
+			CuGjkClosestPoints(convex, convexBasis, convexOrigin, tri, ident, { 0, 0, 0 },
+				maxd * maxd, true, r);
+			if (r.hasContact) {
+				int idx = CuAddContactPoint(manifold, *(&convexBody), *(&meshBody), false,
+					r.normalOnB, r.pointOnBWorld, r.distance, -1, -1, 0, triIdx);
+				if (idx >= 0)
+					onContactAdded(idx, triIdx);
+			}
+		}
+	});
+
+	// resultOut->refreshContactPoints() at the end of the concave pass
+	CuManifoldRefresh(manifold, convexBasis, convexOrigin, ident, { 0, 0, 0 });
+}
+
 } // namespace rscuda
 
 #endif // __CUDACC__

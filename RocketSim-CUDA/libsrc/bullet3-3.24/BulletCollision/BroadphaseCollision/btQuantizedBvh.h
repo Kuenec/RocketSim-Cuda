@@ -184,6 +184,10 @@ ATTRIBUTE_ALIGNED16(class)
 btQuantizedBvh
 {
 public:
+	// 2026-06-10: accessors for the CUDA port's host-side BVH extraction (no behavior change)
+	const btVector3& getBvhAabbMin() const { return m_bvhAabbMin; }
+	const btVector3& getBvhAabbMax() const { return m_bvhAabbMax; }
+	const btVector3& getBvhQuantization() const { return m_bvhQuantization; }
 
 protected:
 	btVector3 m_bvhAabbMin;
