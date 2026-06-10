@@ -755,12 +755,33 @@ verified in source 2026-06-10):**
         CuLoadTrigFix/--trig-table/RequireTrigTable/--emit-trig-table +
         glibc_trig_fix.bin) is now UNUSED dead weight - remove it all, then re-run
         gates + a 20k compare.
-      TODO next: read Angle::GetDeltaTo + BallState ctor hsInfo defaults; bench
-      --game-mode flag + deterministic HS ball init (explicit SetState - arena ctor
-      randomizes y-sign with wall-clock RNG); CPU heatseeker gates; device port
-      (hsInfo fields into GpuBallGameState; HS branches in CuContactAddedCallback
-      + new CuBallPreTickHS in CudaGameTail.cuh; CuAngleFromVec/CuRoundAngleUE3/
-      CuGetForwardVec/CuWrapNormalizeFloat [double fmod of floats = exact] ports).
+      HEATSEEKER PORT WRITTEN (uncommitted at this checkpoint): bench --game-mode
+      flag + deterministic HS ball init (SetState w/ seed-derived y-sign +
+      yTargetDir set from tick 0 for steering coverage); GpuBallGameState += hs
+      fields (uploaded/written back incl. hsInfo for the hash); GpuCollideConsts
+      += hs* consts (extraction in ExtractCollideData); CudaGameTail.cuh: CuAngle
+      helpers (CuWrapNormalizeFloat [double fmod exact], CuAngleFromVec,
+      CuRoundAngleUE3, CuAngleForwardVec) + CuBallPreTickHS; HS branches in
+      CuContactAddedCallback (_OnHit speedup block AFTER the cooldown-else-RETURN
+      restructure [CPU returns from _OnHit on cooldown], wall bounce in ball-world)
+      + kernel GAME_PRE hook after pads. FIXED latent bug: SNOWDAY enum is 3 not 4
+      (isSpecial gate used 4=DROPSHOT). GameMode: SOCCAR0 HOOPS1 HEATSEEKER2
+      SNOWDAY3 DROPSHOT4.
+      VALIDATION: soccar gates PASS; HS 5000x4ar/20000x1ar seed1337 MATCH;
+      HS 5000x8ar seed42 DIVERGES at arena0 tick 1402 -> per-phase compare
+      (--game-mode heatseeker --no-ball-motion) pinpointed CAR PRE-TICK wheel-2
+      RAY: contact POINT + hardPoint match BITWISE, only the NORMAL differs ~1e-4.
+      ROOT CAUSE IDENTIFIED: ray hit a triangle EDGE; two triangles return the
+      BIT-IDENTICAL fraction; strict < tie-break keeps the FIRST-VISITED triangle.
+      CPU visits triangles in btQuantizedBvh RAY-walk order
+      (reportRayOverlappingNodex); CuRayTestStatic predates the BVH port and scans
+      mesh triangles LINEARLY -> different tie winner -> different normal.
+      FIX IN PROGRESS: make CuRayTestStatic's mesh path walk the BVH exactly like
+      the CPU ray path (READ btQuantizedBvh::reportRayOverlappingNodex first -
+      confirm the exact node test + walk variant for rays), then re-run: ray-fuzz,
+      soccar gates + 20k compares, HS seeds incl. 42x8. NOTE the same linear-scan
+      tie-break issue could affect CuRayTestWorld's other callers (the validated
+      soccar gates never hit a tie - tie cases are real but rare).
    2. DEMOLITIONS (#14): deterministic-seed hook for Math::GetRandEngine in the
       WORK copy behind a flag (upstream demo respawn is wall-clock-seeded ->
       bit-exact validation only possible work-CPU vs work-GPU with the same seed;

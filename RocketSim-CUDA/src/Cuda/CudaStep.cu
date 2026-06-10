@@ -749,9 +749,12 @@ __global__ void GpuStepArenasKernel(
 						s.angVel = { dynBodies[d].angVel.x, dynBodies[d].angVel.y, dynBodies[d].angVel.z };
 					}
 				}
-				// pad pre-ticks (ball pre-tick is a no-op in soccar)
+				// pad pre-ticks
 				for (int p = 0; p < numPads; p++)
 					CuPadPreTick(arenaPads[p], dt);
+				// Ball::_PreTickUpdate (heatseeker steering; no-op in soccar)
+				if (ca.consts->gameMode == CU_GAMEMODE_HEATSEEKER)
+					CuBallPreTickHS(arenaBodies[0], ca.ballStates[arenaIdx], *ca.consts, dt);
 				// stepSimulation head: applyGravity (active bodies)
 				for (int d = 0; d < bodiesPerArena; d++)
 					CuApplyGravity(arenaBodies[d], consts[d]);

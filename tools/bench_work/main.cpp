@@ -99,6 +99,7 @@ struct Args {
 	int manifoldDump = 0;           // diagnostic: print CPU collision manifolds for N ticks
 	int arenaOffset = 0;            // diagnostic: arena index offset (reproduce arena K standalone)
 	bool noBallMotion = false;      // diagnostic: skip the gpu-compare ball-motion injection
+	GameMode gameMode = GameMode::SOCCAR;
 };
 
 static void PrintUsage(const char* argv0) {
@@ -153,6 +154,14 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 			out.arenaOffset = atoi(v);
 		} else if (!strcmp(argv[i], "--no-ball-motion")) {
 			out.noBallMotion = true;
+		} else if (!strcmp(argv[i], "--game-mode")) {
+			const char* v = need("--game-mode"); if (!v) return false;
+			if (!strcmp(v, "soccar")) out.gameMode = GameMode::SOCCAR;
+			else if (!strcmp(v, "heatseeker")) out.gameMode = GameMode::HEATSEEKER;
+			else if (!strcmp(v, "hoops")) out.gameMode = GameMode::HOOPS;
+			else if (!strcmp(v, "snowday")) out.gameMode = GameMode::SNOWDAY;
+			else if (!strcmp(v, "dropshot")) out.gameMode = GameMode::DROPSHOT;
+			else { fprintf(stderr, "Unknown game mode: %s\n", v); return false; }
 		} else if (!strcmp(argv[i], "--dump-arena-hashes")) {
 			out.dumpArenaHashes = true;
 		} else if (!strcmp(argv[i], "--dump-state-dir")) {
@@ -236,7 +245,7 @@ static constexpr float HALF_PI = 1.5707963267948966f;
 // Identical arena/car setup for CPU and GPU paths - this is state initialization, not physics.
 static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>& slots) {
 	int arenaIdx = arenaIdxIn + args.arenaOffset;
-	Arena* arena = Arena::Create(GameMode::SOCCAR);
+	Arena* arena = Arena::Create(args.gameMode);
 
 	// Demos disabled: upstream demo respawn is wall-clock-seeded (see header comment)
 	MutatorConfig mc = arena->GetMutatorConfig();
@@ -262,7 +271,19 @@ static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>&
 
 		slots.push_back(CarSlot{ car, Rng(MixSeed(MixSeed(args.seed, (uint64_t)arenaIdx), 0xCA0ull + (uint64_t)i)) });
 	}
-	// Ball stays at its deterministic default rest state (center, BALL_REST_Z)
+	if (args.gameMode == GameMode::HEATSEEKER) {
+		// The arena ctor randomizes the heatseeker ball's y-sign with the
+		// wall-clock-seeded engine; override with a seed-derived deterministic state.
+		// yTargetDir starts nonzero so the steering path is exercised from tick 0.
+		float ySign = (spawnRng.Next() & 1) ? 1.0f : -1.0f;
+		Vec scale = Vec(1, ySign, 1);
+		BallState bs = BallState();
+		bs.pos = RLConst::Heatseeker::BALL_START_POS * scale;
+		bs.vel = RLConst::Heatseeker::BALL_START_VEL * scale;
+		bs.hsInfo.yTargetDir = ySign;
+		arena->ball->SetState(bs);
+	}
+	// Soccar: ball stays at its deterministic default rest state (center, BALL_REST_Z)
 	return arena;
 }
 
@@ -289,6 +310,18 @@ static uint64_t HashArena(Arena* arena, std::vector<CarSlot>& slots, DataStreamO
 		ps.Serialize(out);
 	}
 	return Fnv1a64(out.data.data(), out.data.size(), FNV_BASIS);
+}
+
+static void EmitCarDiag(const char* tag, std::vector<CarSlot>& slots) {
+	for (size_t c = 0; c < slots.size(); c++) {
+		const CarState& cs = slots[c].car->_internalState;
+		printf("DIAG %s car%zu: whenHit=%llu whenExtra=%llu ballPos=(%.9g,%.9g,%.9g) wcNormal=(%.9g,%.9g,%.9g) vel=(%.9g,%.9g,%.9g)\n",
+			tag, c, (unsigned long long)cs.ballHitInfo.tickCountWhenHit,
+			(unsigned long long)cs.ballHitInfo.tickCountWhenExtraImpulseApplied,
+			cs.ballHitInfo.ballPos.x, cs.ballHitInfo.ballPos.y, cs.ballHitInfo.ballPos.z,
+			cs.worldContact.contactNormal.x, cs.worldContact.contactNormal.y, cs.worldContact.contactNormal.z,
+			cs.vel.x, cs.vel.y, cs.vel.z);
+	}
 }
 
 static void EmitArenaDiagnostics(const Args& args, int arenaIdx, uint64_t arenaHash, const DataStreamOut& out) {
@@ -323,6 +356,8 @@ static uint64_t RunCpu(const Args& args, double& elapsedS) {
 		uint64_t arenaHash = HashArena(arena, slots, out);
 		combinedHash = Fnv1a64(&arenaHash, sizeof(arenaHash), combinedHash);
 		EmitArenaDiagnostics(args, arenaIdx, arenaHash, out);
+		if (args.dumpArenaHashes)
+			EmitCarDiag("cpu", slots);
 
 		delete arena;
 	}
@@ -735,6 +770,20 @@ static void ExtractCollideData(Arena* arena, const std::vector<CarSlot>& slots,
 	cc.bumpVelGroundCurve = ExtractCurve(BUMP_VEL_AMOUNT_GROUND_CURVE);
 	cc.bumpVelAirCurve = ExtractCurve(BUMP_VEL_AMOUNT_AIR_CURVE);
 	cc.bumpUpwardVelCurve = ExtractCurve(BUMP_UPWARD_VEL_AMOUNT_CURVE);
+	cc.hsTargetY = Heatseeker::TARGET_Y;
+	cc.hsTargetZ = Heatseeker::TARGET_Z;
+	cc.hsHorizontalBlend = Heatseeker::HORIZONTAL_BLEND;
+	cc.hsVerticalBlend = Heatseeker::VERTICAL_BLEND;
+	cc.hsSpeedBlend = Heatseeker::SPEED_BLEND;
+	cc.hsMaxTurnPitch = Heatseeker::MAX_TURN_PITCH;
+	cc.hsMaxSpeed = Heatseeker::MAX_SPEED;
+	cc.hsTargetSpeedIncrement = Heatseeker::TARGET_SPEED_INCREMENT;
+	cc.hsMinSpeedupInterval = Heatseeker::MIN_SPEEDUP_INTERVAL;
+	cc.hsWallBounceChangeYThresh = Heatseeker::WALL_BOUNCE_CHANGE_Y_THRESH;
+	cc.hsWallBounceChangeYNormal = Heatseeker::WALL_BOUNCE_CHANGE_Y_NORMAL;
+	cc.hsWallBounceForceScale = Heatseeker::WALL_BOUNCE_FORCE_SCALE;
+	cc.hsWallBounceUpFrac = Heatseeker::WALL_BOUNCE_UP_FRAC;
+	cc.arenaExtentY = ARENA_EXTENT_Y;
 }
 
 // ---- static-world raycast validation (--ray-fuzz N) ----
@@ -1324,6 +1373,11 @@ static int RunGpuCompare(const Args& args) {
 				bad |= failF("scr.contactNormal.y", w, afterFirst.wheels[w].contactNormalWS[1], wOut[w].contactNormalWS.y);
 				bad |= failF("scr.contactNormal.z", w, afterFirst.wheels[w].contactNormalWS[2], wOut[w].contactNormalWS.z);
 				bad |= failF("scr.contactPoint.x", w, afterFirst.wheels[w].contactPointWS[0], wOut[w].contactPointWS.x);
+				bad |= failF("scr.contactPoint.y", w, afterFirst.wheels[w].contactPointWS[1], wOut[w].contactPointWS.y);
+				bad |= failF("scr.contactPoint.z", w, afterFirst.wheels[w].contactPointWS[2], wOut[w].contactPointWS.z);
+				bad |= failF("scr.hardPoint.x", w, afterFirst.wheels[w].hardPointWS[0], wOut[w].hardPointWS.x);
+				bad |= failF("scr.hardPoint.y", w, afterFirst.wheels[w].hardPointWS[1], wOut[w].hardPointWS.y);
+				bad |= failF("scr.hardPoint.z", w, afterFirst.wheels[w].hardPointWS[2], wOut[w].hardPointWS.z);
 				bad |= failF("scr.impulse.x", w, afterFirst.wheels[w].impulse[0], wOut[w].impulse.x);
 				bad |= failF("scr.impulse.y", w, afterFirst.wheels[w].impulse[1], wOut[w].impulse.y);
 				bad |= failF("scr.impulse.z", w, afterFirst.wheels[w].impulse[2], wOut[w].impulse.z);
@@ -1748,6 +1802,9 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		rscuda::GpuBallGameState bs = {};
 		bs.velocityImpulseCache = ToGpu(arenas[a]->ball->_velocityImpulseCache);
 		bs.tickCountSinceUpdate = arenas[a]->ball->_internalState.tickCountSinceUpdate;
+		bs.hsYTargetDir = arenas[a]->ball->_internalState.hsInfo.yTargetDir;
+		bs.hsCurTargetSpeed = arenas[a]->ball->_internalState.hsInfo.curTargetSpeed;
+		bs.hsTimeSinceHit = arenas[a]->ball->_internalState.hsInfo.timeSinceHit;
 		rscuda::UploadBallState(batch, a, bs);
 		std::vector<int> order;
 		for (Car* car : arenas[a]->_cars)
@@ -1825,6 +1882,9 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		rscuda::DownloadBallState(batch, a, &bs);
 		arenas[a]->ball->_velocityImpulseCache = FromGpu(bs.velocityImpulseCache);
 		arenas[a]->ball->_internalState.tickCountSinceUpdate = bs.tickCountSinceUpdate;
+		arenas[a]->ball->_internalState.hsInfo.yTargetDir = bs.hsYTargetDir;
+		arenas[a]->ball->_internalState.hsInfo.curTargetSpeed = bs.hsCurTargetSpeed;
+		arenas[a]->ball->_internalState.hsInfo.timeSinceHit = bs.hsTimeSinceHit;
 		arenas[a]->tickCount += args.ticks;
 	}
 
@@ -1836,6 +1896,8 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		uint64_t arenaHash = HashArena(arenas[a], slotsPerArena[a], out);
 		combinedHash = Fnv1a64(&arenaHash, sizeof(arenaHash), combinedHash);
 		EmitArenaDiagnostics(args, a, arenaHash, out);
+		if (args.dumpArenaHashes)
+			EmitCarDiag("gpu", slotsPerArena[a]);
 		delete arenas[a];
 	}
 

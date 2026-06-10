@@ -48,7 +48,12 @@ __device__ __forceinline__ void CuSetActivationState(int& cur, int newState) {
 #define CU_BT_TO_UU 50.f
 #define CU_USERIDX_CAR 1
 #define CU_USERIDX_BALL 2
+// GameMode enum (src/Sim/GameMode.h)
 #define CU_GAMEMODE_SOCCAR 0
+#define CU_GAMEMODE_HOOPS 1
+#define CU_GAMEMODE_HEATSEEKER 2
+#define CU_GAMEMODE_SNOWDAY 3
+#define CU_GAMEMODE_DROPSHOT 4
 #define CU_DEMOMODE_NORMAL 0      // DemoMode::NORMAL
 #define CU_DEMOMODE_ON_CONTACT 1  // DemoMode::ON_CONTACT
 #define CU_DEMOMODE_DISABLED 2    // DemoMode::DISABLED
@@ -399,8 +404,24 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 					CuVec3 cache = GV(in.ball->velocityImpulseCache) + addedVel * CU_UU_TO_BT;
 					in.ball->velocityImpulseCache = { cache.x, cache.y, cache.z };
 				}
+			} else {
+				// "Don't do multiple extra impulses in a row" - the early return also
+				// skips the mode-specific blocks below
+				return;
 			}
-			// (heatseeker / dropshot charge paths: non-soccar, not on device)
+			if (in.cc.gameMode == CU_GAMEMODE_HEATSEEKER) {
+				GpuBallGameState& bs = *in.ball;
+				bool canIncrease = (bs.hsTimeSinceHit > in.cc.hsMinSpeedupInterval) ||
+					(bs.hsYTargetDir == 0.0f);
+				float newTargetDir = (car.team == 0 /*BLUE*/) ? 1.0f : -1.0f;
+				if (canIncrease && (newTargetDir != bs.hsYTargetDir)) {
+					bs.hsTimeSinceHit = 0;
+					float ns = bs.hsCurTargetSpeed + in.cc.hsTargetSpeedIncrement;
+					bs.hsCurTargetSpeed = ns < in.cc.hsMaxSpeed ? ns : in.cc.hsMaxSpeed; // RS_MIN
+				}
+				bs.hsYTargetDir = newTargetDir;
+			}
+			// (dropshot charge path lands with the dropshot port)
 		} else if (bodyB >= 1) {
 			// Car + Car: overrides + bump logic both ways
 			cp.combinedFriction = in.cc.carCarFriction;
@@ -473,8 +494,34 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 			cp.combinedRestitution = in.cc.carWorldRestitution;
 		}
 	} else if (bodyA == 0 && bodyB < 0) {
-		// Ball + World: _OnWorldCollision is a no-op in soccar; mark special
-		if (in.cc.gameMode != /*SNOWDAY*/ 4)
+		// Ball + World: Ball::_OnWorldCollision, then mark special (non-snowday)
+		if (in.cc.gameMode == CU_GAMEMODE_HEATSEEKER) {
+			GpuBallGameState& bs = *in.ball;
+			if (bs.hsYTargetDir != 0.0f) {
+				const GpuBodyState& ballB = in.bodies[0];
+				CuVec3 pos = GV(ballB.pos) * CU_BT_TO_UU;
+				float relNormalY = cp.normalWorldOnB.y * bs.hsYTargetDir;
+				float relY = pos.y * bs.hsYTargetDir;
+				if (relNormalY <= -in.cc.hsWallBounceChangeYNormal &&
+					relY >= in.cc.arenaExtentY - in.cc.hsWallBounceChangeYThresh) {
+					bs.hsYTargetDir *= -1.0f;
+					CuVec3 pos2 = GV(ballB.pos) * CU_BT_TO_UU;
+					CuVec3 vel = GV(ballB.linVel) * CU_BT_TO_UU;
+					CuVec3 goalTargetPos = { 0, in.cc.hsTargetY * bs.hsYTargetDir, in.cc.hsTargetZ };
+					CuVec3 dirToGoal = CuVecNormalizedRS(goalTargetPos - pos2);
+					CuVec3 bounceDir = dirToGoal * (1.0f - in.cc.hsWallBounceUpFrac) +
+						CuVec3{ 0, 0, 1 } * in.cc.hsWallBounceUpFrac;
+					// vel.Length(): RS Vec tree
+					float velLenSq = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z;
+					float velLen = velLenSq > 0 ? sqrtf(velLenSq) : 0.0f;
+					CuVec3 bounceImpulse = (bounceDir * velLen) * in.cc.hsWallBounceForceScale;
+					CuVec3 cache = GV(bs.velocityImpulseCache) + bounceImpulse * CU_UU_TO_BT;
+					bs.velocityImpulseCache = { cache.x, cache.y, cache.z };
+				}
+			}
+		}
+		// (snowday ground-stick handled with the puck port)
+		if (in.cc.gameMode != CU_GAMEMODE_SNOWDAY)
 			cp.isSpecial = 1;
 	}
 }

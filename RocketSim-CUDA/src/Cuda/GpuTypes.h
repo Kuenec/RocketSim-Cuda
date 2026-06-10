@@ -339,10 +339,14 @@ struct GpuManifoldOut {
 // Capacity == pair capacity (<= 1 manifold per pair, so overflow is impossible)
 #define GPU_MAX_MANIFOLDS 96
 
-// Ball game state touched by collision callbacks + finish (soccar scope)
+// Ball game state touched by collision callbacks + pre-tick + finish
 struct GpuBallGameState {
 	GpuVec3 velocityImpulseCache;  // Ball::_velocityImpulseCache (BT units)
 	uint64_t tickCountSinceUpdate; // BallState::tickCountSinceUpdate (finish increments)
+	// HeatseekerInfo
+	float hsYTargetDir;            // 0 = no net
+	float hsCurTargetSpeed;        // UU
+	float hsTimeSinceHit;
 };
 
 // Boost pad constants (pad order = arena _boostPads order, identical all arenas)
@@ -368,6 +372,7 @@ struct GpuTailConsts {
 	float cylHeightBT;                       // CYL_HEIGHT * UU_TO_BT
 };
 
+
 // Constants for the collide phase (shared by all arenas)
 struct GpuCollideConsts {
 	// btCompoundShape::getAabb inputs (m_localAabb includes the child box margin)
@@ -392,6 +397,16 @@ struct GpuCollideConsts {
 	float ballCarExtraZScale, ballCarExtraForwardScale, ballCarExtraMaxDeltaVelUU;
 	GpuCurve ballExtraImpulseFactorCurve;
 	GpuCurve bumpVelGroundCurve, bumpVelAirCurve, bumpUpwardVelCurve;
+	// Heatseeker (RLConst::Heatseeker + arena extent; the contact callback and the
+	// ball pre-tick both read these)
+	float hsTargetY, hsTargetZ;             // goal target point (UU)
+	float hsHorizontalBlend, hsVerticalBlend, hsSpeedBlend;
+	float hsMaxTurnPitch;
+	float hsMaxSpeed;                       // seek speed cap (4600)
+	float hsTargetSpeedIncrement, hsMinSpeedupInterval;
+	float hsWallBounceChangeYThresh, hsWallBounceChangeYNormal;
+	float hsWallBounceForceScale, hsWallBounceUpFrac;
+	float arenaExtentY;
 };
 
 } // namespace rscuda
