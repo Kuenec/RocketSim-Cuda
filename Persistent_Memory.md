@@ -622,28 +622,116 @@ verified in source 2026-06-10):**
    (skip if dot<0), reproject posB + localPointB. Thresholds: convexEps 0,
    edgeDist 0.1, maxEdgeAngle 2pi. btGetHash = (partId<<21)|triIdx (partId 0 here).
    ALL COLLISION NARROWPHASE NOW IN DEVICE CODE (CudaCollision.cuh ~2400 ln).
-   NEXT IMPLEMENTATION STEPS for collision phase completion:
-   1. Host extraction+upload: per-mesh BVH (getQuantizedNodeArray/getSubtreeInfoArray/
-      getBvhAabbMin/Max/getBvhQuantization - accessors added), mesh margin, per-tri
-      GpuTriInfo from trimesh->getTriangleInfoMap() (btHashMap iterate: int key =
-      (0<<21)|triIdx -> btTriangleInfo{m_flags,m_edgeV0V1Angle,V1V2,V2V0}).
-   2. Device collision orchestrator: updateAabbs (per ACTIVE body: shape getAabb at
-      worldTransform UNION getAabb at interp transform [recompute via
-      CuIntegrateTransform on post-damping state] +-0.02; setAabb semantics: proxy
-      aabb + dyn cell move only if aabbMin cellIdx changed && numDyn>1); pair gen
-      (per dyn proxy in [ball,car...] order: statics of cellIdx cell + dyns of same
-      cell, aabbOverlap TestAabbAgainstAabb2, dedup, ADD ORDER); dispatch loop per
-      pair in order: needsCollision (activity) -> by shape kinds: car=compound->box
-      child (compose transform) vs mesh/plane/box/sphere; manifold per pair;
-      contact callbacks INSIDE CuAddContactPoint flow per CPU order: car-ball ->
-      Ball::_OnHit effects (ballHitInfo writes + extra impulse w/ guards + friction/
-      restitution OVERRIDES on the point), car-car -> bump logic (uses CuVecNormalizedRS
-      Vec trees + curves), car-world -> worldContact set + friction/restitution
-      override, ball-world -> isSpecial=true; then btAdjustInternalEdgeContacts for
-      mesh contacts (CuAdjustInternalEdgeContacts).
-   3. rscap manifold capture at AFTER_COLLISION (dispatcher manifold order: pair-cache
-      array order) + bench manifold-compare mode (GPU from AFTER_PREDICT-uploaded
-      state + carSnaps-style world inputs).
+   DONE since: (1) Host extraction+upload of mesh BVHs/margins/triInfos
+   (ExtractMeshBvhs in bench_work + rscuda::UploadMeshBvhs; GpuTriInfo moved to
+   GpuTypes.h; triInfoMap find key = triIdx since partId=0; absent entry ->
+   hasInfo=0 = CPU early-return). (2) rscap manifold+proxy capture at
+   AFTER_COLLISION (ManifoldSnap/ContactSnap/ProxySnap) + bench --manifold-dump N
+   (verified live: car-vs-plane manifolds match expectations).
+   COLLISION ORCHESTRATION SPEC (decoded 2026-06-10 from RS bullet source, verified
+   by uid probe + manifold dump; THE reference for the device port):
+   - updateAabbs: m_forceUpdateAllAabbs=TRUE (Arena never clears) -> ALL objects
+     each tick, but statics recompute identical aabbs -> setAabb `!=` guard no-ops
+     (device: skip statics, proxy aabbs are upload-time constants). Dyn aabb =
+     shape getAabb(worldTransform) +-gContactBreakingThreshold(0.02) UNION (because
+     dispatchInfo.m_useContinuous=true) interp-transform aabb +-0.02.
+     btCompoundShape::getAabb uses CONST m_localAabbMin/Max + margin: center=T*mid,
+     extent=dot3(halfExt+margin, |basis rows|). Sphere: origin +- radius.
+     btStaticPlaneShape::getAabb (RS mod): slab on single axis: [const-0.2,const+0.2],
+     back side extended to +-LARGE (m_singleAxisBackwards). Plane proxy aabbs are
+     THIN -> cars at suspension height (zmin 0.35) do NOT pair with floor (slab
+     zmax 0.2). Ball at rest DOES pair (zmin -0.062).
+   - setAabb (dyn): if aabb bitwise-changed: update aabb; newCell=GetCellIdx(aabbMin);
+     if cell changed AND numDynProxies>1: remove from old 3x3x3 around (i,j,k),
+     append to new 3x3x3 (clamped). Cell dynHandles order = push_back order =
+     ascending per-proxy "re-registration seq" (each move removes from ALL old cells
+     and appends; device model: per-proxy regSeq counter, cell list = members sorted
+     by regSeq; initial regSeq = creation order ball,car0,car1...).
+   - Proxy uid = handle index + 2 (set in btRSBroadphase ctor; NOT garbage).
+     Handle order: statics first (16 meshes then 4 planes), ball, cars. internalAddPair
+     swaps so pair.proxy0 = lower uid -> static always proxy0 of dyn-static pairs;
+     ball proxy0 of ball-car; lower car proxy0 of car-car.
+   - calculateOverlappingPairs: removes ALL activePairs (releases algos+manifolds ->
+     NO persistence, per-tick manifolds only), then per dyn handle in order:
+     cell=cells[cellIdx]; for s in cell.staticHandles (order = smear insertion):
+     TestAabbAgainstAabb2 -> addOverlappingPair (group/mask filter BOTH ways inside,
+     findPair dedup); then if numDynProxies>1 && cell.dynHandles.size()>1: same for
+     dyns (skip self). Pair ARRAY order = add order = dispatch order.
+   - STATICS ARE ISLAND_SLEEPING (btDiscreteDynamicsWorld::addRigidBody) ->
+     isActive()=false. needsCollision(a,b)=!(!a.active && !b.active) -> dyn-static
+     pair dispatches ONLY if the dyn is active. Sleeping ball next to floor =>
+     pair exists, NO algorithm, NO manifold (verified: kickoff ball, 0 manifolds).
+   - defaultNearCallback: needsCollision -> findAlgorithm (per-tick fresh since pairs
+     rebuilt) -> processCollision. Algorithm matrix (RS: USE_BUGGY_SPHERE_BOX
+     undefined, no initializePolyhedralFeatures, convex-convex/plane perturbation
+     DEAD [ccCF: numPerturb=0; planeCF: minPointsThresh=0]):
+     ball-mesh: swappedConvexConcave -> manifold(ball,mesh) AT pair-algo ctor.
+     ball-plane: planeConvex(swapped) -> manifold(ball,plane) AT ctor.
+     car-mesh: swappedCompound(no dbvt: Car compound=btCompoundShape(false,1)) ->
+       preallocate child algo at ctor: convexConcave(carObj,mesh) -> manifold(car,mesh)
+       AT ctor. processCollision: ProcessChildShape(child0): child world aabb
+       (orgTrans*childTrans) + extend 0 vs MESH shape aabb (const, identity) ->
+       TestAabbAgainstAabb2 -> set result wrap+shape ids (partId -1, index 0 on the
+       compound side) -> child convexConcave processCollision (box GJK per tri).
+     car-plane: swappedCompound -> child convexPlane -> manifold(car,plane) AT ctor.
+     ball-car: swappedCompound(car) -> child algo convexConvex(carbox, ball) at ctor
+       but manifold LAZY: created (car,ball) at FIRST processCollision = only when
+       child-vs-ball aabb test passes. Then plain GJK (box margin 0.04+sphere r,
+       maxDistSq=(mA+mB+manifoldBreaking)^2) + EPA fallback.
+     car-car: compoundCompound -> NO dbvt trees -> falls back to base compound
+       processCollision. Ctor chain at pair creation: outer preallocate ->
+       findAlgorithm(car1box, car2compound) -> swappedCompound nested -> its
+       preallocate -> findAlgorithm(car2box, car1box) -> BOXBOX ctor -> manifold
+       (car2, car1) AT ctor (needsCollision-gated) -- body0 = HIGHER car!
+       Runtime: outer ProcessChildShape(car1 child): aabb car1box vs car2 COMPOUND
+       -> sets result body0Wrap=car1box ids A(-1,0) -> nested: ProcessChildShape
+       (car2 child): aabb car2box vs car1box -> sets body1Wrap=car2box ids B(-1,0)
+       -> boxbox processCollision(body0arg=car2box!, body1arg=car1box): detector
+       (box0=car2box at car2 childWT, box1=car1box); manifold(car2,car1) vs result
+       (body0=car1box) -> addContactPoint SWAPPED insertion path.
+   - Manifold m_manifoldsPtr order = getNewManifold call order = pair dispatch order
+     (+ lazy convex-convex inserts at first contact-pass). SOLVER consumes this order.
+   - getNewManifold: contactBreakingThreshold = MIN over both shapes of
+     shape->getContactBreakingThreshold(0.02) = getAngularMotionDisc()*0.02 (RELATIVE
+     flag default ON) -> e.g. car-plane admits d up to ~0.07 (verified dump d=0.0305);
+     contactProcessingThreshold = min(both objs) = BT_LARGE_FLOAT default.
+   - Contact-added callback (gContactAddedCallback=Arena::_BulletContactAddedCallback,
+     fires from btManifoldResult::addContactPoint since ball+cars have
+     CF_CUSTOM_MATERIAL_CALLBACK; args = RESULT wrapper order): skip if either body
+     !hasContactResponse; shouldSwap so bodyA=lower userIndex (car=BT_USERINFO_TYPE_CAR
+     < ball) / the one WITH userIndex; car-ball -> friction=CARBALL_COLLISION_FRICTION,
+     restitution=CARBALL_COLLISION_RESTITUTION + Ball::_OnHit(car, relPosOnBall=
+     localPointA-or-B(ballIsBodyA)*BT_TO_UU): ballHitInfo writes EVERY add; extra
+     impulse guarded (tickCount > lastApplied+1 || lastApplied > tickCount) ->
+     _velocityImpulseCache += (Vec trees, UU, curves); car-car -> friction/rest :=
+     CARCAR consts + bump logic (2-way loop, cooldown, vel-toward checks Vec trees,
+     bumper localPoint.x check, demo mode, BUMP curves -> victim _velocityImpulseCache,
+     carContact id+cooldown writes); car-world -> worldContact.hasContact=true +
+     normal + friction:=carWorldFriction, restitution:=carWorldRestitution;
+     ball-world -> Ball::_OnWorldCollision (soccar: no-op) + m_isSpecial=true (non-
+     snowday). THEN btAdjustInternalEdgeContacts(cp, trimeshWrapSide, otherSide,
+     partId, index) ALWAYS (early-out if shape != trimesh).
+   REMAINING IMPLEMENTATION (in order):
+   a. Host extraction: static object table in handle order (kind mesh/plane, proxy
+      aabbMin/Max consts, group/mask, shape breaking threshold), static CSR cell
+      lists from bp->cells (staticHandles per cell), dyn proxy initial state
+      (aabbMin/Max/cellIdx/ijk from CPU proxies after setup), per-body collide
+      consts (compound localAabbMin/Max+margin, box halfExt+margin, sphere radius,
+      angular motion discs, processing thresholds), game consts (CARBALL_*/CARCAR_*/
+      carWorld fric+rest, BUMP curves already in GpuCarConsts? bump curves =
+      BUMP_VEL_AMOUNT_GROUND/AIR/UPWARD curves - extract), userIndex mapping.
+   b. Device CudaCollideWorld.cuh: CuCollidePhase(arena): dyn aabb update + cell
+      maintenance (regSeq model), pair gen (ordered, filtered, deduped), dispatch
+      per pair type exactly as spec above, manifolds into per-arena buffer in
+      creation order (incl. EMPTY manifolds for ordering!), contact callbacks
+      mutating GpuCarGameState/ball state + _velocityImpulseCache accumulators,
+      internal-edge adjust for mesh contacts. Kernel phase GPU_PHASE_COLLIDE,
+      single thread per arena (like other phases).
+   c. Bench --gpu-compare extension: upload AFTER_PREDICT state + proxy snaps,
+      run collide segment, download manifolds + proxy state, compare vs rscap
+      AFTER_COLLISION (bitwise: aabbs, cells, manifold order/bodies/points all
+      fields). NOTE ball asleep at kickoff -> need ball-motion coverage: give ball
+      initial velocity in compare setup (bench-side state injection) + multi-seed.
    Then solver (btSequentialImpulse - READ NEXT after collision validated), ball
    pre/finish + pads + arena tail, monolithic assembly, flip --gpu-step.
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
