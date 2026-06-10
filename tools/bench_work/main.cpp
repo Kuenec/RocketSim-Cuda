@@ -595,6 +595,7 @@ static void ExtractMeshBvhs(Arena* arena,
 		rscuda::GpuMeshBvh mb;
 		mb.nodeStart = (int)nodes.size();
 		mb.subtreeStart = (int)subtrees.size();
+		mb.numNodes = bvh->getQuantizedNodeArray().size();
 		mb.bvhAabbMin = ToGpuB(bvh->getBvhAabbMin());
 		mb.bvhAabbMax = ToGpuB(bvh->getBvhAabbMax());
 		mb.bvhQuantization = ToGpuB(bvh->getBvhQuantization());
@@ -803,6 +804,18 @@ static int RunRayFuzz(const Args& args, int numRays) {
 	rscuda::GpuBatch* batch = rscuda::CreateBatch(1, args.cars, (int)arena->GetBoostPads().size());
 	rscuda::UploadWorldGeo(batch, planes.data(), (int)planes.size(),
 		meshes.data(), (int)meshes.size(), tris.data(), (int)(tris.size() / 3));
+	{
+		std::vector<rscuda::GpuMeshBvh> bvhs;
+		std::vector<rscuda::GpuBvhNode> bvhNodes;
+		std::vector<rscuda::GpuBvhSubtree> bvhSubtrees;
+		std::vector<rscuda::GpuTriInfo> triInfos;
+		std::vector<float> meshMargins;
+		ExtractMeshBvhs(arena, bvhs, bvhNodes, bvhSubtrees, triInfos, meshMargins);
+		rscuda::UploadMeshBvhs(batch, bvhs.data(), (int)bvhs.size(),
+			bvhNodes.data(), (int)bvhNodes.size(),
+			bvhSubtrees.data(), (int)bvhSubtrees.size(),
+			triInfos.data(), (int)triInfos.size(), meshMargins.data());
+	}
 
 	// Dynamic candidates: ball (sphere) + cars (compound box), with live transforms
 	// and proxy aabbMin (drives btRSBroadphase voxel cell membership)

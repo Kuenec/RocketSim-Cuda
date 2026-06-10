@@ -287,6 +287,7 @@ struct GpuBvhSubtree {
 };
 struct GpuMeshBvh {
 	int nodeStart;      // into shared node buffer
+	int numNodes;       // m_curNodeIndex (the ray walk scans the whole array)
 	int subtreeStart;   // into shared subtree buffer
 	int numSubtrees;
 	GpuVec3 bvhAabbMin, bvhAabbMax, bvhQuantization;

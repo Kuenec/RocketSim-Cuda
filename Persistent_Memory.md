@@ -776,12 +776,22 @@ verified in source 2026-06-10):**
       CPU visits triangles in btQuantizedBvh RAY-walk order
       (reportRayOverlappingNodex); CuRayTestStatic predates the BVH port and scans
       mesh triangles LINEARLY -> different tie winner -> different normal.
-      FIX IN PROGRESS: make CuRayTestStatic's mesh path walk the BVH exactly like
-      the CPU ray path (READ btQuantizedBvh::reportRayOverlappingNodex first -
-      confirm the exact node test + walk variant for rays), then re-run: ray-fuzz,
-      soccar gates + 20k compares, HS seeds incl. 42x8. NOTE the same linear-scan
-      tie-break issue could affect CuRayTestWorld's other callers (the validated
-      soccar gates never hit a tie - tie cases are real but rare).
+      FIXED + HEATSEEKER VALIDATED: CuBvhWalkRay in CudaRaycast.cuh ports
+      btQuantizedBvh::walkStacklessQuantizedTreeAgainstRay (RAYAABB2 path: linear
+      depth-first node scan, quantized-box test + btRayAabb2 slab test with
+      safeNormalized inverse direction, escape-index skips); GpuWorldGeo carries
+      bvhs/bvhNodes (set by UploadMeshBvhs; GpuMeshBvh grew numNodes); ray fuzz
+      callers updated (RunRayFuzz now uploads BVHs too).
+      RESULTS: ray-fuzz 200k PASS; the failing trajectory (HS seed42 tick 1402)
+      per-phase PASS; SOCCAR gates PASS + 20k compare PASS (the ray walk changed
+      every wheel ray path - revalidated); HEATSEEKER: 8ar x5000 seed42 MATCH,
+      20000x1 seed1337 MATCH (hash 9090346742586108841), 64ar x1000 x4cars MATCH
+      (hash 6365120802482066310). HEATSEEKER GATES (work-bench CPU = reference):
+        --game-mode heatseeker --ticks 20000 --arenas 1 --cars 2 --seed 1337
+          -> 9090346742586108841
+        --game-mode heatseeker --ticks 1000 --arenas 64 --cars 4 --seed 1337
+          -> 6365120802482066310
+      TASK #13 HEATSEEKER: COMPLETE.
    2. DEMOLITIONS (#14): deterministic-seed hook for Math::GetRandEngine in the
       WORK copy behind a flag (upstream demo respawn is wall-clock-seeded ->
       bit-exact validation only possible work-CPU vs work-GPU with the same seed;

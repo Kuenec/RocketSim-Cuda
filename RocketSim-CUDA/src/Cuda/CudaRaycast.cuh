@@ -29,6 +29,11 @@ struct GpuWorldGeo {
 	const GpuMeshInfo* meshes;
 	int numMeshes;
 	const GpuVec3* meshTris;  // [triStart*3 + 3*t + corner]
+	// per-mesh quantized BVHs: ray tests must visit triangles in the CPU's
+	// btQuantizedBvh ray-walk order (equal-fraction ties keep the FIRST visit -
+	// proven by a wheel ray crossing a triangle edge, heatseeker seed 42 tick 1402)
+	const GpuMeshBvh* bvhs;
+	const GpuBvhNode* bvhNodes;
 };
 
 struct GpuRayHit {
@@ -129,6 +134,111 @@ __device__ __forceinline__ bool CuRayPlane(
 	return hit;
 }
 
+// btQuantizedBvh::quantizeWithClamp (same math as the contact walk's helper, local
+// variant taking raw min/quantization vectors)
+__device__ __forceinline__ void CuRayQuantizeClamp(CuVec3 bvhMin, CuVec3 bvhMax,
+	CuVec3 quantization, CuVec3 p, int isMax, uint16_t* q) {
+	CuVec3 c = { fmaxf(p.x, bvhMin.x), fmaxf(p.y, bvhMin.y), fmaxf(p.z, bvhMin.z) };
+	c = { fminf(c.x, bvhMax.x), fminf(c.y, bvhMax.y), fminf(c.z, bvhMax.z) };
+	CuVec3 v = (c - bvhMin) * quantization; // component-wise (btVector3 scaled mul)
+	if (isMax) {
+		q[0] = (uint16_t)(((uint16_t)(v.x + 1.0f)) | 1);
+		q[1] = (uint16_t)(((uint16_t)(v.y + 1.0f)) | 1);
+		q[2] = (uint16_t)(((uint16_t)(v.z + 1.0f)) | 1);
+	} else {
+		q[0] = (uint16_t)(((uint16_t)v.x) & 0xfffe);
+		q[1] = (uint16_t)(((uint16_t)v.y) & 0xfffe);
+		q[2] = (uint16_t)(((uint16_t)v.z) & 0xfffe);
+	}
+}
+
+__device__ __forceinline__ unsigned CuRayTestQuantAabb(const uint16_t* min1, const uint16_t* max1,
+	const uint16_t* min2, const uint16_t* max2) {
+	return (unsigned)(min1[0] <= max2[0] && max1[0] >= min2[0] &&
+		min1[2] <= max2[2] && max1[2] >= min2[2] &&
+		min1[1] <= max2[1] && max1[1] >= min2[1]);
+}
+
+// btRayAabb2 (slab test; strict comparison semantics preserved)
+__device__ __forceinline__ bool CuRayAabb2(CuVec3 rayFrom, CuVec3 rayInvDir,
+	const unsigned int raySign[3], const CuVec3 bounds[2], float& tmin,
+	float lambda_min, float lambda_max) {
+	float tmax, tymin, tymax, tzmin, tzmax;
+	const float* bx[2] = { &bounds[0].x, &bounds[1].x };
+	tmin = (bx[raySign[0]][0] - rayFrom.x) * rayInvDir.x;
+	tmax = (bx[1 - raySign[0]][0] - rayFrom.x) * rayInvDir.x;
+	tymin = (bx[raySign[1]][1] - rayFrom.y) * rayInvDir.y;
+	tymax = (bx[1 - raySign[1]][1] - rayFrom.y) * rayInvDir.y;
+	if ((tmin > tymax) || (tymin > tmax))
+		return false;
+	if (tymin > tmin)
+		tmin = tymin;
+	if (tymax < tmax)
+		tmax = tymax;
+	tzmin = (bx[raySign[2]][2] - rayFrom.z) * rayInvDir.z;
+	tzmax = (bx[1 - raySign[2]][2] - rayFrom.z) * rayInvDir.z;
+	if ((tmin > tzmax) || (tzmin > tmax))
+		return false;
+	if (tzmin > tmin)
+		tmin = tzmin;
+	if (tzmax < tmax)
+		tmax = tzmax;
+	return ((tmin < lambda_max) && (tmax > lambda_min));
+}
+
+// btQuantizedBvh::walkStacklessQuantizedTreeAgainstRay (RAYAABB2 path): linear
+// depth-first scan over the contiguous node array with quantized-box + slab tests.
+// processLeaf(triIdx) runs in the EXACT CPU visit order.
+template <typename F>
+__device__ inline void CuBvhWalkRay(const GpuBvhNode* nodes, int numNodes,
+	CuVec3 bvhMin, CuVec3 bvhMax, CuVec3 quantization,
+	CuVec3 raySource, CuVec3 rayTarget, F&& processLeaf) {
+	float lambda_max = 1.0f;
+	CuVec3 rayDirection = rayTarget - raySource;
+	rayDirection = CuSafeNormalize3(rayDirection);
+	lambda_max = CuDot3(rayDirection, rayTarget - raySource);
+	CuVec3 rid = {
+		rayDirection.x == 0.0f ? 1e18f /*BT_LARGE_FLOAT*/ : 1.0f / rayDirection.x,
+		rayDirection.y == 0.0f ? 1e18f : 1.0f / rayDirection.y,
+		rayDirection.z == 0.0f ? 1e18f : 1.0f / rayDirection.z };
+	unsigned int sign[3] = { rid.x < 0.0f, rid.y < 0.0f, rid.z < 0.0f };
+
+	CuVec3 rayAabbMin = CuMin3(raySource, rayTarget); // (box-cast extents are zero)
+	CuVec3 rayAabbMax = CuMax3(raySource, rayTarget);
+	uint16_t qmin[3], qmax[3];
+	CuRayQuantizeClamp(bvhMin, bvhMax, quantization, rayAabbMin, 0, qmin);
+	CuRayQuantizeClamp(bvhMin, bvhMax, quantization, rayAabbMax, 1, qmax);
+
+	int curIndex = 0;
+	while (curIndex < numNodes) {
+		const GpuBvhNode& n = nodes[curIndex];
+		bool isLeafNode = n.escapeIndexOrTriangleIndex >= 0;
+		unsigned rayBoxOverlap = 0;
+		float param = 1.0f;
+		unsigned boxBoxOverlap = CuRayTestQuantAabb(qmin, qmax, n.qmin, n.qmax);
+		if (boxBoxOverlap) {
+			// unQuantize: (float)q / quantization + bvhAabbMin (per-component
+			// division); box-cast extents are zero (x -= 0 is exact)
+			CuVec3 bounds[2];
+			bounds[0] = { (float)n.qmin[0] / quantization.x + bvhMin.x,
+				(float)n.qmin[1] / quantization.y + bvhMin.y,
+				(float)n.qmin[2] / quantization.z + bvhMin.z };
+			bounds[1] = { (float)n.qmax[0] / quantization.x + bvhMin.x,
+				(float)n.qmax[1] / quantization.y + bvhMin.y,
+				(float)n.qmax[2] / quantization.z + bvhMin.z };
+			rayBoxOverlap = CuRayAabb2(raySource, rid, sign, bounds, param, 0.0f, lambda_max)
+				? 1u : 0u;
+		}
+		if (isLeafNode && rayBoxOverlap)
+			processLeaf(n.escapeIndexOrTriangleIndex & ~((~0u) << (31 - 10)));
+		if (rayBoxOverlap != 0 || isLeafNode) {
+			curIndex++;
+		} else {
+			curIndex += -n.escapeIndexOrTriangleIndex;
+		}
+	}
+}
+
 // Closest-hit ray test against the static world (meshes then planes, mirroring arena
 // setup order). cbGroup/cbMask = callback filters. Returns hit with fraction strictly
 // < 1 if anything was hit. Normal is world-space, NOT normalized (castRay normalizes).
@@ -153,11 +263,16 @@ __device__ __forceinline__ void CuRayTestStatic(
 		const GpuVec3* tv = geo.meshTris + (size_t)mi.triStart * 3;
 		CuVec3 localNormal;
 		bool hit = false;
-		for (int t = 0; t < mi.triCount; t++) {
-			if (CuRayTriangle(fromL, toL, GV(tv[t * 3]), GV(tv[t * 3 + 1]), GV(tv[t * 3 + 2]),
-					out.fraction, localNormal))
-				hit = true;
-		}
+		// performRaycast: triangles visited in the btQuantizedBvh ray-walk order
+		// (the strict < in CuRayTriangle makes the visit order the tie-breaker)
+		const GpuMeshBvh& mb = geo.bvhs[m];
+		CuBvhWalkRay(geo.bvhNodes + mb.nodeStart, mb.numNodes,
+			GV(mb.bvhAabbMin), GV(mb.bvhAabbMax), GV(mb.bvhQuantization),
+			fromL, toL, [&](int t) {
+				if (CuRayTriangle(fromL, toL, GV(tv[t * 3]), GV(tv[t * 3 + 1]), GV(tv[t * 3 + 2]),
+						out.fraction, localNormal))
+					hit = true;
+			});
 		if (hit) {
 			// reportHit: hitNormalWorld = basis * localNormal (canonicalizes -0)
 			out.normalWorld = CuMat3MulVec(ident, localNormal);

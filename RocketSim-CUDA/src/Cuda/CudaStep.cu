@@ -220,6 +220,9 @@ void UploadMeshBvhs(GpuBatch* b,
 	CudaCheck(cudaMemcpy(b->dBvhSubtrees, subtrees, sizeof(GpuBvhSubtree) * numSubtrees, cudaMemcpyHostToDevice), "up bvh subtrees");
 	CudaCheck(cudaMemcpy(b->dTriInfos, triInfos, sizeof(GpuTriInfo) * numTris, cudaMemcpyHostToDevice), "up tri infos");
 	CudaCheck(cudaMemcpy(b->dMeshMargins, meshMargins, sizeof(float) * numMeshes, cudaMemcpyHostToDevice), "up mesh margins");
+	// the ray tests reach the BVHs through the world-geo descriptor
+	b->geo.bvhs = b->dMeshBvhs;
+	b->geo.bvhNodes = b->dBvhNodes;
 }
 
 void UploadCollideData(GpuBatch* b, const GpuCollideConsts& consts,
