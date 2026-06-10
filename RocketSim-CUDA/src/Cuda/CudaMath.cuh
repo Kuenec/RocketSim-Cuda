@@ -201,6 +201,22 @@ RSC_HD CuMat3 CuUpdateInertiaTensor(const CuMat3& basis, CuVec3 invInertiaLocal)
 	return CuMat3Mul(CuMat3Scaled(basis, invInertiaLocal), CuMat3Transpose(basis));
 }
 
+// btPlaneSpace1 (btVector3.h:1266); btRecipSqrt is exact 1/sqrt
+RSC_HD void CuPlaneSpace1(CuVec3 n, CuVec3& p, CuVec3& q) {
+	constexpr float CU_SQRT12 = 0.7071067811865475244f;
+	if (fabsf(n.z) > CU_SQRT12) {
+		float a = n.y * n.y + n.z * n.z;
+		float k = 1.0f / sqrtf(a);
+		p = { 0, -n.z * k, n.y * k };
+		q = { a * k, -n.x * p.z, n.x * p.y };
+	} else {
+		float a = n.x * n.x + n.y * n.y;
+		float k = 1.0f / sqrtf(a);
+		p = { -n.y * k, n.x * k, 0 };
+		q = { -n.z * p.y, n.z * p.x, a * k };
+	}
+}
+
 // ---- Device trig matching glibc sinf/cosf bit-exactly --------------------------------
 // Base value: sin/cos computed in double, rounded once to float. That equals glibc for
 // >99.9% of inputs; the rest (double-rounding cases, ~0.08% for sinf) are fixed by an

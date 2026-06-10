@@ -90,22 +90,6 @@ __device__ __forceinline__ bool CuRayTriangle(
 	return true;
 }
 
-// btPlaneSpace1 (btVector3.h:1266); btRecipSqrt is exact 1/sqrt
-__device__ __forceinline__ void CuPlaneSpace1(CuVec3 n, CuVec3& p, CuVec3& q) {
-	constexpr float CU_SQRT12 = 0.7071067811865475244f;
-	if (fabsf(n.z) > CU_SQRT12) {
-		float a = n.y * n.y + n.z * n.z;
-		float k = 1.0f / sqrtf(a);
-		p = { 0, -n.z * k, n.y * k };
-		q = { a * k, -n.x * p.z, n.x * p.y };
-	} else {
-		float a = n.x * n.x + n.y * n.y;
-		float k = 1.0f / sqrtf(a);
-		p = { -n.y * k, n.x * k, 0 };
-		q = { -n.z * p.y, n.z * p.x, a * k };
-	}
-}
-
 __device__ __forceinline__ CuVec3 CuMin3(CuVec3 a, CuVec3 b) {
 	return { fminf(a.x, b.x), fminf(a.y, b.y), fminf(a.z, b.z) };
 }

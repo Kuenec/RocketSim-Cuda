@@ -64,6 +64,8 @@ struct Gen {
 		__builtin_memcpy(&f, &bits, 4);
 		return f;
 	}
+	// Exact [-1, 1] in 1/1024 steps
+	float NextSigned() { return (float)((int64_t)(Next() % 2049) - 1024) / 1024.0f; }
 	// small float for angular velocities (covers Taylor + normal + cap branches)
 	float NextAngVel() {
 		uint64_t r = Next();
@@ -86,6 +88,44 @@ inline void FillInput(Gen& g, Input& in) {
 	in.mb = {};
 	in.dt = 1.0f / 120.0f;
 	in.ang = (float)((int64_t)(g.Next() % 2049) - 1024) / 1024.0f * 0.75f;
+}
+
+// ---- GJK/EPA fuzz (box vs triangle, the convexConvex path used for car-vs-mesh) ----
+struct GjkCase {
+	V3 boxHalfExtentsCtor;  // btBoxShape ctor arg (margin handling inside)
+	M3 boxBasis;            // box world transform
+	V3 boxOrigin;
+	V3 triV[3];             // triangle verts (mesh local == world for statics)
+	float triMargin;        // mesh collision margin
+	// host-derived for device:
+	V3 boxImplicitHalfExt;  // implicitShapeDimensions (support basis)
+	float boxMargin;
+	float maxDistSq;        // (marginA+marginB+manifold breaking threshold)^2
+};
+struct GjkOut {
+	int hasContact;
+	V3 normalOnB;
+	V3 pointOnB;
+	float distance;
+};
+
+inline void FillGjkCase(Gen& g, GjkCase& c) {
+	// box roughly car-hitbox sized (BT units ~ 2.36 x 1.70 x 0.72 half extents 1.18...)
+	c.boxHalfExtentsCtor = {
+		0.4f + (float)(g.Next() % 1025) / 1024.0f * 1.5f,
+		0.3f + (float)(g.Next() % 1025) / 1024.0f * 1.2f,
+		0.15f + (float)(g.Next() % 1025) / 1024.0f * 0.6f };
+	// triangle around origin, mesh-scale (1-20 BT edge lengths)
+	float s = 0.5f + (float)(g.Next() % 1025) / 1024.0f * 10.0f;
+	for (int i = 0; i < 3; i++)
+		c.triV[i] = { g.NextSigned() * s, g.NextSigned() * s, g.NextSigned() * s };
+	c.triMargin = 0.04f; // CONVEX_DISTANCE_MARGIN (mesh getMargin default)
+	// box pose near the triangle: separated -> deeply penetrating
+	c.boxOrigin = {
+		(c.triV[0].x + c.triV[1].x + c.triV[2].x) / 3 + g.NextSigned() * 2.5f,
+		(c.triV[0].y + c.triV[1].y + c.triV[2].y) / 3 + g.NextSigned() * 2.5f,
+		(c.triV[0].z + c.triV[1].z + c.triV[2].z) / 3 + g.NextSigned() * 2.5f };
+	c.boxBasis = {}; // host fills orthonormal basis from a quat
 }
 
 } // namespace mathtest

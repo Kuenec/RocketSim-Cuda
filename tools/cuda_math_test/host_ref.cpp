@@ -107,6 +107,95 @@ void HostCompute(const Input* inputs, Output* outputs, size_t n) {
 	}
 }
 
+} // namespace mathtest
+
+// GJK/EPA reference via the REAL bullet detector (compiled in rocketsim_work)
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btBoxShape.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btTriangleShape.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btGjkPairDetector.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btGjkEpaPenetrationDepthSolver.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btVoronoiSimplexSolver.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
+
+namespace mathtest {
+
+struct CollectResult : public btDiscreteCollisionDetectorInterface::Result {
+	bool has = false;
+	btVector3 normal, point;
+	btScalar depth = 0;
+	virtual void setShapeIdentifiersA(int, int) {}
+	virtual void setShapeIdentifiersB(int, int) {}
+	virtual void addContactPoint(const btVector3& n, const btVector3& p, btScalar d) {
+		has = true;
+		normal = n;
+		point = p;
+		depth = d;
+	}
+};
+
+void HostGjkDerive(GjkCase* cases, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		GjkCase& c = cases[i];
+		// orthonormal basis from qa-style random quat seeded by case data
+		btQuaternion q(c.triV[0].x + 0.123f, c.triV[1].y + 0.456f, c.triV[2].z + 0.789f, 1.0f);
+		q.normalize();
+		btMatrix3x3 m;
+		m.setRotation(q);
+		for (int r = 0; r < 3; r++) {
+			c.boxBasis.r[r].x = m[r].x();
+			c.boxBasis.r[r].y = m[r].y();
+			c.boxBasis.r[r].z = m[r].z();
+		}
+		btBoxShape box(btVector3(c.boxHalfExtentsCtor.x, c.boxHalfExtentsCtor.y, c.boxHalfExtentsCtor.z));
+		btVector3 ext = box.getImplicitShapeDimensions();
+		c.boxImplicitHalfExt = { ext.x(), ext.y(), ext.z() };
+		c.boxMargin = box.getMarginNonVirtual();
+		// manifold threshold = min over shapes of getContactBreakingThreshold(0.02)
+		btTriangleShape tri(btVector3(c.triV[0].x, c.triV[0].y, c.triV[0].z),
+			btVector3(c.triV[1].x, c.triV[1].y, c.triV[1].z),
+			btVector3(c.triV[2].x, c.triV[2].y, c.triV[2].z));
+		tri.setMargin(c.triMargin);
+		btScalar breaking = btMin(box.getContactBreakingThreshold(gContactBreakingThreshold),
+			tri.getContactBreakingThreshold(gContactBreakingThreshold));
+		btScalar maxd = c.boxMargin + tri.getMarginNonVirtual() + breaking;
+		c.maxDistSq = maxd * maxd;
+	}
+}
+
+void HostGjkCompute(const GjkCase* cases, GjkOut* outs, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		const GjkCase& c = cases[i];
+		btBoxShape box(btVector3(c.boxHalfExtentsCtor.x, c.boxHalfExtentsCtor.y, c.boxHalfExtentsCtor.z));
+		btTriangleShape tri(btVector3(c.triV[0].x, c.triV[0].y, c.triV[0].z),
+			btVector3(c.triV[1].x, c.triV[1].y, c.triV[1].z),
+			btVector3(c.triV[2].x, c.triV[2].y, c.triV[2].z));
+		tri.setMargin(c.triMargin);
+
+		btVoronoiSimplexSolver simplexSolver;
+		btGjkEpaPenetrationDepthSolver pdSolver;
+		btGjkPairDetector gjk(&box, &tri, &simplexSolver, &pdSolver);
+		gjk.setMinkowskiA(&box);
+		gjk.setMinkowskiB(&tri);
+
+		btGjkPairDetector::ClosestPointInput input;
+		input.m_maximumDistanceSquared = c.maxDistSq;
+		input.m_transformA = btTransform(
+			btMatrix3x3(c.boxBasis.r[0].x, c.boxBasis.r[0].y, c.boxBasis.r[0].z,
+				c.boxBasis.r[1].x, c.boxBasis.r[1].y, c.boxBasis.r[1].z,
+				c.boxBasis.r[2].x, c.boxBasis.r[2].y, c.boxBasis.r[2].z),
+			btVector3(c.boxOrigin.x, c.boxOrigin.y, c.boxOrigin.z));
+		input.m_transformB.setIdentity();
+
+		CollectResult res;
+		gjk.getClosestPoints(input, res);
+
+		outs[i].hasContact = res.has;
+		outs[i].normalOnB = res.has ? V3{ res.normal.x(), res.normal.y(), res.normal.z() } : V3{ 0, 0, 0 };
+		outs[i].pointOnB = res.has ? V3{ res.point.x(), res.point.y(), res.point.z() } : V3{ 0, 0, 0 };
+		outs[i].distance = res.has ? (float)res.depth : 0.0f;
+	}
+}
+
 void HostTrig(const uint32_t* bits, float* sinOut, float* cosOut, size_t n) {
 	for (size_t i = 0; i < n; i++) {
 		float x;

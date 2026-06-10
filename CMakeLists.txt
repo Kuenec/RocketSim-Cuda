@@ -53,9 +53,9 @@ if(CMAKE_CUDA_COMPILER)
 	target_link_libraries(rocketsim_work PUBLIC CUDA::cudart_static)
 
 	# Bit-exactness regression guard for the device math layer (see CudaMath.cuh)
-	add_executable(cuda_math_test tools/cuda_math_test/main.cu tools/cuda_math_test/host_ref.cpp
-		${WORK_DIR}/src/Cuda/RsqrtHost.cpp)
+	add_executable(cuda_math_test tools/cuda_math_test/main.cu tools/cuda_math_test/host_ref.cpp)
 	target_include_directories(cuda_math_test PRIVATE ${WORK_DIR}/src)
+	target_link_libraries(cuda_math_test PRIVATE rocketsim_work)
 	set_target_properties(cuda_math_test PROPERTIES
 		CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON
 		CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)

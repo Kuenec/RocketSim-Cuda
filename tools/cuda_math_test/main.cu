@@ -8,6 +8,7 @@
 // Exit 0 = all ops bit-exact. Exit 1 = mismatch (details printed).
 
 #include "Cuda/CudaMath.cuh"
+#include "Cuda/CudaCollision.cuh"
 #include "Cuda/RsqrtHost.h"
 #include "../../tools/cuda_math_test/test_data.h"
 
@@ -24,6 +25,41 @@ namespace mathtest {
 void HostFillDerived(Input* inputs, size_t n);
 void HostCompute(const Input* inputs, Output* outputs, size_t n);
 void HostTrig(const uint32_t* bits, float* sinOut, float* cosOut, size_t n);
+void HostGjkDerive(GjkCase* cases, size_t n);
+void HostGjkCompute(const GjkCase* cases, GjkOut* outs, size_t n);
+}
+
+__global__ void GjkKernel(const GjkCase* cases, GjkOut* outs, size_t n) {
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const GjkCase c = cases[i];
+
+	CuGjkShape box;
+	box.kind = CU_SHAPE_BOX;
+	box.boxHalfExtNoMargin = { c.boxImplicitHalfExt.x, c.boxImplicitHalfExt.y, c.boxImplicitHalfExt.z };
+	box.margin = c.boxMargin;
+
+	CuGjkShape tri;
+	tri.kind = CU_SHAPE_TRIANGLE;
+	tri.triV[0] = { c.triV[0].x, c.triV[0].y, c.triV[0].z };
+	tri.triV[1] = { c.triV[1].x, c.triV[1].y, c.triV[1].z };
+	tri.triV[2] = { c.triV[2].x, c.triV[2].y, c.triV[2].z };
+	tri.margin = c.triMargin;
+
+	CuMat3 basisA = { { { c.boxBasis.r[0].x, c.boxBasis.r[0].y, c.boxBasis.r[0].z },
+	                    { c.boxBasis.r[1].x, c.boxBasis.r[1].y, c.boxBasis.r[1].z },
+	                    { c.boxBasis.r[2].x, c.boxBasis.r[2].y, c.boxBasis.r[2].z } } };
+	CuVec3 originA = { c.boxOrigin.x, c.boxOrigin.y, c.boxOrigin.z };
+	CuMat3 basisB = CuIdentity3();
+	CuVec3 originB = { 0, 0, 0 };
+
+	CuGjkResult r;
+	CuGjkClosestPoints(box, basisA, originA, tri, basisB, originB, c.maxDistSq, true, r);
+
+	outs[i].hasContact = r.hasContact;
+	outs[i].normalOnB = r.hasContact ? V3{ r.normalOnB.x, r.normalOnB.y, r.normalOnB.z } : V3{ 0, 0, 0 };
+	outs[i].pointOnB = r.hasContact ? V3{ r.pointOnBWorld.x, r.pointOnBWorld.y, r.pointOnBWorld.z } : V3{ 0, 0, 0 };
+	outs[i].distance = r.hasContact ? r.distance : 0.0f;
 }
 
 static CuVec3 CV(const V3& v) { return { v.x, v.y, v.z }; }
@@ -174,6 +210,9 @@ int main(int argc, char** argv) {
 		printf("TRIG TABLE: loaded %s\n", tablePath);
 	}
 
+	// EPA's expand() recursion needs more than the default 1KB device stack
+	Check(cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024), "stack limit");
+
 	{ // RSQRTSS capture + emulation hypothesis check + upload
 		static uint32_t rsqrtTab[2][4096];
 		RsBuildRsqrtTable(rsqrtTab);
@@ -244,6 +283,63 @@ int main(int argc, char** argv) {
 				ib[offsetof(Input, w) / 4], ib[offsetof(Input, w) / 4 + 1], ib[offsetof(Input, w) / 4 + 2]);
 		} else {
 			printf("MATHTEST %-10s PASS (%zu samples)\n", f.name, samples);
+		}
+	}
+
+	// ---------- GJK/EPA fuzz (box vs triangle) ----------
+	{
+		size_t gn = samples / 4;
+		std::vector<GjkCase> cases(gn);
+		Gen gg(0x61D6EAull);
+		for (size_t i = 0; i < gn; i++)
+			FillGjkCase(gg, cases[i]);
+		HostGjkDerive(cases.data(), gn);
+
+		std::vector<GjkOut> hostOut(gn), devOut(gn);
+		HostGjkCompute(cases.data(), hostOut.data(), gn);
+
+		GjkCase* dCases;
+		GjkOut* dOuts;
+		Check(cudaMalloc(&dCases, gn * sizeof(GjkCase)), "gjk in");
+		Check(cudaMalloc(&dOuts, gn * sizeof(GjkOut)), "gjk out");
+		Check(cudaMemcpy(dCases, cases.data(), gn * sizeof(GjkCase), cudaMemcpyHostToDevice), "gjk up");
+		GjkKernel<<<(unsigned)((gn + 127) / 128), 128>>>(dCases, dOuts, gn);
+		Check(cudaGetLastError(), "gjk launch");
+		Check(cudaMemcpy(devOut.data(), dOuts, gn * sizeof(GjkOut), cudaMemcpyDeviceToHost), "gjk dl");
+		cudaFree(dCases);
+		cudaFree(dOuts);
+
+		size_t bad = 0, firstBad = (size_t)-1;
+		for (size_t i = 0; i < gn; i++) {
+			bool ok = hostOut[i].hasContact == devOut[i].hasContact;
+			if (ok && hostOut[i].hasContact) {
+				ok = FloatEq(hostOut[i].distance, devOut[i].distance) &&
+					FloatEq(hostOut[i].normalOnB.x, devOut[i].normalOnB.x) &&
+					FloatEq(hostOut[i].normalOnB.y, devOut[i].normalOnB.y) &&
+					FloatEq(hostOut[i].normalOnB.z, devOut[i].normalOnB.z) &&
+					FloatEq(hostOut[i].pointOnB.x, devOut[i].pointOnB.x) &&
+					FloatEq(hostOut[i].pointOnB.y, devOut[i].pointOnB.y) &&
+					FloatEq(hostOut[i].pointOnB.z, devOut[i].pointOnB.z);
+			}
+			if (!ok) {
+				if (bad == 0) firstBad = i;
+				bad++;
+			}
+		}
+		if (bad) {
+			failures++;
+			uint32_t hd, dd;
+			memcpy(&hd, &hostOut[firstBad].distance, 4);
+			memcpy(&dd, &devOut[firstBad].distance, 4);
+			printf("MATHTEST %-10s FAIL (%zu/%zu differ, first at %zu: cpuHas=%d gpuHas=%d "
+				"cpuDist=%.9g(0x%08X) gpuDist=%.9g(0x%08X) cpuN=(%.9g,%.9g,%.9g) gpuN=(%.9g,%.9g,%.9g))\n",
+				"gjkBoxTri", bad, gn, firstBad,
+				hostOut[firstBad].hasContact, devOut[firstBad].hasContact,
+				hostOut[firstBad].distance, hd, devOut[firstBad].distance, dd,
+				hostOut[firstBad].normalOnB.x, hostOut[firstBad].normalOnB.y, hostOut[firstBad].normalOnB.z,
+				devOut[firstBad].normalOnB.x, devOut[firstBad].normalOnB.y, devOut[firstBad].normalOnB.z);
+		} else {
+			printf("MATHTEST %-10s PASS (%zu samples)\n", "gjkBoxTri", gn);
 		}
 	}
 
