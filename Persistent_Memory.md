@@ -390,14 +390,36 @@ CAVEAT: autoflip atan2f/asinf double-rounded stand-ins (CuAtan2f/CuAsinf) - not 
 proven to trigger in compare runs; fuzz atan2/asin vs glibc still pending (bounded
 domain |args|<=~1).
 
+**Collision phase decoded so far (2026-06-10):**
+- btRSBroadphase::calculateOverlappingPairs: ALL activePairs REMOVED then re-added EVERY
+  tick -> algorithms+manifolds are PER-TICK (no warm starting, no cross-tick contact
+  state!) - massive port simplification. Pair candidates per dynamic proxy (handle
+  order = creation: statics, ball, cars): statics in proxy's cellIdx cell + dyns in
+  same cell (if numDynProxies>1); aabbOverlap = TestAabbAgainstAabb2; findPair dedups;
+  ADD ORDER (-> dispatch -> solver row order) = iteration order, replicate exactly.
+- updateSingleAabb (per ACTIVE object only - inactive keep STALE proxy AABB/cells):
+  AABB = shape getAabb(worldTransform) +- gContactBreakingThreshold(0.02) UNIONED with
+  getAabb(interpolationWorldTransform) +- 0.02 (m_useContinuous default true).
+  CORRECTION to earlier note: the interpolation transform written by predict IS read
+  here - but predict+collision are in-tick adjacent, so it can be recomputed as tick
+  scratch (integrateTransform of post-damping state); no cross-tick storage. Proxy
+  aabbMin/aabbMax + cell membership DO persist across ticks (GpuBodyState must carry).
+  setAabb early-outs if AABB unchanged; dyn cell membership only changes when aabbMin's
+  cellIdx changes (and only if numDynProxies>1).
+- Narrowphase algo map for soccar pairs: sphere/box-vs-trimesh = btConvexConcave
+  (per-triangle GJK+EPA via btConvexTriangleCallback + btInternalEdgeUtility adjust),
+  compound(car) wraps child box, box-box = btBoxBoxCollisionAlgorithm (SAT detector),
+  box-sphere = btConvexConvex (GJK+EPA), box/sphere-vs-plane = btConvexPlane.
+  Contact callback: CF_CUSTOM_MATERIAL_CALLBACK -> Arena::_BulletContactAddedCallback
+  (ball hit info, bumps, worldContact.hasContact). Manifold mechanics per tick:
+  btPersistentManifold add/refresh/4-point reduction.
+
 ### Next Steps (in order)
-1. Collision phase port (35% of CPU): btRSBroadphase calculateOverlappingPairs (voxel
-   grid pair gen), narrowphase per pair (box-vs-mesh via btCompoundCollisionAlgorithm/
-   convexTriangle GJK+EPA, sphere-mesh, box-box, sphere-box, plane tests), manifolds +
-   btInternalEdgeUtility adjustment, contact-added callback (Arena::_BulletContactAddedCallback
-   -> car-ball/car-car/car-world events incl worldContact.hasContact for autoflip/autoroll).
-2. Solver+islands (PGS), then ball pre/finish + pads + Arena tail; then assemble the
-   monolithic per-tick pipeline in GpuStepArenasKernel and flip --gpu-step.
+1. Read+port in slices with per-slice fuzz/compare: (a) AABB update + pair gen,
+   (b) convex-plane + manifold mechanics + contact callback, (c) convex-concave mesh
+   (GJK pair detector + EPA + internal edge), (d) box-box SAT, (e) compound plumbing,
+   (f) dispatch order + solver handoff. Then solver+islands, ball/pads/tail, assemble
+   monolithic kernel, flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
