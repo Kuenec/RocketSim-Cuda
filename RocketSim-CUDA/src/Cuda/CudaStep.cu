@@ -26,6 +26,7 @@
 #include "CudaMath.cuh"
 #include "CudaRaycast.cuh"
 #include "CudaVehicle.cuh"
+#include "CudaCollision.cuh"
 #include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
