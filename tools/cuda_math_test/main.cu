@@ -237,11 +237,13 @@ static void EmitTrigTable(const char* path, uint32_t domHi) {
 int main(int argc, char** argv) {
 	size_t samples = 4 * 1000 * 1000;
 	bool trigExhaustive = false;
+	bool trigFullRange = false;     // exhaustive over ALL finite floats (2^32-ish)
 	const char* emitPath = nullptr;
 	const char* tablePath = nullptr;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--samples") && i + 1 < argc) samples = strtoull(argv[++i], nullptr, 10);
 		else if (!strcmp(argv[i], "--trig-exhaustive")) trigExhaustive = true;
+		else if (!strcmp(argv[i], "--trig-exhaustive-full")) { trigExhaustive = true; trigFullRange = true; }
 		else if (!strcmp(argv[i], "--emit-trig-table") && i + 1 < argc) emitPath = argv[++i];
 		else if (!strcmp(argv[i], "--trig-table") && i + 1 < argc) tablePath = argv[++i];
 	}
@@ -448,7 +450,7 @@ int main(int argc, char** argv) {
 	// ---------- trig domain check ----------
 	// integrateTransform trig args lie in [0, ANGULAR_MOTION_THRESHOLD]
 	const uint32_t domLo = 0;
-	const uint32_t domHi = domHiBits;
+	const uint32_t domHi = trigFullRange ? 0x7F7FFFFFu /*max finite*/ : domHiBits;
 
 	size_t trigN = trigExhaustive ? (size_t)(domHi - domLo + 1) * 2 : (size_t)16 * 1000 * 1000;
 	const size_t CHUNK = 16 * 1000 * 1000;

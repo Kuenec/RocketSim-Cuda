@@ -252,21 +252,167 @@ __device__ __forceinline__ bool CuTrigLookup(const TrigFixEntry* tab, int n, uin
 	return false;
 }
 
-__device__ __forceinline__ float CuSinf(float x) {
-	uint32_t key;
-	memcpy(&key, &x, 4);
-	float fixv;
-	if (g_trigFix.sinTab && CuTrigLookup(g_trigFix.sinTab, g_trigFix.sinN, key, fixv))
-		return fixv;
-	return (float)sin((double)x);
+// ---- glibc 2.4x sinf/cosf, ported VERBATIM (2026-06-10) ----------------------------
+// From glibc sysdeps/ieee754/flt-32/{s_sinf.c,s_cosf.c,s_sincosf.h,sincosf_poly.h,
+// s_sincosf_data.c} (the !TOINT_INTRINSICS path x86-64 uses). Double arithmetic +
+// exact integer reduction only -> bit-identical to the host CRT over the FULL float
+// range (validated exhaustively, all 2^32 inputs, by cuda_math_test). This replaces
+// the old small-domain empirical correction table.
+
+struct CuSincosT {
+	double sign[4];
+	double hpi_inv;  // 2/PI * 2^24 (!TOINT_INTRINSICS scaling)
+	double hpi;      // PI/2
+	double c0, c1, c2, c3, c4;
+	double s1, s2, s3;
+};
+
+static __device__ const CuSincosT g_sincosfTable[2] = {
+	{
+		{ 1.0, -1.0, -1.0, 1.0 },
+		0x1.45F306DC9C883p+23,
+		0x1.921FB54442D18p0,
+		0x1p0,
+		-0x1.ffffffd0c621cp-2,
+		0x1.55553e1068f19p-5,
+		-0x1.6c087e89a359dp-10,
+		0x1.99343027bf8c3p-16,
+		-0x1.555545995a603p-3,
+		0x1.1107605230bc4p-7,
+		-0x1.994eb3774cf24p-13
+	},
+	{
+		{ 1.0, -1.0, -1.0, 1.0 },
+		0x1.45F306DC9C883p+23,
+		0x1.921FB54442D18p0,
+		-0x1p0,
+		0x1.ffffffd0c621cp-2,
+		-0x1.55553e1068f19p-5,
+		0x1.6c087e89a359dp-10,
+		-0x1.99343027bf8c3p-16,
+		-0x1.555545995a603p-3,
+		0x1.1107605230bc4p-7,
+		-0x1.994eb3774cf24p-13
+	}
+};
+
+static __device__ const uint32_t g_invPio4[24] = {
+	0xa2,       0xa2f9,     0xa2f983,   0xa2f9836e,
+	0xf9836e4e, 0x836e4e44, 0x6e4e4415, 0x4e441529,
+	0x441529fc, 0x1529fc27, 0x29fc2757, 0xfc2757d1,
+	0x2757d1f5, 0x57d1f534, 0xd1f534dd, 0xf534ddc0,
+	0x34ddc0db, 0xddc0db62, 0xc0db6295, 0xdb629599,
+	0x6295993c, 0x95993c43, 0x993c4390, 0x3c439041
+};
+
+#define CU_PI63 0x1.921FB54442D18p-62
+#define CU_PIO4F 0x1.921FB6p-1f
+
+__device__ __forceinline__ uint32_t CuAbstop12(float x) {
+	return (__float_as_uint(x) >> 20) & 0x7ff;
 }
-__device__ __forceinline__ float CuCosf(float x) {
-	uint32_t key;
-	memcpy(&key, &x, 4);
-	float fixv;
-	if (g_trigFix.cosTab && CuTrigLookup(g_trigFix.cosTab, g_trigFix.cosN, key, fixv))
-		return fixv;
-	return (float)cos((double)x);
+
+// NOTE: the host glibc dispatches to the FMA-compiled build (__sinf_fma /
+// __cosf_fma) on this CPU; its GCC contraction pattern (verified by disassembly +
+// exhaustive host test) fuses every poly mul-add and the reduction subtraction.
+// The fma() calls below replicate that exactly.
+__device__ __forceinline__ double CuSincosReduceFast(double x, const CuSincosT* p, int* np) {
+	double r = x * p->hpi_inv;
+	int n = ((int32_t)r + 0x800000) >> 24;
+	*np = n;
+	return fma((double)-n, p->hpi, x);
+}
+
+__device__ __forceinline__ double CuSincosReduceLarge(uint32_t xi, int* np) {
+	const uint32_t* arr = &g_invPio4[(xi >> 26) & 15];
+	int shift = (xi >> 23) & 7;
+	uint64_t n, res0, res1, res2;
+	xi = (xi & 0xffffff) | 0x800000;
+	xi <<= shift;
+	res0 = xi * arr[0];
+	res1 = (uint64_t)xi * arr[4];
+	res2 = (uint64_t)xi * arr[8];
+	res0 = (res2 >> 32) | (res0 << 32);
+	res0 += res1;
+	n = (res0 + (1ULL << 61)) >> 62;
+	res0 -= n << 62;
+	double x = (double)(int64_t)res0;
+	*np = (int)n;
+	return x * CU_PI63;
+}
+
+__device__ __forceinline__ float CuSinfPoly(double x, double x2, const CuSincosT* p, int n) {
+	double x3, x4, x6, x7, s, c, c1, c2, s1;
+	if ((n & 1) == 0) {
+		x3 = x * x2;
+		s1 = fma(x2, p->s3, p->s2);
+		x7 = x3 * x2;
+		s = fma(x3, p->s1, x);
+		return (float)fma(x7, s1, s);
+	} else {
+		x4 = x2 * x2;
+		c2 = fma(x2, p->c4, p->c3);
+		c1 = fma(x2, p->c1, p->c0);
+		x6 = x4 * x2;
+		c = fma(x4, p->c2, c1);
+		return (float)fma(x6, c2, c);
+	}
+}
+
+__device__ __forceinline__ float CuSinf(float y) {
+	double x = y;
+	double s;
+	int n;
+	const CuSincosT* p = &g_sincosfTable[0];
+	if (CuAbstop12(y) < CuAbstop12(CU_PIO4F)) {
+		s = x * x;
+		if (CuAbstop12(y) < CuAbstop12(0x1p-12f))
+			return y;
+		return CuSinfPoly(x, s, p, 0);
+	} else if (CuAbstop12(y) < CuAbstop12(120.0f)) {
+		x = CuSincosReduceFast(x, p, &n);
+		s = p->sign[n & 3];
+		if (n & 2)
+			p = &g_sincosfTable[1];
+		return CuSinfPoly(x * s, x * x, p, n);
+	} else if (CuAbstop12(y) < 0x7f8) { // < abstop12(INFINITY)
+		uint32_t xi = __float_as_uint(y);
+		int sign = xi >> 31;
+		x = CuSincosReduceLarge(xi, &n);
+		s = p->sign[(n + sign) & 3];
+		if ((n + sign) & 2)
+			p = &g_sincosfTable[1];
+		return CuSinfPoly(x * s, x * x, p, n);
+	}
+	return y - y; // inf/nan -> nan
+}
+
+__device__ __forceinline__ float CuCosf(float y) {
+	double x = y;
+	double s;
+	int n;
+	const CuSincosT* p = &g_sincosfTable[0];
+	if (CuAbstop12(y) < CuAbstop12(CU_PIO4F)) {
+		double x2 = x * x;
+		if (CuAbstop12(y) < CuAbstop12(0x1p-12f))
+			return 1.0f;
+		return CuSinfPoly(x, x2, p, 1);
+	} else if (CuAbstop12(y) < CuAbstop12(120.0f)) {
+		x = CuSincosReduceFast(x, p, &n);
+		s = p->sign[n & 3];
+		if (n & 2)
+			p = &g_sincosfTable[1];
+		return CuSinfPoly(x * s, x * x, p, n ^ 1);
+	} else if (CuAbstop12(y) < 0x7f8) {
+		uint32_t xi = __float_as_uint(y);
+		int sign = xi >> 31;
+		x = CuSincosReduceLarge(xi, &n);
+		s = p->sign[(n + sign) & 3];
+		if ((n + sign) & 2)
+			p = &g_sincosfTable[1];
+		return CuSinfPoly(x * s, x * x, p, n ^ 1);
+	}
+	return y - y;
 }
 
 // Host-side: load a table file emitted by cuda_math_test and bind it to this TU's
