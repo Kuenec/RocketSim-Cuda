@@ -2190,6 +2190,292 @@ __device__ inline void CuConvexVsMesh(
 	CuManifoldRefresh(manifold, convexBasis, convexOrigin, ident, { 0, 0, 0 });
 }
 
+// ================== btInternalEdgeUtility port =====================================
+// btAdjustInternalEdgeContacts with flags=0 (Arena passes none): frontFacing=1,
+// no double-sided. Triangle info extracted host-side into a flat per-triangle array
+// (partId always 0 for our meshes). Thresholds (btTriangleInfoMap defaults):
+// convexEpsilon=0, edgeDistanceThreshold=0.1, maxEdgeAngleThreshold=2*SIMD_PI.
+
+#define CU_TRI_INFO_V0V1_CONVEX 1
+#define CU_TRI_INFO_V1V2_CONVEX 2
+#define CU_TRI_INFO_V2V0_CONVEX 4
+#define CU_TRI_INFO_V0V1_SWAP_NORMALB 8
+#define CU_TRI_INFO_V1V2_SWAP_NORMALB 16
+#define CU_TRI_INFO_V2V0_SWAP_NORMALB 32
+#define CU_EDGE_DISTANCE_THRESHOLD 0.1f
+#define CU_MAX_EDGE_ANGLE_THRESHOLD 6.283185307179586232f // SIMD_2_PI
+#define CU_CONVEX_EPSILON 0.0f
+
+struct GpuTriInfo {
+	int flags;
+	float edgeV0V1Angle, edgeV1V2Angle, edgeV2V0Angle;
+	uint8_t hasInfo; // triangle present in the CPU info map
+};
+
+// btQuaternion operator*(quat, vec) SSE tree:
+//  x = (w*vx + y*vz) - z*vy ; y = (w*vy + z*vx) - x*vz
+//  z = (w*vz + x*vy) - y*vx ; w = -(x*vx + y*vy) - z*vz
+__device__ __forceinline__ CuQuat CuQuatMulVec(CuQuat q, CuVec3 v) {
+	return {
+		(q.w * v.x + q.y * v.z) - q.z * v.y,
+		(q.w * v.y + q.z * v.x) - q.x * v.z,
+		(q.w * v.z + q.x * v.y) - q.y * v.x,
+		-(q.x * v.x + q.y * v.y) - q.z * v.z
+	};
+}
+
+// quatRotate(q, v) = (q * v) * q.inverse(); xyz of the result
+__device__ __forceinline__ CuVec3 CuQuatRotate(CuQuat rotation, CuVec3 v) {
+	CuQuat q = CuQuatMulVec(rotation, v);
+	CuQuat inv = { -rotation.x, -rotation.y, -rotation.z, rotation.w };
+	q = CuQuatMul(q, inv);
+	return { q.x, q.y, q.z };
+}
+
+// btNearestPointInLineSegment (btInternalEdgeUtility.cpp:357); fuzzyZero =
+// length2 < SIMD_EPSILON*SIMD_EPSILON
+__device__ __forceinline__ CuVec3 CuNearestPointInLineSegment(CuVec3 point, CuVec3 line0, CuVec3 line1) {
+	CuVec3 lineDelta = line1 - line0;
+	if (CuLength2(lineDelta) < CU_SIMD_EPSILON * CU_SIMD_EPSILON)
+		return line0;
+	float delta = CuDot3(point - line0, lineDelta) / CuDot3(lineDelta, lineDelta);
+	if (delta < 0) delta = 0;
+	else if (delta > 1) delta = 1;
+	return line0 + lineDelta * delta;
+}
+
+// btGetAngle: atan2(swing.refAxis0, swing.refAxis1) - double-rounded stand-in
+__device__ __forceinline__ float CuGetAngleIE(CuVec3 edgeA, CuVec3 normalA, CuVec3 normalB) {
+	return (float)atan2((double)CuDot3(normalB, edgeA), (double)CuDot3(normalB, normalA));
+}
+
+// btClampNormal (btInternalEdgeUtility.cpp:380)
+__device__ __forceinline__ bool CuClampNormal(CuVec3 edge, CuVec3 tri_normal, CuVec3 localContactNormalOnB,
+	float correctedEdgeAngle, CuVec3& clampedLocalNormal) {
+	CuVec3 edgeCross = CuNormalize3(CuCross(edge, tri_normal)); // .normalize() rsqrt
+	float curAngle = CuGetAngleIE(edgeCross, tri_normal, localContactNormalOnB);
+
+	if (correctedEdgeAngle < 0) {
+		if (curAngle < correctedEdgeAngle) {
+			float diffAngle = correctedEdgeAngle - curAngle;
+			CuQuat rotation = CuQuatAxisAngle(edge, diffAngle);
+			clampedLocalNormal = CuMat3MulVec(CuMat3SetRotation(rotation), localContactNormalOnB);
+			return true;
+		}
+	}
+	if (correctedEdgeAngle >= 0) {
+		if (curAngle > correctedEdgeAngle) {
+			float diffAngle = correctedEdgeAngle - curAngle;
+			CuQuat rotation = CuQuatAxisAngle(edge, diffAngle);
+			clampedLocalNormal = CuMat3MulVec(CuMat3SetRotation(rotation), localContactNormalOnB);
+			return true;
+		}
+	}
+	return false;
+}
+
+// btAdjustInternalEdgeContacts (mesh transform identity, flags=0). Mutates the
+// manifold point exactly like CPU. Mesh body = "colObj0Wrap" (the triangle side).
+__device__ inline void CuAdjustInternalEdgeContacts(
+	CuManifoldPoint& cp,
+	CuVec3 v0, CuVec3 v1, CuVec3 v2,
+	const GpuTriInfo& info) {
+
+	if (!info.hasInfo)
+		return;
+
+	const CuMat3 ident = CuIdentity3(); // mesh world transform basis
+	const float frontFacing = 1.0f;
+
+	// tri_shape->calcNormal: cross + normalize() [rsqrt]
+	CuVec3 tri_normal = CuNormalize3(CuCross(v1 - v0, v2 - v0));
+
+	// stale-nearest quirk: computed for edge V0V1 BEFORE the bestedge loop
+	CuVec3 nearest = CuNearestPointInLineSegment(cp.localPointB, v0, v1);
+	CuVec3 contact = cp.localPointB;
+
+	bool isNearEdge = false;
+	int numConcaveEdgeHits = 0;
+	int numConvexEdgeHits = 0;
+
+	// basisT * normalWorld (identity: canon trees), then normalize() [rsqrt]
+	CuVec3 localContactNormalOnB = CuMat3MulVec(CuMat3Transpose(ident), cp.normalWorldOnB);
+	localContactNormalOnB = CuNormalize3(localContactNormalOnB);
+
+	int bestedge = -1;
+	float disttobestedge = 3.402823466e+38f;
+	if (fabsf(info.edgeV0V1Angle) < CU_MAX_EDGE_ANGLE_THRESHOLD) {
+		CuVec3 nr = CuNearestPointInLineSegment(cp.localPointB, v0, v1);
+		float len = sqrtf(CuLength2(contact - nr));
+		if (len < disttobestedge) {
+			bestedge = 0;
+			disttobestedge = len;
+		}
+	}
+	if (fabsf(info.edgeV1V2Angle) < CU_MAX_EDGE_ANGLE_THRESHOLD) {
+		CuVec3 nr = CuNearestPointInLineSegment(cp.localPointB, v1, v2);
+		float len = sqrtf(CuLength2(contact - nr));
+		if (len < disttobestedge) {
+			bestedge = 1;
+			disttobestedge = len;
+		}
+	}
+	if (fabsf(info.edgeV2V0Angle) < CU_MAX_EDGE_ANGLE_THRESHOLD) {
+		CuVec3 nr = CuNearestPointInLineSegment(cp.localPointB, v2, v0);
+		float len = sqrtf(CuLength2(contact - nr));
+		if (len < disttobestedge) {
+			bestedge = 2;
+			disttobestedge = len;
+		}
+	}
+
+	// ---- edge V0V1 (uses the STALE pre-loop `nearest`) ----
+	if (fabsf(info.edgeV0V1Angle) < CU_MAX_EDGE_ANGLE_THRESHOLD) {
+		float len = sqrtf(CuLength2(contact - nearest));
+		if (len < CU_EDGE_DISTANCE_THRESHOLD)
+			if (bestedge == 0) {
+				CuVec3 edge = v0 - v1;
+				isNearEdge = true;
+				if (info.edgeV0V1Angle == 0.0f) {
+					numConcaveEdgeHits++;
+				} else {
+					bool isEdgeConvex = (info.flags & CU_TRI_INFO_V0V1_CONVEX) != 0;
+					float swapFactor = isEdgeConvex ? 1.0f : -1.0f;
+					CuVec3 nA = tri_normal * swapFactor;
+					CuQuat orn = CuQuatAxisAngle(edge, info.edgeV0V1Angle);
+					CuVec3 computedNormalB = CuQuatRotate(orn, tri_normal);
+					if (info.flags & CU_TRI_INFO_V0V1_SWAP_NORMALB)
+						computedNormalB = computedNormalB * -1.0f;
+					CuVec3 nB = computedNormalB * swapFactor;
+
+					float NdotA = CuDot3(localContactNormalOnB, nA);
+					float NdotB = CuDot3(localContactNormalOnB, nB);
+					bool backFacingNormal = (NdotA < CU_CONVEX_EPSILON) && (NdotB < CU_CONVEX_EPSILON);
+
+					if (backFacingNormal) {
+						numConcaveEdgeHits++;
+					} else {
+						numConvexEdgeHits++;
+						CuVec3 clampedLocalNormal;
+						bool isClamped = CuClampNormal(edge, tri_normal * swapFactor, localContactNormalOnB, info.edgeV0V1Angle, clampedLocalNormal);
+						if (isClamped) {
+							if (CuDot3(clampedLocalNormal, tri_normal * frontFacing) > 0) {
+								CuVec3 newNormal = CuMat3MulVec(ident, clampedLocalNormal);
+								cp.normalWorldOnB = newNormal;
+								cp.positionWorldOnB = cp.positionWorldOnA - cp.normalWorldOnB * cp.distance1;
+								cp.localPointB = CuInvXform(ident, { 0, 0, 0 }, cp.positionWorldOnB);
+							}
+						}
+					}
+				}
+			}
+	}
+
+	// ---- edge V1V2 ----
+	nearest = CuNearestPointInLineSegment(contact, v1, v2);
+	if (fabsf(info.edgeV1V2Angle) < CU_MAX_EDGE_ANGLE_THRESHOLD) {
+		float len = sqrtf(CuLength2(contact - nearest));
+		if (len < CU_EDGE_DISTANCE_THRESHOLD)
+			if (bestedge == 1) {
+				isNearEdge = true;
+				CuVec3 edge = v1 - v2;
+				if (info.edgeV1V2Angle == 0.0f) {
+					numConcaveEdgeHits++;
+				} else {
+					bool isEdgeConvex = (info.flags & CU_TRI_INFO_V1V2_CONVEX) != 0;
+					float swapFactor = isEdgeConvex ? 1.0f : -1.0f;
+					CuVec3 nA = tri_normal * swapFactor;
+					CuQuat orn = CuQuatAxisAngle(edge, info.edgeV1V2Angle);
+					CuVec3 computedNormalB = CuQuatRotate(orn, tri_normal);
+					if (info.flags & CU_TRI_INFO_V1V2_SWAP_NORMALB)
+						computedNormalB = computedNormalB * -1.0f;
+					CuVec3 nB = computedNormalB * swapFactor;
+
+					float NdotA = CuDot3(localContactNormalOnB, nA);
+					float NdotB = CuDot3(localContactNormalOnB, nB);
+					bool backFacingNormal = (NdotA < CU_CONVEX_EPSILON) && (NdotB < CU_CONVEX_EPSILON);
+
+					if (backFacingNormal) {
+						numConcaveEdgeHits++;
+					} else {
+						numConvexEdgeHits++;
+						// CPU quirk: shadowed local recompute, NOT normalized
+						CuVec3 localN2 = CuMat3MulVec(CuMat3Transpose(ident), cp.normalWorldOnB);
+						CuVec3 clampedLocalNormal;
+						bool isClamped = CuClampNormal(edge, tri_normal * swapFactor, localN2, info.edgeV1V2Angle, clampedLocalNormal);
+						if (isClamped) {
+							if (CuDot3(clampedLocalNormal, tri_normal * frontFacing) > 0) {
+								CuVec3 newNormal = CuMat3MulVec(ident, clampedLocalNormal);
+								cp.normalWorldOnB = newNormal;
+								cp.positionWorldOnB = cp.positionWorldOnA - cp.normalWorldOnB * cp.distance1;
+								cp.localPointB = CuInvXform(ident, { 0, 0, 0 }, cp.positionWorldOnB);
+							}
+						}
+					}
+				}
+			}
+	}
+
+	// ---- edge V2V0 ----
+	nearest = CuNearestPointInLineSegment(contact, v2, v0);
+	if (fabsf(info.edgeV2V0Angle) < CU_MAX_EDGE_ANGLE_THRESHOLD) {
+		float len = sqrtf(CuLength2(contact - nearest));
+		if (len < CU_EDGE_DISTANCE_THRESHOLD)
+			if (bestedge == 2) {
+				isNearEdge = true;
+				CuVec3 edge = v2 - v0;
+				if (info.edgeV2V0Angle == 0.0f) {
+					numConcaveEdgeHits++;
+				} else {
+					bool isEdgeConvex = (info.flags & CU_TRI_INFO_V2V0_CONVEX) != 0;
+					float swapFactor = isEdgeConvex ? 1.0f : -1.0f;
+					CuVec3 nA = tri_normal * swapFactor;
+					CuQuat orn = CuQuatAxisAngle(edge, info.edgeV2V0Angle);
+					CuVec3 computedNormalB = CuQuatRotate(orn, tri_normal);
+					if (info.flags & CU_TRI_INFO_V2V0_SWAP_NORMALB)
+						computedNormalB = computedNormalB * -1.0f;
+					CuVec3 nB = computedNormalB * swapFactor;
+					(void)nA; (void)nB;
+
+					float NdotA = CuDot3(localContactNormalOnB, nA);
+					float NdotB = CuDot3(localContactNormalOnB, nB);
+					bool backFacingNormal = (NdotA < CU_CONVEX_EPSILON) && (NdotB < CU_CONVEX_EPSILON);
+
+					if (backFacingNormal) {
+						numConcaveEdgeHits++;
+					} else {
+						numConvexEdgeHits++;
+						// CPU quirk: shadowed local recompute, NOT normalized
+						CuVec3 localN2 = CuMat3MulVec(CuMat3Transpose(ident), cp.normalWorldOnB);
+						CuVec3 clampedLocalNormal;
+						bool isClamped = CuClampNormal(edge, tri_normal * swapFactor, localN2, info.edgeV2V0Angle, clampedLocalNormal);
+						if (isClamped) {
+							if (CuDot3(clampedLocalNormal, tri_normal * frontFacing) > 0) {
+								CuVec3 newNormal = CuMat3MulVec(ident, clampedLocalNormal);
+								cp.normalWorldOnB = newNormal;
+								cp.positionWorldOnB = cp.positionWorldOnA - cp.normalWorldOnB * cp.distance1;
+								cp.localPointB = CuInvXform(ident, { 0, 0, 0 }, cp.positionWorldOnB);
+							}
+						}
+					}
+				}
+			}
+	}
+
+	if (isNearEdge) {
+		if (numConcaveEdgeHits > 0) {
+			// flags=0: not concave-double-sided
+			CuVec3 newNormal = tri_normal * frontFacing;
+			float d = CuDot3(newNormal, localContactNormalOnB);
+			if (d < 0)
+				return;
+			cp.normalWorldOnB = CuMat3MulVec(ident, newNormal);
+			cp.positionWorldOnB = cp.positionWorldOnA - cp.normalWorldOnB * cp.distance1;
+			cp.localPointB = CuInvXform(ident, { 0, 0, 0 }, cp.positionWorldOnB);
+		}
+	}
+}
+
 } // namespace rscuda
 
 #endif // __CUDACC__
