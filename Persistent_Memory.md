@@ -647,12 +647,20 @@ verified in source 2026-06-10):**
      (m_linearVelocity + m_externalForceImpulse) / setAngularVelocity(+extTorque) ->
      setWorldTransform(solverBody.m_worldTransform) [split impulse: position correction!]
      -> companionId=-1. Pools resizeNoInitialize(0).
-   - REMAINING READS for the port: btSolverBody.h (SIMD internalApplyImpulse,
-     getVelocityInLocalPointNoDelta, writebackVelocityAndTransform trees),
-     addFrictionConstraint full body (rhs from desiredVelocity etc.),
-     gResolveSplitPenetrationImpulse_sse2 exact body, rb->getVelocityInLocalPoint
-     tree (lin + ang x rel), where solverInfo.m_timeStep is assigned per tick,
-     btContactSolverInfo m_globalCfm default(0) confirm.
+   - solverInfo.m_timeStep = timeStep assigned in internalSingleStepSimulation
+     (btDiscreteDynamicsWorld.cpp:439) BEFORE solveConstraints each tick = 1/120
+     always during bullet step (the 1/60 default only matters for the car pre-tick
+     which reads it BEFORE the first bullet step - already handled/validated).
+   - btSolverBody::getVelocityInLocalPointNoDelta = (linVel + extForceImp) +
+     (angVel + extTorqueImp).cross(rel_pos) (zero for fixed body).
+     writebackVelocityAndTransform: linVel += deltaLin; angVel += deltaAng; if any
+     push/turn component != 0: integrateTransform(NoRot if m_noRot)(worldTransform,
+     pushVel, turnVel * 0.1, dt) -> m_worldTransform (POSITION CORRECTION).
+   - REMAINING READS for the port: btSolverBody.h USE_SIMD internalApplyImpulse
+     (SSE trees - it's used by warmstart-with-0 and split resolve),
+     addFrictionConstraint full body (rhs computation w/ desiredVelocity=0),
+     gResolveSplitPenetrationImpulse_sse2 exact body (lines ~315-348),
+     rb->getVelocityInLocalPoint tree (btRigidBody.h: linVel + angVel.cross(rel)).
    Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
    already bit-exact feeds the solver in the same kernel run; compare body snaps at
    AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
