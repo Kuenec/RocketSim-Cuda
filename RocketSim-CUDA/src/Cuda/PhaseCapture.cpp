@@ -2,6 +2,9 @@
 
 #include "../../libsrc/bullet3-3.24/BulletDynamics/Dynamics/btDiscreteDynamicsWorld.h"
 #include "../../libsrc/bullet3-3.24/BulletDynamics/Dynamics/btRigidBody.h"
+#include "../../libsrc/bullet3-3.24/BulletCollision/CollisionDispatch/btCollisionDispatcher.h"
+#include "../../libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
+#include "../../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btRSBroadphase.h"
 #include "../Sim/Car/Car.h"
 
 namespace rscap {
@@ -9,6 +12,8 @@ namespace rscap {
 bool enabled = false;
 std::vector<BodySnap> points[POINT_COUNT];
 std::vector<CarPreTickSnap> carSnaps;
+std::vector<ManifoldSnap> manifolds;
+std::vector<ProxySnap> proxies;
 
 const char* const POINT_NAMES[POINT_COUNT] = {
 	"pre_bullet", "after_predict", "after_collision", "after_islands",
@@ -41,6 +46,51 @@ void Capture(Point p, btDiscreteDynamicsWorld* world) {
 		CopyMat(s.invInertiaWorld, rb->getInvInertiaTensorWorld());
 		s.activationState = rb->getActivationState();
 		s.deactivationTime = rb->getDeactivationTime();
+	}
+
+	if (p == AFTER_COLLISION) {
+		auto* disp = world->getDispatcher();
+		manifolds.clear();
+		int n = disp->getNumManifolds();
+		manifolds.resize(n);
+		for (int i = 0; i < n; i++) {
+			const btPersistentManifold* m = disp->getManifoldByIndexInternal(i);
+			ManifoldSnap& ms = manifolds[i];
+			ms.body0 = m->getBody0();
+			ms.body1 = m->getBody1();
+			ms.numContacts = m->getNumContacts();
+			for (int c = 0; c < m->getNumContacts() && c < 4; c++) {
+				const btManifoldPoint& cp = m->getContactPoint(c);
+				ContactSnap& cs = ms.pts[c];
+				CopyVec(cs.localPointA, cp.m_localPointA);
+				CopyVec(cs.localPointB, cp.m_localPointB);
+				CopyVec(cs.positionWorldOnA, cp.m_positionWorldOnA);
+				CopyVec(cs.positionWorldOnB, cp.m_positionWorldOnB);
+				CopyVec(cs.normalWorldOnB, cp.m_normalWorldOnB);
+				cs.distance = cp.m_distance1;
+				cs.combinedFriction = cp.m_combinedFriction;
+				cs.combinedRestitution = cp.m_combinedRestitution;
+				cs.partId0 = cp.m_partId0;
+				cs.partId1 = cp.m_partId1;
+				cs.index0 = cp.m_index0;
+				cs.index1 = cp.m_index1;
+				cs.isSpecial = cp.m_isSpecial;
+			}
+		}
+		proxies.clear();
+		proxies.resize(bodies.size());
+		for (int i = 0; i < bodies.size(); i++) {
+			btRigidBody* rb = bodies[i];
+			ProxySnap& ps = proxies[i];
+			ps.rb = rb;
+			auto* proxy = (btRSBroadphaseProxy*)rb->getBroadphaseProxy();
+			CopyVec(ps.aabbMin, proxy->m_aabbMin);
+			CopyVec(ps.aabbMax, proxy->m_aabbMax);
+			ps.cellIdx = proxy->cellIdx;
+			ps.iIdx = proxy->iIdx;
+			ps.jIdx = proxy->jIdx;
+			ps.kIdx = proxy->kIdx;
+		}
 	}
 }
 

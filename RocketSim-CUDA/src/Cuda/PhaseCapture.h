@@ -38,6 +38,31 @@ extern std::vector<BodySnap> points[POINT_COUNT]; // refreshed every captured ti
 
 void Capture(Point p, btDiscreteDynamicsWorld* world);
 
+// ---- collision-phase capture (at AFTER_COLLISION) ----
+// Dispatcher manifolds in creation order + broadphase proxy state of each nonstatic
+// body. This is the bit-exact validation target for the GPU collision orchestrator.
+
+struct ContactSnap {
+	float localPointA[3], localPointB[3];
+	float positionWorldOnA[3], positionWorldOnB[3];
+	float normalWorldOnB[3];
+	float distance, combinedFriction, combinedRestitution;
+	int partId0, index0, partId1, index1;
+	uint8_t isSpecial;
+};
+struct ManifoldSnap {
+	const void* body0, *body1;   // btCollisionObject* identity (may be a static)
+	int numContacts;
+	ContactSnap pts[4];
+};
+struct ProxySnap {
+	const void* rb;
+	float aabbMin[3], aabbMax[3];
+	int cellIdx, iIdx, jIdx, kIdx;
+};
+extern std::vector<ManifoldSnap> manifolds;  // refreshed at AFTER_COLLISION
+extern std::vector<ProxySnap> proxies;       // refreshed at AFTER_COLLISION
+
 // ---- per-car pre-tick capture (hooks in Car::_PreTickUpdate) ----
 // One entry per car per tick, in CPU execution order (unordered_set iteration), so the
 // GPU compare can replay each car's pre-tick from its exact input state - including

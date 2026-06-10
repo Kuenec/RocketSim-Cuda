@@ -95,6 +95,7 @@ struct Args {
 	bool gpuStep = false;           // GPU produces the simulation result (monolithic kernel)
 	int gpuCompare = 0;             // lockstep-validate ported GPU phases for N ticks
 	int rayFuzz = 0;                // validate device static raycast vs CPU for N rays
+	int manifoldDump = 0;           // diagnostic: print CPU collision manifolds for N ticks
 	std::string trigTable = "glibc_trig_fix.bin"; // libm correction table (see CudaMath.cuh)
 };
 
@@ -142,6 +143,9 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 		} else if (!strcmp(argv[i], "--ray-fuzz")) {
 			const char* v = need("--ray-fuzz"); if (!v) return false;
 			out.rayFuzz = atoi(v);
+		} else if (!strcmp(argv[i], "--manifold-dump")) {
+			const char* v = need("--manifold-dump"); if (!v) return false;
+			out.manifoldDump = atoi(v);
 		} else if (!strcmp(argv[i], "--trig-table")) {
 			const char* v = need("--trig-table"); if (!v) return false;
 			out.trigTable = v;
@@ -1276,6 +1280,57 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 	return combinedHash;
 }
 
+// Diagnostic: print the CPU dispatcher's manifolds (creation order) each tick, with
+// bodies mapped to names. Ground truth for the GPU collision orchestrator port.
+static int RunManifoldDump(const Args& args) {
+	std::vector<CarSlot> slots;
+	Arena* arena = SetupArena(args, 0, slots);
+
+	auto bodyName = [&](const void* obj) -> std::string {
+		if (obj == &arena->ball->_rigidBody) return "ball";
+		for (size_t c = 0; c < slots.size(); c++)
+			if (obj == &slots[c].car->_rigidBody) return "car" + std::to_string(c);
+		for (size_t w = 0; w < arena->_worldCollisionRBs.size(); w++)
+			if (obj == arena->_worldCollisionRBs[w])
+				return (arena->_worldCollisionRBs[w]->getCollisionShape()->getShapeType()
+					== TRIANGLE_MESH_SHAPE_PROXYTYPE ? "mesh" : "plane") + std::to_string(w);
+		return "?";
+	};
+
+	for (int tick = 0; tick < args.manifoldDump; tick++) {
+		for (CarSlot& slot : slots)
+			UpdateControls(slot);
+		rscap::carSnaps.clear();
+		rscap::enabled = true;
+		arena->Step(1);
+		rscap::enabled = false;
+
+		bool any = false;
+		for (const rscap::ManifoldSnap& m : rscap::manifolds)
+			if (m.numContacts) any = true;
+		if (!any)
+			continue;
+		printf("tick %d: %zu manifolds\n", tick, rscap::manifolds.size());
+		for (size_t i = 0; i < rscap::manifolds.size(); i++) {
+			const rscap::ManifoldSnap& m = rscap::manifolds[i];
+			printf("  [%zu] %s vs %s: %d pts\n", i,
+				bodyName(m.body0).c_str(), bodyName(m.body1).c_str(), m.numContacts);
+			for (int c = 0; c < m.numContacts; c++) {
+				const rscap::ContactSnap& p = m.pts[c];
+				printf("    pt%d d=%.9g n=(%.9g,%.9g,%.9g) wB=(%.9g,%.9g,%.9g) "
+					"fr=%.9g re=%.9g part(%d,%d) idx(%d,%d)%s\n",
+					c, p.distance, p.normalWorldOnB[0], p.normalWorldOnB[1], p.normalWorldOnB[2],
+					p.positionWorldOnB[0], p.positionWorldOnB[1], p.positionWorldOnB[2],
+					p.combinedFriction, p.combinedRestitution,
+					p.partId0, p.partId1, p.index0, p.index1,
+					p.isSpecial ? " SPECIAL" : "");
+			}
+		}
+	}
+	delete arena;
+	return 0;
+}
+
 #endif // RS_CUDA
 
 int main(int argc, char** argv) {
@@ -1304,6 +1359,14 @@ int main(int argc, char** argv) {
 		return RunRayFuzz(args, args.rayFuzz);
 #else
 		fprintf(stderr, "RAY_FUZZ: FAIL (built without CUDA toolkit)\n");
+		return 2;
+#endif
+	}
+	if (args.manifoldDump > 0) {
+#ifdef RS_CUDA
+		return RunManifoldDump(args);
+#else
+		fprintf(stderr, "MANIFOLD_DUMP: FAIL (built without CUDA toolkit)\n");
 		return 2;
 #endif
 	}
