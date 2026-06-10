@@ -447,12 +447,22 @@ domain |args|<=~1).
   car-world -> _BtCallback_OnCarWorldCollision (sets worldContact - read tail);
   ball-world -> ball->_OnWorldCollision + m_isSpecial=true (non-snowday).
   THEN btAdjustInternalEdgeContacts always (swap-aware args).
-  STILL TO READ: callback tails (bump impulses via BUMP_VEL curves, demo logic,
-  car-world worldContact set), Ball::_OnHit (extra impulse + BALL_CAR_EXTRA_IMPULSE
-  curve + tickCountWhenHit/ballHitInfo), Ball::_OnWorldCollision,
-  btAdjustInternalEdgeContacts (btInternalEdgeUtility.cpp), then GJK
-  (btGjkPairDetector), EPA (btGjkEpa2), btConvexConcave, btBoxBox, btCompound,
-  dispatcher needsCollision/order, solver handoff.
+- Bump/demo + car-world callback tails READ (Arena.cpp:360-415): demo decision by
+  demoMode (gates: DISABLED -> isDemo=false) + team check; bump: baseScale from
+  BUMP_VEL_AMOUNT_GROUND/AIR curve(speedTowardsOtherCar), hitUpDir = other isOnGround ?
+  car2 GetUpDir : (0,0,1); bumpImpulse = velDir*baseScale + hitUpDir*UPWARD_curve*
+  mutator.bumpForceScale (Vec trees); car2->_velocityImpulseCache += bumpImpulse*
+  UU_TO_BT; car1 carContact={car2 id, mutator.bumpCooldownTime}. Car-world:
+  worldContact={true, m_normalWorldOnB}; manifold friction=mutator.carWorldFriction,
+  restitution=mutator.carWorldRestitution (overrides AFTER combine).
+- Arena ctor: btRSBroadphase(minPos*UU_TO_BT, maxPos*UU_TO_BT, maxAABBLen*UU_TO_BT*
+  cellSizeMult(1 heavy), pairCache=btHashedOverlappingPairCache, maxObjects).
+  STILL TO READ: Ball::_OnHit (extra impulse + BALL_CAR_EXTRA_IMPULSE curve +
+  ballHitInfo writes), Ball::_OnWorldCollision, btAdjustInternalEdgeContacts
+  (btInternalEdgeUtility.cpp), GJK (btGjkPairDetector), EPA (btGjkEpa2),
+  btConvexConcave, btBoxBox, btCompound, dispatcher needsCollision/order,
+  refreshContactPoints tail, sortCachedPoints tail + gContactCalcArea3Points,
+  convex-plane CreateFunc perturbation defaults, solver handoff.
 
 ### Next Steps (in order)
 1. Read+port in slices with per-slice fuzz/compare: (a) AABB update + pair gen,
