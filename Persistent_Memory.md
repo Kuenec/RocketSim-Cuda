@@ -589,12 +589,38 @@ verified in source 2026-06-10):**
    escapeIndex. DEVICE NEEDS per mesh: quantized node array (btQuantizedBvhNode:
    ushort[3]x2 + int escapeOrTriIdx), subtree headers, m_bvhAabbMin/Max,
    m_bvhQuantization (extract host-side from mesh->getOptimizedBvh()).
-   REMAINING UNREAD for collision: walkStacklessQuantizedTreeCacheFriendly loop,
-   btInternalEdgeUtility (btAdjustInternalEdgeContacts + triangleInfoMap extraction),
-   compound algo file (small), TestTriangleAgainstAabb2/TestAabbAgainstAabb2 trees;
-   then: manifold-compare harness (capture at AFTER_COLLISION) + device collision-phase
-   orchestrator (AABB update -> pair gen -> dispatch loop in pair order -> per-pair
-   algo -> manifold + callbacks (release order!) -> refresh).
+   PORTED (2026-06-10 cont.): CuBvhQuantizeClamp/CuTestQuantAabb/CuBvhWalk (subtree
+   loop + linear walk, exact CPU triangle order), CuTestTriangleAabb (Z,X,Y),
+   CuConvexVsMesh (concave per-pair: AABB in tri space + mesh-margin expand, BVH walk,
+   per-tri early-out [support WITH margin via basis.INVERSE, both plane sides,
+   threshold = manifold breaking], dispatch sphere->CuSphereTriangleCollide (identity-
+   transform canon trees, swap=false) / box->CuGjkClosestPoints(maxDistSq=(margins+
+   breaking)^2), shared manifold accumulation with onContactAdded callback hook per
+   inserted point, CuManifoldRefresh at end). Builds clean. WORK COPY CHANGE:
+   btQuantizedBvh.h got public getBvhAabbMin/Max/getBvhQuantization accessors (gates
+   still to re-verify after; no behavior change). Host extraction still TODO: BVH
+   node/subtree arrays via getQuantizedNodeArray/getSubtreeInfoArray + the new
+   accessors; mesh margin per mesh (concaveShape->getMargin()).
+   btAdjustInternalEdgeContacts READ (struct): trimesh triangleInfoMap lookup by
+   btGetHash(partId,index) (READ btGetHash + btTriangleInfo layout: m_flags +
+   m_edgeV0V1Angle/V1V2/V2V0); flags arg = 0 (frontFacing=1, no double-sided);
+   localContactNormalOnB = basisT * normalWorld, normalize() [rsqrt]; bestedge by
+   min length to edges with |angle| < m_maxEdgeAngleThreshold (via
+   btNearestPointInLineSegment - READ); per-edge block (3x, verbatim quirks incl.
+   STALE `nearest` reuse in edge-0 block): len < m_edgeDistanceThreshold && bestedge
+   match -> angle==0 ? concaveHit++ : [swapFactor by TRI_INFO_*_CONVEX flag, nB =
+   swapFactor*quatRotate(btQuaternion(edge, angle), triNormal) (*-1 if SWAP_NORMALB),
+   backFacing if NdotA<convexEps && NdotB<convexEps -> concave++ else convex++ +
+   btClampNormal(edge, swapFactor*triNormal, localN, angle, clamped) (READ) ->
+   if clamped.dot(triNormal) > 0: cp.m_normalWorldOnB = basis*clamped,
+   positionWorldOnB REPROJECTED = posA - normal*distance1, localPointB = invXform].
+   V1V2 block declares LOCAL localContactNormalOnB shadowing (recomputed, NOT
+   normalized!) - verbatim quirk. STILL TO READ: function tail after 3 edge blocks
+   (isNearEdge/numConcaveEdgeHits final handling), btNearestPointInLineSegment,
+   btClampNormal, quatRotate tree, tri_shape->calcNormal, btGetHash,
+   btTriangleInfoMap defaults (m_maxEdgeAngleThreshold etc.), triangleInfoMap host
+   extraction (hash map -> flat per-tri array), compound algo file; then:
+   manifold-compare harness + device collision orchestrator.
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
        partId/index semantics);
    (g) manifold assembly: per-pair btPersistentManifold (4-pt cache, sortCachedPoints
