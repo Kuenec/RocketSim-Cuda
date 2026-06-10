@@ -744,16 +744,23 @@ verified in source 2026-06-10):**
       - Arena ctor HEATSEEKER: ball start pos/vel = Heatseeker::BALL_START_* with
         WALL-CLOCK-random y sign -> heatseeker gates must SetState the ball
         explicitly (seed-derived sign) in SetupArena.
-      - BLOCKER-LEVEL FINDING: GetForwardVec needs glibc sinf/cosf over FULL float
-        range; the existing correction table only covers +-[0,0.7854]. Plan: port
-        glibc 2.4x s_sinf.c/s_cosf.c VERBATIM to device (like atan2f/asinf; doubles
-        only -> bit-exact), exhaustively validate all 2^32 floats on GPU vs host,
-        then RETIRE the glibc_trig_fix.bin table entirely (integrate phase switches
-        to the same exact ports - re-run all gates + compares after).
-      TODO: read Angle::GetDeltaTo + BallState ctor hsInfo defaults; bench
-      --game-mode flag + deterministic HS ball init; CPU heatseeker gates;
-      device port (hsInfo fields into GpuBallGameState; HS branches in
-      CuContactAddedCallback + new CuBallPreTickHS in CudaGameTail.cuh).
+      - DONE (commit 42b4da2): glibc sinf/cosf ported to device FULL-RANGE
+        (CudaMath.cuh CuSinf/CuCosf rewritten: glibc s_sinf/cosf generic algorithm
+        + the FMA-build contraction the host IFUNC actually dispatches to
+        (__sinf_fma; proven by disassembly + an exhaustive HOST reference matching
+        all 8.56e9 evals): explicit fma() on every poly mul-add and reduce_fast's
+        x - n*hpi. GPU exhaustive: ALL 2^32 finite floats PASS for both. Gates
+        PASS. cuda_math_test gained --trig-exhaustive-full.
+        CLEANUP PENDING: the old TrigFix table machinery (g_trigFix/CuTrigLookup/
+        CuLoadTrigFix/--trig-table/RequireTrigTable/--emit-trig-table +
+        glibc_trig_fix.bin) is now UNUSED dead weight - remove it all, then re-run
+        gates + a 20k compare.
+      TODO next: read Angle::GetDeltaTo + BallState ctor hsInfo defaults; bench
+      --game-mode flag + deterministic HS ball init (explicit SetState - arena ctor
+      randomizes y-sign with wall-clock RNG); CPU heatseeker gates; device port
+      (hsInfo fields into GpuBallGameState; HS branches in CuContactAddedCallback
+      + new CuBallPreTickHS in CudaGameTail.cuh; CuAngleFromVec/CuRoundAngleUE3/
+      CuGetForwardVec/CuWrapNormalizeFloat [double fmod of floats = exact] ports).
    2. DEMOLITIONS (#14): deterministic-seed hook for Math::GetRandEngine in the
       WORK copy behind a flag (upstream demo respawn is wall-clock-seeded ->
       bit-exact validation only possible work-CPU vs work-GPU with the same seed;
