@@ -37,7 +37,8 @@ struct GpuRayFuzzResult {
 	GpuVec3 normal;
 };
 void RunRayFuzz(GpuBatch* batch, const GpuVec3* fromTo /*2 per ray*/, int numRays,
-	int cbGroup, int cbMask, GpuRayFuzzResult* results);
+	int cbGroup, int cbMask, const GpuDynBody* dynBodies, int numDyn, int ignoreIdx,
+	const GpuGridParams& grid, GpuRayFuzzResult* results);
 
 // Load the glibc trig correction table (see CudaMath.cuh). Must be called before any
 // stepping; returns false if the file is missing/corrupt.

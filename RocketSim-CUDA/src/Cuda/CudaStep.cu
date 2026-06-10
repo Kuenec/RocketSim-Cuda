@@ -137,29 +137,39 @@ void UploadWorldGeo(GpuBatch* b,
 	b->geo.meshTris = b->dTris;
 }
 
-__global__ void RayFuzzKernel(GpuWorldGeo geo, const GpuVec3* fromTo, int numRays,
-	int cbGroup, int cbMask, GpuRayFuzzResult* results) {
+__global__ void RayFuzzKernel(GpuWorldGeo geo, GpuGridParams grid, const GpuVec3* fromTo, int numRays,
+	int cbGroup, int cbMask, const GpuDynBody* dyn, int numDyn, int ignoreIdx,
+	GpuRayFuzzResult* results) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= numRays) return;
 	GpuRayHit hit;
-	CuRayTestStatic(geo, GV(fromTo[i * 2]), GV(fromTo[i * 2 + 1]), cbGroup, cbMask, hit);
+	CuRayTestWorld(geo, grid, dyn, numDyn, ignoreIdx, GV(fromTo[i * 2]), GV(fromTo[i * 2 + 1]),
+		cbGroup, cbMask, hit);
 	results[i].hitKind = hit.hitKind;
 	results[i].fraction = hit.fraction;
 	results[i].normal = { hit.normalWorld.x, hit.normalWorld.y, hit.normalWorld.z };
 }
 
 void RunRayFuzz(GpuBatch* b, const GpuVec3* fromTo, int numRays,
-	int cbGroup, int cbMask, GpuRayFuzzResult* results) {
+	int cbGroup, int cbMask, const GpuDynBody* dynBodies, int numDyn, int ignoreIdx,
+	const GpuGridParams& grid, GpuRayFuzzResult* results) {
 	GpuVec3* dRays;
 	GpuRayFuzzResult* dRes;
+	GpuDynBody* dDyn = nullptr;
 	CudaCheck(cudaMalloc(&dRays, sizeof(GpuVec3) * 2 * numRays), "alloc rays");
 	CudaCheck(cudaMalloc(&dRes, sizeof(GpuRayFuzzResult) * numRays), "alloc ray results");
 	CudaCheck(cudaMemcpy(dRays, fromTo, sizeof(GpuVec3) * 2 * numRays, cudaMemcpyHostToDevice), "upload rays");
-	RayFuzzKernel<<<(numRays + 127) / 128, 128>>>(b->geo, dRays, numRays, cbGroup, cbMask, dRes);
+	if (numDyn > 0) {
+		CudaCheck(cudaMalloc(&dDyn, sizeof(GpuDynBody) * numDyn), "alloc dyn");
+		CudaCheck(cudaMemcpy(dDyn, dynBodies, sizeof(GpuDynBody) * numDyn, cudaMemcpyHostToDevice), "upload dyn");
+	}
+	RayFuzzKernel<<<(numRays + 127) / 128, 128>>>(b->geo, grid, dRays, numRays, cbGroup, cbMask,
+		dDyn, numDyn, ignoreIdx, dRes);
 	CudaCheck(cudaGetLastError(), "rayfuzz launch");
 	CudaCheck(cudaMemcpy(results, dRes, sizeof(GpuRayFuzzResult) * numRays, cudaMemcpyDeviceToHost), "download ray results");
 	cudaFree(dRays);
 	cudaFree(dRes);
+	cudaFree(dDyn);
 }
 
 void UploadArenaState(GpuBatch* b, int arenaIdx,

@@ -24,6 +24,7 @@
 #include "DataStream/DataStreamOut.h"
 #include "Profiling.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btStridingMeshInterface.h"
+#include "../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btRSBroadphase.h"
 
 #ifdef RS_CUDA
 #include "Cuda/CudaStep.h"
@@ -544,13 +545,68 @@ static int RunRayFuzz(const Args& args, int numRays) {
 	rscuda::UploadWorldGeo(batch, planes.data(), (int)planes.size(),
 		meshes.data(), (int)meshes.size(), tris.data(), (int)(tris.size() / 3));
 
+	// Dynamic candidates: ball (sphere) + cars (compound box), with live transforms
+	// and proxy aabbMin (drives btRSBroadphase voxel cell membership)
+	std::vector<rscuda::GpuDynBody> dyn;
+	{
+		rscuda::GpuDynBody d = {};
+		btRigidBody& rb = arena->ball->_rigidBody;
+		d.kind = 1; // sphere
+		d.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		d.basis = ToGpuB(rb.getWorldTransform().getBasis());
+		d.origin = ToGpuB(rb.getWorldTransform().getOrigin());
+		d.aabbMin = ToGpuB(rb.getBroadphaseProxy()->m_aabbMin);
+		d.group = rb.getBroadphaseProxy()->m_collisionFilterGroup;
+		d.mask = rb.getBroadphaseProxy()->m_collisionFilterMask;
+		d.hasContactResponse = rb.hasContactResponse();
+		dyn.push_back(d);
+	}
+	for (CarSlot& slot : slots) {
+		rscuda::GpuDynBody d = {};
+		btRigidBody& rb = slot.car->_rigidBody;
+		d.kind = 2; // compound box
+		const btBoxShape& box = slot.car->_childHitboxShape;
+		btVector3 he = box.getHalfExtentsWithoutMargin();
+		float m = box.getMargin();
+		d.boxHalfExtWithMargin = { he.x() + m, he.y() + m, he.z() + m };
+		d.childOffset = ToGpuB(slot.car->_compoundShape.getChildTransform(0).getOrigin());
+		d.basis = ToGpuB(rb.getWorldTransform().getBasis());
+		d.origin = ToGpuB(rb.getWorldTransform().getOrigin());
+		d.aabbMin = ToGpuB(rb.getBroadphaseProxy()->m_aabbMin);
+		d.group = rb.getBroadphaseProxy()->m_collisionFilterGroup;
+		d.mask = rb.getBroadphaseProxy()->m_collisionFilterMask;
+		d.hasContactResponse = rb.hasContactResponse();
+		dyn.push_back(d);
+	}
+
+	rscuda::GpuGridParams grid = {};
+	{
+		auto* bp = (btRSBroadphase*)arena->_bulletWorldParams.broadphase;
+		grid.minPos = ToGpuB(bp->minPos);
+		grid.cellSize = bp->cellSize;
+		grid.cellSizeSq = bp->cellSizeSq;
+		grid.cellsX = bp->cellsX;
+		grid.cellsY = bp->cellsY;
+		grid.cellsZ = bp->cellsZ;
+	}
+
 	Rng rng(MixSeed(args.seed, 0x52A1ull));
 	std::vector<rscuda::GpuVec3> fromTo((size_t)numRays * 2);
 	for (int i = 0; i < numRays; i++) {
-		// positions across the arena volume (BT units; arena ~ +-82 x +-102 x 0..41)
-		float x = rng.NextSigned() * 90.0f;
-		float y = rng.NextSigned() * 110.0f;
-		float z = (rng.NextSigned() * 0.5f + 0.5f) * 45.0f;
+		// positions across the arena volume (BT units; arena ~ +-82 x +-102 x 0..41),
+		// every 4th ray aimed near the ball or a car so dynamic shapes get real coverage
+		float x, y, z;
+		uint64_t pick = rng.Next() % 4;
+		if (pick == 0) {
+			const rscuda::GpuDynBody& target = dyn[rng.Next() % dyn.size()];
+			x = target.origin.x + rng.NextSigned() * 4.0f;
+			y = target.origin.y + rng.NextSigned() * 4.0f;
+			z = target.origin.z + (rng.NextSigned() * 0.5f + 0.5f) * 4.0f;
+		} else {
+			x = rng.NextSigned() * 90.0f;
+			y = rng.NextSigned() * 110.0f;
+			z = (rng.NextSigned() * 0.5f + 0.5f) * 45.0f;
+		}
 		// direction: downward-biased (suspension-like) or fully random; varied length
 		float dx = rng.NextSigned(), dy = rng.NextSigned();
 		float dz = (rng.Next() % 4 == 0) ? rng.NextSigned() : -(float)(rng.Next() % 1025) / 1024.0f;
@@ -561,14 +617,13 @@ static int RunRayFuzz(const Args& args, int numRays) {
 
 	std::vector<rscuda::GpuRayFuzzResult> gpuRes(numRays);
 	rscuda::RunRayFuzz(batch, fromTo.data(), numRays, btBroadphaseProxy::DefaultFilter,
-		btBroadphaseProxy::StaticFilter, gpuRes.data());
+		btBroadphaseProxy::AllFilter, dyn.data(), (int)dyn.size(), -1, grid, gpuRes.data());
 
 	int bad = 0;
 	for (int i = 0; i < numRays; i++) {
 		btVector3 from(fromTo[i * 2].x, fromTo[i * 2].y, fromTo[i * 2].z);
 		btVector3 to(fromTo[i * 2 + 1].x, fromTo[i * 2 + 1].y, fromTo[i * 2 + 1].z);
 		btCollisionWorld::ClosestRayResultCallback cb(from, to, nullptr);
-		cb.m_collisionFilterMask = btBroadphaseProxy::StaticFilter; // statics only
 		arena->_bulletWorld.rayTest(from, to, cb);
 
 		bool cpuHit = cb.hasHit();

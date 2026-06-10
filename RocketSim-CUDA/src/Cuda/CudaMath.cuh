@@ -41,6 +41,29 @@ RSC_HD float CuDot3(CuVec3 a, CuVec3 b) {
 }
 RSC_HD float CuLength2(CuVec3 a) { return CuDot3(a, a); }
 
+// btMatrix3x3 * btVector3: row dots. NOT a bitwise no-op even for identity matrices -
+// the dot tree (1*x + 0*y) + 0*z canonicalizes -0 to +0 (0*negative = -0 etc.), and
+// the CPU applies it via colObjWorldTransform on ray endpoints / hit normals. Replicate.
+RSC_HD CuVec3 CuMat3MulVec(const CuMat3& m, CuVec3 v) {
+	return { CuDot3(m.r[0], v), CuDot3(m.r[1], v), CuDot3(m.r[2], v) };
+}
+
+RSC_HD CuMat3 CuIdentity3() {
+	return { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } } };
+}
+
+// btTransform::operator()(v) = basis rows dot v, plus origin
+RSC_HD CuVec3 CuTransformPoint(const CuMat3& basis, CuVec3 origin, CuVec3 v) {
+	CuVec3 r = CuMat3MulVec(basis, v);
+	return r + origin;
+}
+
+// btVector3::setInterpolate3 SSE tree: out = v0*(1-rt) + v1*rt per element
+RSC_HD CuVec3 CuInterpolate3(CuVec3 v0, CuVec3 v1, float rt) {
+	float s = 1.0f - rt;
+	return { v0.x * s + v1.x * rt, v0.y * s + v1.y * rt, v0.z * s + v1.z * rt };
+}
+
 // btVector3::safeNormalize (btVector3.h:287): plain sqrt + operator/= which is
 // "*this *= 1.0/s" (reciprocal then element multiply) - NO rsqrt estimate here
 RSC_HD CuVec3 CuSafeNormalize3(CuVec3 v) {

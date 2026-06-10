@@ -12,6 +12,7 @@
 // caught by compare harnesses if ever hit).
 
 #include "CudaMath.cuh"
+#include "CudaConvexCast.cuh"
 #include "GpuTypes.h"
 
 namespace rscuda {
@@ -37,29 +38,6 @@ struct GpuRayHit {
 };
 
 __device__ __forceinline__ CuVec3 GV(const GpuVec3& v) { return { v.x, v.y, v.z }; }
-
-// btMatrix3x3 * btVector3: row dots. NOT a bitwise no-op even for identity matrices -
-// the dot tree (1*x + 0*y) + 0*z canonicalizes -0 to +0 (0*negative = -0 etc.), and
-// the CPU applies it to hit normals/ray endpoints via colObjWorldTransform. Replicate.
-__device__ __forceinline__ CuVec3 CuMat3MulVec(const CuMat3& m, CuVec3 v) {
-	return { CuDot3(m.r[0], v), CuDot3(m.r[1], v), CuDot3(m.r[2], v) };
-}
-
-__device__ __forceinline__ CuMat3 CuIdentity3() {
-	return { { { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 } } };
-}
-
-// btTransform::operator()(v) = basis rows dot v, plus origin
-__device__ __forceinline__ CuVec3 CuTransformPoint(const CuMat3& basis, CuVec3 origin, CuVec3 v) {
-	CuVec3 r = CuMat3MulVec(basis, v);
-	return r + origin;
-}
-
-// btVector3::setInterpolate3 SSE tree: out = v0*(1-rt) + v1*rt per element
-__device__ __forceinline__ CuVec3 CuInterpolate3(CuVec3 v0, CuVec3 v1, float rt) {
-	float s = 1.0f - rt;
-	return { v0.x * s + v1.x * rt, v0.y * s + v1.y * rt, v0.z * s + v1.z * rt };
-}
 
 // btTriangleRaycastCallback::processTriangle, flags=0 (no backface filter, flip normal
 // on backface hits). Updates hit fraction/normal (normal in object-local space ==
@@ -214,6 +192,100 @@ __device__ __forceinline__ void CuRayTestStatic(
 		if (CuRayPlane(fromL, toL, GV(pl.normal), pl.planeConst, out.fraction, localNormal)) {
 			out.normalWorld = CuMat3MulVec(ident, localNormal);
 			out.hitKind = 0;
+		}
+	}
+}
+
+__device__ __forceinline__ CuMat3 GM(const GpuMat3& m) {
+	return { { GV(m.row[0]), GV(m.row[1]), GV(m.row[2]) } };
+}
+
+// btTransform compose: basis = bA*bB (mat-mul tree), origin = (A)(oB)
+__device__ __forceinline__ void CuTransformCompose(
+	const CuMat3& bA, CuVec3 oA, const CuMat3& bB, CuVec3 oB,
+	CuMat3& bOut, CuVec3& oOut) {
+	bOut = CuMat3Mul(bA, bB);
+	oOut = CuTransformPoint(bA, oA, oB);
+}
+
+// btRSBroadphase::GetCellIndices (btRSBroadphase.h:90): (pos-min)/cellSize via
+// reciprocal multiply (btVector3 operator/), int truncation, clamp
+__device__ __forceinline__ void CuGetCellIndices(const GpuGridParams& g, CuVec3 pos,
+	int& i, int& j, int& k) {
+	CuVec3 rel = pos - GV(g.minPos);
+	float inv = 1.0f / g.cellSize;
+	CuVec3 f = rel * inv;
+	i = (int)f.x;
+	j = (int)f.y;
+	k = (int)f.z;
+	i = i < 0 ? 0 : (i > g.cellsX - 1 ? g.cellsX - 1 : i);
+	j = j < 0 ? 0 : (j > g.cellsY - 1 ? g.cellsY - 1 : j);
+	k = k < 0 ? 0 : (k > g.cellsZ - 1 ? g.cellsZ - 1 : k);
+}
+
+// Full closest-hit ray test replicating btRSBroadphase::rayTest candidate semantics:
+// statics brute force (provably reference-equal: +-1-cell smear >= max short-ray
+// length), dynamics gated by the voxel cell rule for short rays. ignoreIdx excludes
+// a dynamic body (the vehicle's own chassis).
+__device__ __forceinline__ void CuRayTestWorld(
+	const GpuWorldGeo& geo, const GpuGridParams& grid,
+	const GpuDynBody* dyn, int numDyn, int ignoreIdx,
+	CuVec3 from, CuVec3 to, int cbGroup, int cbMask, GpuRayHit& out) {
+
+	CuRayTestStatic(geo, from, to, cbGroup, cbMask, out);
+
+	// btVector3::distance2(rayTo): (rayTo - rayFrom).length2()
+	CuVec3 rayD = to - from;
+	float rayLenSq = CuLength2(rayD);
+	bool shortRay = rayLenSq < grid.cellSizeSq;
+	int ri = 0, rj = 0, rk = 0;
+	if (shortRay)
+		CuGetCellIndices(grid, from, ri, rj, rk);
+
+	const CuMat3 ident = CuIdentity3();
+	for (int i = 0; i < numDyn; i++) {
+		if (i == ignoreIdx)
+			continue;
+		const GpuDynBody& d = dyn[i];
+		if (!((d.group & cbMask) && (cbGroup & d.mask)))
+			continue;
+		if (shortRay) {
+			// dyn proxy is registered in the 3x3x3 cells around its aabbMin's cell;
+			// the ray only tests rayFrom's cell
+			int di, dj, dk;
+			CuGetCellIndices(grid, GV(d.aabbMin), di, dj, dk);
+			int ddi = ri - di, ddj = rj - dj, ddk = rk - dk;
+			if (ddi < -1 || ddi > 1 || ddj < -1 || ddj > 1 || ddk < -1 || ddk > 1)
+				continue;
+		}
+
+		CuConvexShape shape;
+		CuMat3 shapeBasis;
+		CuVec3 shapeOrigin;
+		if (d.kind == CU_SHAPE_BOX) {
+			// compound branch: child world transform = bodyTrans * childTrans
+			// (child basis identity, origin childOffset) - compose trees matter
+			shape = { CU_SHAPE_BOX, 0.0f, GV(d.boxHalfExtWithMargin) };
+			CuMat3 childBasis = CuIdentity3();
+			CuTransformCompose(GM(d.basis), GV(d.origin), childBasis, GV(d.childOffset),
+				shapeBasis, shapeOrigin);
+		} else {
+			shape = { CU_SHAPE_SPHERE, d.sphereRadius, { 0, 0, 0 } };
+			shapeBasis = GM(d.basis);
+			shapeOrigin = GV(d.origin);
+		}
+
+		CuCastResult castResult;
+		castResult.fraction = out.fraction;
+		if (CuSubsimplexCastRay(from, to, shape, shapeBasis, shapeOrigin, castResult)) {
+			if (CuLength2(castResult.normal) > 0.0001f) {
+				if (castResult.fraction < out.fraction) {
+					// rayTestSingleInternal: normal.normalize() (second normalize)
+					out.normalWorld = CuNormalize3(castResult.normal);
+					out.fraction = castResult.fraction;
+					out.hitKind = 1 + i;
+				}
+			}
 		}
 	}
 }

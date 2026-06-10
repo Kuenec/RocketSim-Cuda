@@ -119,6 +119,32 @@ struct GpuPadState {
 	int32_t lockedCarIdx;           // -1 = none (mirrors BoostPadState::curLockedCar)
 };
 
+// Dynamic ray-candidate body (ball sphere / car compound box) - shape descriptor plus
+// its current world transform and filters; production kernels build these from
+// GpuBodyState + shape consts, the ray-fuzz tool fills them host-side.
+struct GpuDynBody {
+	int kind;                 // 1 = sphere, 2 = box-compound (CU_SHAPE_* values)
+	float sphereRadius;
+	GpuVec3 boxHalfExtWithMargin;
+	GpuVec3 childOffset;      // compound child transform origin (identity rotation)
+	GpuMat3 basis;
+	GpuVec3 origin;
+	GpuVec3 aabbMin;          // broadphase proxy AABB min (drives voxel cell membership)
+	int group, mask;
+	int hasContactResponse;
+};
+
+// btRSBroadphase voxel grid parameters. Dynamic proxies register in the 3x3x3 cells
+// around their aabbMin's cell; short rays (len^2 < cellSizeSq) only test proxies in
+// rayFrom's cell. Statics are smeared +-1 cell, so for them brute force == reference
+// for any ray length; only dynamics need the cell gate.
+struct GpuGridParams {
+	GpuVec3 minPos;
+	float cellSize;
+	float cellSizeSq;
+	int cellsX, cellsY, cellsZ;
+};
+
 // ---- Static world geometry (host-extracted from the arena's bullet world) ----
 
 struct GpuPlane {
