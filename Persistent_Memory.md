@@ -414,12 +414,26 @@ domain |args|<=~1).
   (ball hit info, bumps, worldContact.hasContact). Manifold mechanics per tick:
   btPersistentManifold add/refresh/4-point reduction.
 
+- btConvexPlaneCollisionAlgorithm::processCollision READ: support pt vs plane in local
+  spaces (transform inverse/compose trees), distance vs breaking threshold (+closestPoint
+  threshold 0), addContactPoint(planeWorldNormal, projected pt, dist); polyhedral
+  (box) perturbation loop when numContacts < m_minimumPointsPerturbationThreshold:
+  perturbeRot quats around plane-space tangents, angle = gContactBreakingThreshold /
+  getAngularMotionDisc clamped pi/8 (check CreateFunc defaults for iters/threshold).
+- btManifoldResult::addContactPoint READ: depth>breakingThreshold reject; pointA =
+  pointInWorld + normal*depth; localA/B via invXform; getCacheEntry -> replace or add;
+  combined friction/restitution (RS-MODIFIED: static pair -> min(friction)/
+  max(restitution), dynamic pair -> a*b); btPlaneSpace1 for lateral friction dirs;
+  partId/index stored (swap-aware); gContactAddedCallback when CF_CUSTOM_MATERIAL
+  (always: ball+cars have it) AFTER insert, with obj0/obj1 swap-normalized.
+
 ### Next Steps (in order)
 1. Read+port in slices with per-slice fuzz/compare: (a) AABB update + pair gen,
-   (b) convex-plane + manifold mechanics + contact callback, (c) convex-concave mesh
-   (GJK pair detector + EPA + internal edge), (d) box-box SAT, (e) compound plumbing,
-   (f) dispatch order + solver handoff. Then solver+islands, ball/pads/tail, assemble
-   monolithic kernel, flip --gpu-step.
+   (b) convex-plane + manifold mechanics (btPersistentManifold getCacheEntry/
+   sortCachedPoints/refreshContactPoints NEXT READ) + Arena contact callback,
+   (c) convex-concave mesh (GJK pair detector + EPA + internal edge), (d) box-box SAT,
+   (e) compound plumbing, (f) dispatch order + solver handoff. Then solver+islands,
+   ball/pads/tail, assemble monolithic kernel, flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
