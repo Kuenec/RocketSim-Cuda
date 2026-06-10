@@ -561,28 +561,102 @@ verified in source 2026-06-10):**
      ACCUMULATE (bodies/manifolds appended) and solve in ONE solveGroup at final
      processConstraints() (our scale never exceeds 128) -> single batched
      solveGroup(all active islands' bodies, all their manifolds in sorted order).
-   - solveGroup = solveGroupCacheFriendlySetup + Iterations + Finish.
-     Setup: convertBodies (getOrInitSolverBody per body: solver body pool in
-     first-seen order; initSolverBody: m_externalForceImpulse = totalForce*invMass*dt
-     [THE force->velocity integration!], externalTorqueImpulse = totalTorque*
-     invInertiaWorld*dt) -> convertContacts (per manifold: per contact with
-     dist <= processingThreshold(LARGE): solver constraint + RS m_isSpecial
-     ACCUMULATION into body m_specialResolveInfo {num++, friction=cp (last), rest=cp,
-     totalNormal+=, totalDist+=rel_pos.length()} (SKIPS static bodies) +
-     convertContactInner: friction dirs from relative velocity (vel-dependent:
-     lateralDir1 = vel - n*rel_vel, normalized if lat_rel_vel>eps else planeSpace1;
-     SOLVER_USE_2_FRICTION_DIRECTIONS off by default -> 1 friction row/contact) ->
-     then per body with m_specialResolveInfo.num>0: convertContactSpecial (synthetic
-     averaged contact vs the FIXED solver body: distance=avg, normal=avg(non-
-     normalized!), friction/rest from last special cp, rel_pos1 = normal*-distance,
-     rel_pos2 = 0) + CLEAR the info. Read setupContactConstraint/addFrictionConstraint/
-     setFrictionConstraintImpulse + Iterations (solveSingleIteration: SIMD resolve
-     fn variants - solverMode default has SOLVER_SIMD: must decode the SSE resolve
-     trees exactly!) + Finish (writeback) NEXT.
-   - solverInfo defaults to confirm: m_numIterations (10), m_erp2, m_restitutionVelocityThreshold, splitImpulse etc. (btContactSolverInfo ctor + any RS edits).
-   Validation: rscap AFTER_SOLVE body snaps exist; compare segment AFTER_COLLISION ->
-   AFTER_SOLVE (needs manifolds+game-callback side effects upload or run collide+solve
-   chained from AFTER_PREDICT in one segment - chained is simpler and already exact).
+   - solverInfo: defaults numIterations=10, sor=1, erp=0.2, globalCfm=0, linearSlop=0,
+     warmstartingFactor=0.85, restitutionVelocityThreshold=0.2, splitImpulse=true,
+     splitImpulseTurnErp=0.1, minimumSolverBatchSize=128, leastSquaresResidualThreshold=0,
+     solverMode = SOLVER_USE_WARMSTARTING | SOLVER_SIMD. ARENA OVERRIDES:
+     m_splitImpulsePenetrationThreshold = 1.0e30f (=> rhs/rhsPenetration SPLIT path for
+     ALL contacts: rhs = velocityImpulse only, rhsPenetration = penetrationImpulse),
+     m_erp2 = 0.8. m_timeStep set by stepSimulation flow (1/60 DEFAULT on tick 0
+     until set - the car pre-tick capture showed solverTimeStep semantics; VERIFY
+     where it's assigned when wiring).
+   - RESOLVE FUNCTIONS: BT_ALLOW_SSE4 is MSVC-only -> Linux GCC uses the _sse2
+     variants (USE_SIMD=1 via btSolverBody.h). Trees to replicate:
+     btSimdDot3(a,b) = m0 + (m1 + m2) [x + (y + z) ORDER, unlike (x+y)+z elsewhere!].
+     RowGeneric_sse2: deltaImpulse = rhs - applied*cfm; deltaVel1Dotn = dot3(n1,
+     dLinA) + dot3(rp1xn, dAngA); same B; deltaImpulse -= dv1*jacInv; -= dv2*jacInv;
+     sum = applied + deltaImpulse; if sum < lower: deltaImpulse = lower-applied,
+     applied = lower; (elif) sum < upper? keep : deltaImpulse = upper-applied,
+     applied = upper [mask logic = exactly two nested selects]; then dLin += (n *
+     invMass) * deltaImpulse, dAng += angComp * deltaImpulse for A and B.
+     RowLowerLimit_sse2: same minus the upper clamp. SplitPenetrationImpulse_sse2:
+     same shape on push/turn velocities with rhsPenetration (read its exact body +
+     btSolverBody.h SIMD internalApplyImpulse/getVelocityInLocalPointNoDelta/
+     writebackVelocityAndTransform trees when porting - USE_SIMD structs use SSE!).
+   - solveGroup = Setup + Iterations + Finish:
+     SETUP: convertBodies (companionId=-1 for all; pool reserve(n+1) resize(0); per
+     body getOrInitSolverBody [pool in bodies[] order; statics->fixed body shared];
+     initSolverBody: m_externalForceImpulse = totalForce*invMass*dt [THE force->vel
+     integration], m_externalTorqueImpulse = totalTorque*invInertiaWorld*dt; no gyro
+     flags in RS) -> convertContacts in manifold order (per contact dist <=
+     processingThreshold(LARGE): expand contact constraint; m_frictionIndex =
+     frictionPool.size(); setupContactConstraint:
+       relaxation=sor=1; invTimeStep; cfm=0*invTimeStep; erp=0.8;
+       torqueAxis0 = rel_pos1 x n; angCompA = invInertiaWorld*axis*angFactor(1);
+       torqueAxis1 = rel_pos2 x n; angCompB = invInertiaWorld*(-axis)*angFactor;
+       denom0/1 = invMass + n.dot(angComp x rel_pos) [B: (-angCompB) x rel_pos2];
+       jacDiagABInv = relaxation/(denom0+denom1+cfm);
+       contactNormal1 = n, relpos1CrossNormal = torqueAxis0; normal2 = -n,
+       relpos2CrossNormal = -torqueAxis1 (fixed body: zeros);
+       penetration = dist + linearSlop(0); rel_vel via rb->getVelocityInLocalPoint
+       (REAL body vels, not solver); restitution = restitutionCurve(rel_vel,
+       combinedRestitution, 0.2): |rel_vel| < thresh -> 0 else rest*-rel_vel; clamp<=0->0;
+       WARMSTARTING ON: appliedImpulse = cp.m_appliedImpulse(0 fresh)*0.85 ->
+       internalApplyImpulse with 0 (replicate arithmetic anyway); appliedPush=0;
+       vel1Dotn = n1.dot(linVel+extForceImp) + rp1xn.dot(angVel+extTorqueImp) [SOLVER
+       body vels]; rel_vel = vel1Dotn+vel2Dotn; velocityError = restitution - rel_vel;
+       positionalError = penetration>0 ? 0 : -penetration*erp*invTimeStep;
+       Arena threshold 1e30 => rhs = velocityImpulse = velErr*jacInv, rhsPenetration =
+       posErr*jacInv; m_cfm = cfm*jacInv (0); lower=0, upper=1e10;
+       RS: solverConstraint.m_isSpecial = cp.m_isSpecial)
+     + RS isSpecial accumulation into NON-STATIC bodies' m_specialResolveInfo
+       {num++, friction=cp.combined (LAST wins), restitution=cp, totalNormal +=
+       n, totalDist += rel_pos(of that body).length()}
+     + convertContactInner: no rolling friction (combined=0); friction dir:
+       vel = solverA.getVelocityInLocalPointNoDelta(rel_pos1) - B(...) [uses
+       linVel+extForce? READ btSolverBody fn]; lateralDir1 = vel - n*rel_vel;
+       lat_rel_vel = len2; if > SIMD_EPSILON: dir1 *= 1/sqrt (btSqrt!) ->
+       addFrictionConstraint(dir1, desiredVel=0, cfmSlip=0) else planeSpace1(n) ->
+       addFrictionConstraint(dir1); ONE friction row (no 2-dir flag);
+       setFrictionConstraintImpulse: frictionPool[m_frictionIndex].appliedImpulse=0.
+       (READ addFrictionConstraint tail: rhs computation w/ desiredVelocity.)
+     + per body in bodies[] order with specialResolveInfo.num>0: convertContactSpecial:
+       distance = totalDist/num; normal = totalNormal/num (UNNORMALIZED avg);
+       synthetic btManifoldPoint {dist, normal, lastFriction, lastRestitution,
+       isSpecial=false}; frictionIndex = contactPool.size() BEFORE expand; bodyA =
+       the body, bodyB = FIXED body (created on demand); rel_pos1 = normal*-distance,
+       rel_pos2 = 0; setupContactConstraint + convertContactInner (collObj1=NULL).
+       QUIRK: the synthetic constraint's m_frictionIndex is STALE GARBAGE from the
+       pool slot (never assigned) -> setFrictionConstraintImpulse writes 0 to a stale
+       friction index - VALUE-BENIGN (all appliedImpulses already 0 fresh); skip on
+       device but remember. THEN body->m_specialResolveInfo = {} (cleared).
+     ITERATIONS: solveGroupCacheFriendlySplitImpulseIterations FIRST (splitImpulse
+     on): numIterations loop over ALL contact rows IN ORDER (orderTmpConstraintPool =
+     identity; NO isSpecial skip here!) resolveSplitPenetrationImpulse; early-break
+     when residual^2max <= 0 (threshold) - exact FP compare; then main loop
+     iteration 0..9 (NO early exit): solveSingleIteration: (no joints) NON-interleave
+     path: contact rows in order SKIPPING m_isSpecial; then friction rows in order:
+     totalImpulse = contactPool[m_frictionIndex].appliedImpulse; if > 0: lower=-fric*
+     total, upper=+fric*total, resolveRowGeneric. (Special contacts' friction rows
+     skip via totalImpulse==0.)
+     FINISH: writeBackContacts (warmstarting on): pt->m_appliedImpulse etc. (manifold
+     pts - released next tick, no sim effect; RS skips null pts) -> writeBackBodies:
+     writebackVelocityAndTransform(dt, splitImpulseTurnErp=0.1) [READ btSolverBody.h:
+     linVel += deltaLin, angVel += deltaAng; transform from push/turn velocities via
+     btTransformUtil::integrateTransform if push/turn nonzero] -> body setLinearVelocity
+     (m_linearVelocity + m_externalForceImpulse) / setAngularVelocity(+extTorque) ->
+     setWorldTransform(solverBody.m_worldTransform) [split impulse: position correction!]
+     -> companionId=-1. Pools resizeNoInitialize(0).
+   - REMAINING READS for the port: btSolverBody.h (SIMD internalApplyImpulse,
+     getVelocityInLocalPointNoDelta, writebackVelocityAndTransform trees),
+     addFrictionConstraint full body (rhs from desiredVelocity etc.),
+     gResolveSplitPenetrationImpulse_sse2 exact body, rb->getVelocityInLocalPoint
+     tree (lin + ang x rel), where solverInfo.m_timeStep is assigned per tick,
+     btContactSolverInfo m_globalCfm default(0) confirm.
+   Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
+   already bit-exact feeds the solver in the same kernel run; compare body snaps at
+   AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
+   manifold appliedImpulses optional). rscap AFTER_SOLVE body snaps already exist.
 2. (DONE - collision phase; narrowphase notes kept below for reference)
    PORTED + VALIDATED (CudaCollision.cuh): manifold mechanics (add/sort4/remove/
    refresh, RS no-replacement), CuAddContactPoint (combine rules, plane-space friction
