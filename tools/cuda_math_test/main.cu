@@ -8,6 +8,7 @@
 // Exit 0 = all ops bit-exact. Exit 1 = mismatch (details printed).
 
 #include "Cuda/CudaMath.cuh"
+#include "Cuda/RsqrtHost.h"
 #include "../../tools/cuda_math_test/test_data.h"
 
 #include <cuda_runtime.h>
@@ -59,6 +60,13 @@ __global__ void ComputeKernel(const Input* inputs, Output* outputs, size_t n) {
 	o.integBasis = MD(ib);
 	o.integPos = VD(ip);
 
+	float d = CuDot3(DV(in.a), DV(in.a));
+	o.rsqrt = (d > CU_SIMD_EPSILON) ? CuRsqrtSS(d) : 0.0f;
+	o.norm3 = (CuLength2(DV(in.a)) > CU_SIMD_EPSILON) ? VD(CuNormalize3(DV(in.a))) : V3{ 0, 0, 0 };
+	o.safeNorm3 = VD(CuSafeNormalize3(DV(in.a)));
+	o.axisAngle = (CuLength2(DV(in.a)) > CU_SIMD_EPSILON)
+		? QD(CuQuatAxisAngle(DV(in.a), in.ang)) : Q4{ 0, 0, 0, 0 };
+
 	outputs[i] = o;
 }
 
@@ -102,24 +110,33 @@ static const FieldDef FIELDS[] = {
 	{ "inertia", offsetof(Output, inertia), 9 },
 	{ "integBasis", offsetof(Output, integBasis), 9 },
 	{ "integPos", offsetof(Output, integPos), 3 },
+	{ "rsqrt", offsetof(Output, rsqrt), 1 },
+	{ "norm3", offsetof(Output, norm3), 3 },
+	{ "safeNorm3", offsetof(Output, safeNorm3), 3 },
+	{ "axisAngle", offsetof(Output, axisAngle), 4 },
 };
 
-// Exhaustively scan [0, domHi] comparing glibc sinf/cosf vs double-rounded sin/cos;
-// write all mismatches as (inputBits, glibcBits) pairs: header TFIX, sinN, cosN.
+// Exhaustively scan +/-[0, domHi] comparing glibc sinf/cosf vs double-rounded sin/cos;
+// write all mismatches as (inputBits, glibcBits) pairs sorted by input bits:
+// header TFIX, sinN, cosN. Negative domain needed: steering quats use signed angles.
 static void EmitTrigTable(const char* path, uint32_t domHi) {
 	std::vector<TrigFixEntry> sinFix, cosFix;
-	for (uint64_t u = 0; u <= domHi; u++) {
-		float x;
-		uint32_t ub = (uint32_t)u;
-		memcpy(&x, &ub, 4);
-		float hs = sinf(x), hc = cosf(x);
-		float ds = (float)sin((double)x), dc = (float)cos((double)x);
-		uint32_t hsb, hcb, dsb, dcb;
-		memcpy(&hsb, &hs, 4); memcpy(&hcb, &hc, 4);
-		memcpy(&dsb, &ds, 4); memcpy(&dcb, &dc, 4);
-		if (hsb != dsb) sinFix.push_back({ ub, hsb });
-		if (hcb != dcb) cosFix.push_back({ ub, hcb });
-	}
+	auto scan = [&](uint32_t signBit) {
+		for (uint64_t u = 0; u <= domHi; u++) {
+			uint32_t ub = signBit | (uint32_t)u;
+			float x;
+			memcpy(&x, &ub, 4);
+			float hs = sinf(x), hc = cosf(x);
+			float ds = (float)sin((double)x), dc = (float)cos((double)x);
+			uint32_t hsb, hcb, dsb, dcb;
+			memcpy(&hsb, &hs, 4); memcpy(&hcb, &hc, 4);
+			memcpy(&dsb, &ds, 4); memcpy(&dcb, &dc, 4);
+			if (hsb != dsb) sinFix.push_back({ ub, hsb });
+			if (hcb != dcb) cosFix.push_back({ ub, hcb });
+		}
+	};
+	scan(0);          // positive domain (already sorted ascending)
+	scan(0x80000000u); // negative domain (bits sort above positives, stays sorted)
 	FILE* f = fopen(path, "wb");
 	if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
 	uint32_t magic = 0x54464958u, sn = (uint32_t)sinFix.size(), cn = (uint32_t)cosFix.size();
@@ -155,6 +172,22 @@ int main(int argc, char** argv) {
 			return 2;
 		}
 		printf("TRIG TABLE: loaded %s\n", tablePath);
+	}
+
+	{ // RSQRTSS capture + emulation hypothesis check + upload
+		static uint32_t rsqrtTab[2][4096];
+		RsBuildRsqrtTable(rsqrtTab);
+		uint64_t bad = RsVerifyRsqrtEmulation(rsqrtTab, 4000000);
+		if (bad) {
+			printf("MATHTEST rsqrt-emulation hypothesis FAILED on this CPU (%llu/4000000 mismatches)\n",
+				(unsigned long long)bad);
+			return 1;
+		}
+		if (!CuUploadRsqrtTable(rsqrtTab)) {
+			fprintf(stderr, "rsqrt table upload failed\n");
+			return 2;
+		}
+		printf("RSQRT TABLE: captured, hypothesis verified (4M samples), uploaded\n");
 	}
 
 	// ---------- op fuzz ----------
@@ -219,7 +252,7 @@ int main(int argc, char** argv) {
 	const uint32_t domLo = 0;
 	const uint32_t domHi = domHiBits;
 
-	size_t trigN = trigExhaustive ? (size_t)(domHi - domLo + 1) : (size_t)16 * 1000 * 1000;
+	size_t trigN = trigExhaustive ? (size_t)(domHi - domLo + 1) * 2 : (size_t)16 * 1000 * 1000;
 	const size_t CHUNK = 16 * 1000 * 1000;
 	uint32_t* dBits; float *dSin, *dCos;
 	Check(cudaMalloc(&dBits, CHUNK * 4), "malloc bits");
@@ -233,9 +266,17 @@ int main(int argc, char** argv) {
 	Gen tg(0x7717ull);
 	for (size_t done = 0; done < trigN; done += CHUNK) {
 		size_t n = (trigN - done < CHUNK) ? (trigN - done) : CHUNK;
-		for (size_t i = 0; i < n; i++)
-			bits[i] = trigExhaustive ? (uint32_t)(domLo + done + i)
-			                         : (uint32_t)(domLo + tg.Next() % (uint64_t)(domHi - domLo + 1));
+		const uint64_t posCount = (uint64_t)(domHi - domLo + 1);
+		for (size_t i = 0; i < n; i++) {
+			if (trigExhaustive) {
+				uint64_t k = done + i; // first all positives, then negatives
+				bits[i] = (k < posCount) ? (uint32_t)(domLo + k)
+				                         : (0x80000000u | (uint32_t)(domLo + (k - posCount)));
+			} else {
+				uint64_t r = tg.Next();
+				bits[i] = ((r >> 60) & 1 ? 0x80000000u : 0) | (uint32_t)(domLo + r % posCount);
+			}
+		}
 		Check(cudaMemcpy(dBits, bits.data(), n * 4, cudaMemcpyHostToDevice), "upload bits");
 		TrigKernel<<<(unsigned)((n + 255) / 256), 256>>>(dBits, dSin, dCos, n);
 		Check(cudaGetLastError(), "trig launch");

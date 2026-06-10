@@ -41,6 +41,17 @@ RSC_HD float CuDot3(CuVec3 a, CuVec3 b) {
 }
 RSC_HD float CuLength2(CuVec3 a) { return CuDot3(a, a); }
 
+// btVector3::safeNormalize (btVector3.h:287): plain sqrt + operator/= which is
+// "*this *= 1.0/s" (reciprocal then element multiply) - NO rsqrt estimate here
+RSC_HD CuVec3 CuSafeNormalize3(CuVec3 v) {
+	float l2 = CuLength2(v);
+	if (l2 >= CU_SIMD_EPSILON * CU_SIMD_EPSILON) {
+		float inv = 1.0f / sqrtf(l2);
+		return v * inv;
+	}
+	return { 1, 0, 0 };
+}
+
 // btVector3::cross SSE tree (btVector3.h:384) reduces to the classic element formulas
 RSC_HD CuVec3 CuCross(CuVec3 a, CuVec3 b) {
 	return {
@@ -246,6 +257,55 @@ inline bool CuLoadTrigFix(const char* path) {
 #endif // __CUDACC__
 
 #ifdef __CUDACC__
+// ---- RSQRTSS emulation -----------------------------------------------------------
+// btVector3::normalize() (btVector3.h:304) uses _mm_rsqrt_ss + one Newton-Raphson
+// step. The estimate is CPU-vendor-specific, so the device emulates THIS CPU's
+// instruction via a host-captured table (RsqrtHost.cpp): result mantissa depends only
+// on (exponent parity, top 12 mantissa bits); exponent scales arithmetically.
+// Hypothesis verified at init by RsVerifyRsqrtEmulation and continuously by
+// cuda_math_test's rsqrt/normalize ops.
+static __device__ __constant__ uint32_t g_rsqrtTab[2][4096];
+
+__device__ __forceinline__ float CuRsqrtSS(float x) {
+	uint32_t u;
+	memcpy(&u, &x, 4);
+	uint32_t e = (u >> 23) & 0xFF;
+	uint32_t m = (u >> 11) & 0xFFF;
+	uint32_t p = (e & 1) ^ 1;
+	uint32_t refBits = g_rsqrtTab[p][m];
+	int k = ((int)e - (int)(127 + p)) / 2;
+	uint32_t refExp = (refBits >> 23) & 0xFF;
+	uint32_t out = (refBits & 0x807FFFFFu) | ((uint32_t)((int)refExp - k) << 23);
+	float r;
+	memcpy(&r, &out, 4);
+	return r;
+}
+
+// Host: upload the captured table into this TU's constant symbol
+inline bool CuUploadRsqrtTable(const uint32_t table[2][4096]) {
+	return cudaMemcpyToSymbol(g_rsqrtTab, table, sizeof(uint32_t) * 2 * 4096) == cudaSuccess;
+}
+
+// btVector3::normalize() SSE tree (btVector3.h:304): dot3, rsqrt estimate, one NR
+// step (y0*(1.5 - d*0.5*y0*y0)), then multiply all lanes
+__device__ __forceinline__ CuVec3 CuNormalize3(CuVec3 v) {
+	float d = CuLength2(v);
+	float y0 = CuRsqrtSS(d);
+	float t = d * 0.5f;
+	t = t * y0;
+	t = t * y0;
+	float z = 1.5f - t;
+	float y = y0 * z;
+	return v * y;
+}
+
+// btQuaternion::setRotation(axis, angle) (btQuaternion.h:108)
+__device__ __forceinline__ CuQuat CuQuatAxisAngle(CuVec3 axis, float angle) {
+	float d = sqrtf(CuLength2(axis)); // btVector3::length
+	float s = CuSinf(angle * 0.5f) / d;
+	return { axis.x * s, axis.y * s, axis.z * s, CuCosf(angle * 0.5f) };
+}
+
 // btTransformUtil::integrateTransform (btTransformUtil.h:37), exponential map branch.
 // Argument trees encoded literally: sin arg is (0.5*fAngle)*dt, cos arg is (fAngle*dt)*0.5.
 // Device-only: uses the trig fix table.

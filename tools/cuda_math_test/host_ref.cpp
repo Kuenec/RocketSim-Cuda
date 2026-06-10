@@ -11,6 +11,8 @@
 #include "../../RocketSim-CUDA/libsrc/bullet3-3.24/LinearMath/btTransformUtil.h"
 
 #include <cmath>
+#include <cstring>
+#include <xmmintrin.h>
 
 namespace mathtest {
 
@@ -82,6 +84,26 @@ void HostCompute(const Input* inputs, Output* outputs, size_t n) {
 		btTransformUtil::integrateTransform(cur, BV(in.b), BV(in.w), in.dt, pred);
 		o.integBasis = FM(pred.getBasis());
 		o.integPos = FV(pred.getOrigin());
+
+		// raw RSQRTSS of a guaranteed-positive normal value
+		float d = BV(in.a).dot(BV(in.a));
+		o.rsqrt = (d > SIMD_EPSILON) ? _mm_cvtss_f32(_mm_rsqrt_ss(_mm_set_ss(d))) : 0.0f;
+
+		if (BV(in.a).length2() > SIMD_EPSILON) {
+			btVector3 n = BV(in.a);
+			n.normalize();
+			o.norm3 = FV(n);
+		} else {
+			o.norm3 = { 0, 0, 0 };
+		}
+
+		o.safeNorm3 = FV(BV(in.a).safeNormalized());
+
+		if (BV(in.a).length2() > SIMD_EPSILON) {
+			o.axisAngle = FQ(btQuaternion(BV(in.a), in.ang));
+		} else {
+			o.axisAngle = { 0, 0, 0, 0 };
+		}
 	}
 }
 

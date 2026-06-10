@@ -24,6 +24,7 @@
 
 #include "CudaStep.h"
 #include "CudaMath.cuh"
+#include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -62,7 +63,29 @@ struct GpuBatch {
 	uint64_t tickCount;
 };
 
+// Capture this CPU's RSQRTSS into the device emulation table; verify the emulation
+// hypothesis on host first so a different CPU fails loudly, never silently.
+static void InitRsqrtEmulation() {
+	static bool done = false;
+	if (done) return;
+	static uint32_t tab[2][4096];
+	RsBuildRsqrtTable(tab);
+	uint64_t bad = RsVerifyRsqrtEmulation(tab, 4000000);
+	if (bad) {
+		fprintf(stderr, "FATAL: RSQRTSS emulation hypothesis fails on this CPU "
+			"(%llu/4000000 mismatches) - GPU exactness impossible without a new scheme\n",
+			(unsigned long long)bad);
+		exit(2);
+	}
+	if (!CuUploadRsqrtTable(tab)) {
+		fprintf(stderr, "FATAL: rsqrt table upload failed\n");
+		exit(2);
+	}
+	done = true;
+}
+
 GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
+	InitRsqrtEmulation();
 	GpuBatch* b = new GpuBatch{};
 	b->numArenas = numArenas;
 	b->numCars = numCarsPerArena;

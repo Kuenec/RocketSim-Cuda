@@ -19,6 +19,7 @@ struct Input {
 	Q4 qa, qb;
 	M3 ma, mb;
 	float dt;
+	float ang;   // steering-like angle within trig table domain
 };
 
 // One sample's outputs for every tested op
@@ -34,6 +35,10 @@ struct Output {
 	M3 inertia;     // updateInertiaTensor(basis(qa), a)
 	M3 integBasis;  // integrateTransform basis out
 	V3 integPos;    // integrateTransform pos out
+	float rsqrt;    // raw RSQRTSS estimate of |dot3(a,a)|
+	V3 norm3;       // btVector3::normalize (rsqrt-NR path), zero if input near zero
+	V3 safeNorm3;   // btVector3::safeNormalized
+	Q4 axisAngle;   // btQuaternion(axis=a, angle=ang)
 };
 
 // splitmix64 - identical generator on both sides
@@ -80,6 +85,7 @@ inline void FillInput(Gen& g, Input& in) {
 	in.ma = {};
 	in.mb = {};
 	in.dt = 1.0f / 120.0f;
+	in.ang = (float)((int64_t)(g.Next() % 2049) - 1024) / 1024.0f * 0.75f;
 }
 
 } // namespace mathtest
