@@ -538,29 +538,52 @@ verified in source 2026-06-10):**
   output.addContactPoint(normalInB, pointOnB+positionOffset, distance).
 
 ### Next Steps (in order)
-1. PORT-WHILE-READING (fresh window, source side-by-side, faithful trees) the remaining
-   heavy narrowphase into src/Cuda/CudaCollision.cuh slices:
-   (a) GJK decoded above - port directly; still read: triangle support case +
-       btGjkEpaPenetrationDepthSolver/btGjkEpa2 (EPA polytope ~1000 ln) + shape
-       getAabb trees (box btTransformAabb, sphere +-(radius+0.08+margin?)) for the
-       fix-normal branch;
-   (b) btBoxBoxDetector (767 ln ODE SAT, car-car);
-   (c) sphere-triangle + sphere-box (decoded above, small);
-   (d) convex-plane (decoded above, small);
-   (e) btConvexConcave FULLY READ (btConvexConcaveCollisionAlgorithm.cpp): per pair:
-       collisionMarginTriangle = MESH getMargin; convex AABB in tri space (transform
-       inverse compose) + extra margin (triMargin + 0); processAllTriangles over that
-       AABB -> per triangle: TestTriangleAgainstAabb2 cull; EARLY-OUT both sides:
-       support WITH margin along +-world tri normal (normalize=RSQRT; dir via
-       basis.INVERSE() (cofactor CuMat3Inverse!) * normal), dist = projTr - projPt >
-       breakingThreshold -> skip; then btTriangleShape(margin=triMargin) + dispatch:
-       sphere->sphereTriangle special, box->convexConvex GJK; SHARED per-pair manifold
-       accumulates across triangles in BVH WALK ORDER (replicate
-       btQuantizedBvh::walkStacklessQuantizedTree + quantization params; upload BVH
-       node array host-side from mesh getOptimizedBvh); partId/triangleIndex set into
-       result for tri side (feeds internal-edge + callbacks); refreshContactPoints at
-       end. ALSO btInternalEdgeUtility adjust in contact callback (triangleInfoMap
-       extract host-side);
+1. SOLVER PORT (btSequentialImpulseConstraintSolver + islands) - READING DONE for
+   the orchestration shell (2026-06-10), port next. Decoded so far:
+   - calculateSimulationIslands: islandManager->updateActivationState: island tag =
+     sequential index over NON-static objects in m_collisionObjects order (=> ball 0,
+     car0 1, car1 2; statics tag -1/companion -2) + initUnionFind + findUnions over
+     the PAIR ARRAY (not manifolds! aabb-overlap pairs merge islands when both
+     mergesSimulationIslands) -> storeIslandActivationState (tag=find(index),
+     m_sz = collision-object array index). No constraints/predictive manifolds in RS.
+   - solveConstraints: m_sortedConstraints empty -> setup(solverInfo,0,0);
+     buildAndProcessIslands: buildIslands: unionFind.sortIslands(); per island:
+     all-sleeping (no ACTIVE_TAG/DISABLE_DEACTIVATION member) -> ALL set
+     ISLAND_SLEEPING; else sleeping members -> WANTS_DEACTIVATION + deactTime=0
+     (the island WAKE mechanism). Then m_islandmanifold built from dispatcher
+     manifolds IN ORDER (no numContacts filter since m_deterministicOverlappingPairs
+     false) filtered: either body !ISLAND_SLEEPING && needsResponse (hasContactResponse
+     both); kinematic-activate quirks skipped (no kinematics).
+   - processIslands: m_islandmanifold.quickSort(by islandId only - bullet quickSort
+     order must be replicated for ties!); per island (unionFind element order):
+     bodies pushed in m_sz order; if !islandSleeping: callback->processIsland.
+   - InplaceSolverIslandCallback: minimumSolverBatchSize=128 default -> islands
+     ACCUMULATE (bodies/manifolds appended) and solve in ONE solveGroup at final
+     processConstraints() (our scale never exceeds 128) -> single batched
+     solveGroup(all active islands' bodies, all their manifolds in sorted order).
+   - solveGroup = solveGroupCacheFriendlySetup + Iterations + Finish.
+     Setup: convertBodies (getOrInitSolverBody per body: solver body pool in
+     first-seen order; initSolverBody: m_externalForceImpulse = totalForce*invMass*dt
+     [THE force->velocity integration!], externalTorqueImpulse = totalTorque*
+     invInertiaWorld*dt) -> convertContacts (per manifold: per contact with
+     dist <= processingThreshold(LARGE): solver constraint + RS m_isSpecial
+     ACCUMULATION into body m_specialResolveInfo {num++, friction=cp (last), rest=cp,
+     totalNormal+=, totalDist+=rel_pos.length()} (SKIPS static bodies) +
+     convertContactInner: friction dirs from relative velocity (vel-dependent:
+     lateralDir1 = vel - n*rel_vel, normalized if lat_rel_vel>eps else planeSpace1;
+     SOLVER_USE_2_FRICTION_DIRECTIONS off by default -> 1 friction row/contact) ->
+     then per body with m_specialResolveInfo.num>0: convertContactSpecial (synthetic
+     averaged contact vs the FIXED solver body: distance=avg, normal=avg(non-
+     normalized!), friction/rest from last special cp, rel_pos1 = normal*-distance,
+     rel_pos2 = 0) + CLEAR the info. Read setupContactConstraint/addFrictionConstraint/
+     setFrictionConstraintImpulse + Iterations (solveSingleIteration: SIMD resolve
+     fn variants - solverMode default has SOLVER_SIMD: must decode the SSE resolve
+     trees exactly!) + Finish (writeback) NEXT.
+   - solverInfo defaults to confirm: m_numIterations (10), m_erp2, m_restitutionVelocityThreshold, splitImpulse etc. (btContactSolverInfo ctor + any RS edits).
+   Validation: rscap AFTER_SOLVE body snaps exist; compare segment AFTER_COLLISION ->
+   AFTER_SOLVE (needs manifolds+game-callback side effects upload or run collide+solve
+   chained from AFTER_PREDICT in one segment - chained is simpler and already exact).
+2. (DONE - collision phase; narrowphase notes kept below for reference)
    PORTED + VALIDATED (CudaCollision.cuh): manifold mechanics (add/sort4/remove/
    refresh, RS no-replacement), CuAddContactPoint (combine rules, plane-space friction
    dirs, swap semantics), sphere-triangle collide, sphere-box getSphereDistance,
@@ -745,11 +768,21 @@ verified in source 2026-06-10):**
      transforms (car body), not the child convex transform: localPointA is in body
      space; the child offset corrupted distance1 and pruned valid points (tick
      3063 car-mesh). Other 4 refresh sites audited: already body transforms.
-   STATUS: collision compare PASS 20000 ticks seed 1337 (commit d39f559, gates
-   PASS); multi-seed 20k runs (42/7777/123456789) in flight. TODO: side-effect
-   compare (ballHitInfo/velocityImpulseCache/worldContact/carContact) - only
-   manifolds+proxies compared so far; remove TEMP debug[100+] diagnostics in
-   CudaCollideWorld.cuh/bench when validation done.
+   STATUS: COLLISION PHASE VALIDATED - 20000-tick gpu-compare PASS on seeds
+   1337/42/7777/123456789 (all 5 phases: car-pretick, predict, COLLISION,
+   integrate, activation bit-exact), both gates PASS (commit 3280716).
+   Two more root-cause fixes during multi-seed (NOT collision):
+   - Autoflip atan2f stand-in: replaced with VERBATIM glibc 2.4x CORE-MATH
+     atan2f/asinf device ports (CudaVehicle.cuh CuAtan2f/CuAsinf, sources
+     fetched from glibc-2.42 e_atan2f.c/e_asinf.c/s_asincosf_data.c; correctly
+     rounded, doubles/fma only -> bit-identical). cuda_math_test now fuzzes
+     both vs host glibc: 16M values PASS each ("atan2f"/"asinf" ops).
+   - Autoflip timer: CPU `CAR_AUTOFLIP_TIME * (absRoll / M_PI)` promotes to
+     DOUBLE (M_PI) with one float rounding at the store; device had float pi +
+     two roundings. Audited remaining M_PI uses in per-tick paths: none others.
+   TODO: side-effect compare (ballHitInfo/velocityImpulseCache/worldContact/
+   carContact) - only manifolds+proxies compared so far; remove TEMP debug[100+]
+   diagnostics in CudaCollideWorld.cuh/bench when convenient.
    Then solver (btSequentialImpulse - READ NEXT after collision validated), ball
    pre/finish + pads + arena tail, monolithic assembly, flip --gpu-step.
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
