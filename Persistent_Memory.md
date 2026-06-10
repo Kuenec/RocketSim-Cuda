@@ -547,13 +547,25 @@ verified in source 2026-06-10):**
    (b) btBoxBoxDetector (767 ln ODE SAT, car-car);
    (c) sphere-triangle + sphere-box (decoded above, small);
    (d) convex-plane (decoded above, small);
-   (e) btConvexConcaveCollisionAlgorithm + btConvexTriangleCallback: triangle gathering
-       via quantized BVH processAllTriangles over the convex AABB in LOCAL mesh space -
-       TRIANGLE ITERATION ORDER = BVH walk order, affects manifold point order ->
-       replicate the quantized BVH walk (btQuantizedBvh::walkStacklessQuantizedTree)
-       or prove order-equivalence; per-tri manifold via convexConvex GJK; ALSO
-       btInternalEdgeUtility adjust in the contact callback (needs mesh triangleInfoMap
-       - extract host-side);
+   (e) btConvexConcave FULLY READ (btConvexConcaveCollisionAlgorithm.cpp): per pair:
+       collisionMarginTriangle = MESH getMargin; convex AABB in tri space (transform
+       inverse compose) + extra margin (triMargin + 0); processAllTriangles over that
+       AABB -> per triangle: TestTriangleAgainstAabb2 cull; EARLY-OUT both sides:
+       support WITH margin along +-world tri normal (normalize=RSQRT; dir via
+       basis.INVERSE() (cofactor CuMat3Inverse!) * normal), dist = projTr - projPt >
+       breakingThreshold -> skip; then btTriangleShape(margin=triMargin) + dispatch:
+       sphere->sphereTriangle special, box->convexConvex GJK; SHARED per-pair manifold
+       accumulates across triangles in BVH WALK ORDER (replicate
+       btQuantizedBvh::walkStacklessQuantizedTree + quantization params; upload BVH
+       node array host-side from mesh getOptimizedBvh); partId/triangleIndex set into
+       result for tri side (feeds internal-edge + callbacks); refreshContactPoints at
+       end. ALSO btInternalEdgeUtility adjust in contact callback (triangleInfoMap
+       extract host-side);
+   PORTED SO FAR (CudaCollision.cuh, builds clean): manifold mechanics (add/sort4/
+   remove/refresh, RS no-replacement), CuAddContactPoint (combine rules, plane-space
+   friction dirs, swap semantics), sphere-triangle collide, sphere-box getSphereDistance,
+   convex-plane collide, FULL GJK (CuGjkClosestPoints incl fix-normal aabb branch +
+   CuShapeAabb box/sphere/triangle); EPA = loud stub (compare harness will flag);
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
        partId/index semantics);
    (g) manifold assembly: per-pair btPersistentManifold (4-pt cache, sortCachedPoints
