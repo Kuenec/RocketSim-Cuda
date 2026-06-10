@@ -305,14 +305,65 @@ equal-vertex 1e-4) + sphere/box supports. CRITICAL LESSONS:
 - Grid params live in btRSBroadphase (public): minPos/cellSize/cells dims; same grid
   drives COLLISION pair generation (calculateOverlappingPairs) for task 10.
 
+**DONE: CudaVehicle.cuh constraint helpers** (CuResolveSingleCollision/Bilateral,
+CuApplyImpulse, CuComputeImpulseDenominator, CuVelocityInLocalPoint) - trees from
+btContactConstraint.cpp/btRigidBody.h/btJacobianEntry.h. erp: extract solverInfo.m_erp
+host-side (default 0.2; check Arena overrides).
+
+**Car pre-tick port: FULL INVENTORY DONE (all of Car.cpp + btVehicleRL read).**
+Structure: demo branch (gates: disabled) -> updateVehicleFirst (wheel transforms via
+steering axis-angle quat * column-assembled basis2, fwd=up x right then normalize()
+[rsqrt]; rayCast per wheel [castRay semantics: ignore chassis, group Default|
+DROPSHOT_FLOOR, hasContactResponse no-hit rule, normal normalize(); suspension length
+clamp via std::clamp; relVel via denominator>0.1 branch; extraPushback =
+resolveSingleCollision(...,applyImpulses=false)/numWheels when static ground and
+wheelTraceLen < restLen+radius-SUSPENSION_SUBTRACTION]; calcFrictionImpulses [axleDir
+from wheel basis getColumn(right), project off surface normal, safeNormalized;
+forwardDir = surfNormal x axleDir safeNormalized; sideImpulse = resolveSingleBilateral;
+rollingFriction: engineForce ? -engine/frictionScale : brake path with relVel
+threshold rounding (timeStep>1/80 branch; 120Hz -> skipped) * 113.73963f clamp +-brake;
+impulse = (fwd*rolling*longFric + axle*side*latFric) * (mass/3)]) -> wheelsWithContact/
+isOnGround(>=3) -> _UpdateWheels [handbrake rise/fall clamp; throttle/brake state
+machine (deadzone, STOPPING_FORWARD_VEL, BRAKING_NO_THROTTLE_SPEED_THRESH); engine =
+throttle*THROTTLE_TORQUE*UU_TO_BT*driveSpeedScale(/4 if airborne); steer from speed
+curves blended by handbrakeVal, applied to wheels 0,1; friction curve inputs from
+(angVel x wheelDelta + vel)*BT_TO_UU dotted with lat/long dirs, baseFriction>5 ratio;
+handbrake factor curves; non-sticky scale by normal.z when throttle==0; sticky force:
+upwardsDirFromWheelContacts [sum contact normals, safeNormalized], fullStick,
+scale 0.5 + (1-|up.z|), applyCentralForce] -> air torque (if <3 wheels) [flip torque:
+applyTorque(invInertiaWorld.INVERSE() * basis * dodgeTorque); air control torque+
+damping trees; THROTTLE_AIR_ACCEL central force] -> _UpdateJump [impulse/force
+sequence, JUMP_PRE_MIN_ACCEL_SCALE 0.62] -> _UpdateAutoFlip [needs Angle::FromRotMat =
+ATAN2F (exact port needed!); CAR_AUTOFLIP_* consts; angVel += fwd*torque*scale*dt] ->
+_UpdateDoubleJumpOrFlip [dodgeDir safeNormalized 2D, Vec::Normalized() (CHECK its
+tree), flip impulse scaling consts, flipRelTorque /tickTimeScale(=1 at 120Hz),
+powf(1-FLIP_Z_DAMP_120, 1.0) z-damp (constant, precompute host)] -> _UpdateAutoRoll
+(if throttle && (contact 1..3 wheels || worldContact)) [cross/dot/clamp trees, central
+force + applyTorque(invInertiaWorld.inverse()*...)] -> worldContact.hasContact=false
+-> updateVehicleSecond [updateSuspension: force=(rest-len)*stiffness*clippedInv;
+damping rate compress/relax; *suspensionForceScale; max(0); applyImpulse(normal*
+(force*dt + extraPushback), contactPoint-origin); friction: applyImpulse(impulse*dt,
+contactOffset - upDir*(upDir dot contactOffset))] -> _UpdateBoost [state machine,
+BOOST_MIN_TIME, applyCentralForce fwd*boostAccel(Ground|Air)*UU_TO_BT*CAR_MASS].
+STILL TO DECODE: btMatrix3x3::inverse() tree (cofactor/det), Angle::FromRotMat
+(atan2f - port glibc atan2f or correction approach over bounded domain),
+Vec::Normalized (RocketSim Vec - check which sqrt path), applyTorque/applyCentralForce
+accumulator trees (m_totalForce += force*linearFactor etc.), LinearPieceCurve data
+extraction (RLConst curves -> sorted (in,out) arrays; GetOutput lerp tree already read),
+wheel consts extraction (btWheelInfoRL fields incl. m_suspensionRestLength1,
+SUSPENSION_SUBTRACTION, chassis connection points after MAX_SUSPENSION_TRAVEL
+adjustment), forwardSpeed = linVel dot forwardVector (getForwardVector = basis column
+via m_indexForwardAxis=1?? check getForwardVector impl).
+GpuWheelState persists: steerAngle, engineForce, brake, latFriction, longFriction,
+suspensionForceScale (+ raycast scratch is intra-tick).
+Capture plan: hooks in Car::_PreTickUpdate around updateVehicleFirst / game block /
+updateVehicleSecond / _UpdateBoost; compare wheel scratch + body forces + car state.
+
 ### Next Steps (in order)
-1. Port resolveSingleCollision + resolveSingleBilateral (btContactConstraint.cpp), then
-   btVehicleRL updateVehicleFirst/Second device port (wheel transforms incl. steering
-   quat + basis assembly + fwd normalize; rayCast wrapper = castRay semantics incl.
-   hasContactResponse no-hit rule + normal normalize; suspension; friction impulses)
-   with per-sub-phase capture in Car::_PreTickUpdate; then Car game-logic state
-   machines (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll + RLConst
-   curves); validate via --gpu-compare with car pre-tick segment.
+1. Decode remaining items above; extract vehicle/curve consts host-side; implement
+   device UpdateVehicleFirst/Second + car game logic in CudaVehicle.cuh; add CPU
+   capture points; validate via --gpu-compare car pre-tick segments.
+2. Then collision (35%), solver+islands, ball/pads/game tail; flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
