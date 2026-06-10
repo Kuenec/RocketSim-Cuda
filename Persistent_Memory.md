@@ -656,11 +656,24 @@ verified in source 2026-06-10):**
      writebackVelocityAndTransform: linVel += deltaLin; angVel += deltaAng; if any
      push/turn component != 0: integrateTransform(NoRot if m_noRot)(worldTransform,
      pushVel, turnVel * 0.1, dt) -> m_worldTransform (POSITION CORRECTION).
-   - REMAINING READS for the port: btSolverBody.h USE_SIMD internalApplyImpulse
-     (SSE trees - it's used by warmstart-with-0 and split resolve),
-     addFrictionConstraint full body (rhs computation w/ desiredVelocity=0),
-     gResolveSplitPenetrationImpulse_sse2 exact body (lines ~315-348),
-     rb->getVelocityInLocalPoint tree (btRigidBody.h: linVel + angVel.cross(rel)).
+   - SplitPenetration_sse2: early `if (!c.m_rhsPenetration) return 0` (exact FP !=0
+     test); deltaImpulse = rhsPen - appliedPush*cfm; dotn trees on PUSH/TURN
+     velocities; LOWER clamp only (upper mask computed but unused, same as scalar);
+     push += (n*invMass)*delta, turn += angComp*delta.
+   - setupFrictionConstraint (full): appliedImpulse=0 (NO friction warmstart);
+     jacDiagABInv = relaxation/(denom0+denom1) [NO cfm]; vel1Dotn = n1.dot(linVel+
+     extForceImp) + rp1xn.dot(angVel [NO extTorque!]); velocityError = desired(0) -
+     rel_vel; rhs = velErr*jacInv (no friction anchor flag); rhsPenetration=0;
+     cfm=cfmSlip(0); lower=-friction, upper=+friction (overwritten per iteration
+     by +-fric*totalImpulse anyway). addFrictionConstraint: expand + m_frictionIndex
+     = contact idx + setup.
+   - btSolverBody internalApplyImpulse(linComp, angComp, mag): deltaLin += linComp*
+     mag, deltaAng += angComp*mag (SSE per-lane = scalar-identical).
+   - rb->getVelocityInLocalPoint(rel) = m_linearVelocity + m_angularVelocity.cross(rel).
+   ALL SOLVER READS COMPLETE - next window: write CudaSolver.cuh (solver body pool,
+   convert bodies/contacts/special, split iterations, 10 main iterations, finish
+   writeback incl position correction), wire GPU_PHASE_SOLVE, extend gpu-compare
+   with AFTER_PREDICT->AFTER_SOLVE chained segment (collision feeds solver in-kernel).
    Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
    already bit-exact feeds the solver in the same kernel run; compare body snaps at
    AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
