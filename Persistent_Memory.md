@@ -234,12 +234,58 @@ precomputed host-side; sleep thresholds squared; noRot). Kernel supports phase w
 (RunPhaseSegment) for isolation; production StepTicks runs the full range in one launch.
 `--gpu-step`/`--gpu-compare` REQUIRE glibc_trig_fix.bin (actionable error if missing).
 
+**Vehicle port in progress (task: car pre-tick = 50% of CPU time). Decoded semantics
+(2026-06-10, all from work-tree source):**
+- RSQRTSS emulation DONE+VERIFIED (RsqrtHost.cpp capture, 12-bit mantissa + exponent
+  parity hypothesis holds on this CPU, 4M-sample check at every init; CuNormalize3 /
+  CuSafeNormalize3 / CuQuatAxisAngle in CudaMath, all fuzz-PASS). Trig table extended
+  to negative domain (steering quats; 1.6M sin + 36k cos entries) - REGENERATE with
+  cuda_math_test --emit-trig-table if missing.
+- Suspension raycast chain: Car::_PreTickUpdate -> btVehicleRL::updateVehicleFirst
+  (updateWheelTransform per wheel -> rayCast per wheel -> calcFrictionImpulses), then
+  car game logic, then updateVehicleSecond (updateSuspension applyImpulse + friction
+  applyImpulse). Cross-tick persistent wheel state: m_steerAngle, m_engineForce,
+  m_brake, m_latFriction, m_longFriction (calcFrictionImpulses in tick N reads values
+  set by _UpdateWheels in tick N-1!), m_suspensionForceScale.
+- btDefaultVehicleRaycaster::castRay (RS-modified): ClosestRayResultCallback(from, to,
+  ignoreObj=chassis); group = DefaultFilter|addedMask, mask = AllFilter. After closest
+  hit found: requires btRigidBody + hasContactResponse() else returns NO HIT (a closest
+  demoed car masks walls behind it!). Result normal gets normalize() (rsqrt path).
+- needsCollision: (proxyGroup & cbMask) && (cbGroup & proxyMask), ignoreObj excluded.
+  Soccar ray candidates: 16 meshes (static, identity transform -> local==world),
+  4 planes (identity basis, origin=posBT; floor n=+z @0, ceiling n=-z @height,
+  side walls n=+-x), ball (sphere), other cars (compound->box). Static bodies:
+  group=StaticFilter(2), mask=All^Static.
+- Mesh ray: rayTestSingleInternal concave branch -> btTriangleRaycastCallback::
+  processTriangle (exact math read: plane-side products, distance=dist_a/(dist_a-dist_b),
+  STRICT < hitFraction, edge_tolerance=-1e-4*len2(n), three cross/dot containment tests,
+  normal.normalize(), backface flip if dist_a<=0). Fraction culling across triangles/
+  objects is min-equivalent (brute force OK) EXCEPT exact ties: first-tested wins ->
+  BVH/dbvt order tie risk, accepted for now (compare harness will catch).
+- Plane ray: concave generic branch synthesizes 2 triangles from ray AABB in object-
+  local space: btPlaneSpace1(n) tangents (uses btRecipSqrt = exact 1/sqrt, NOT rsqrtss),
+  radius=halfExtents.length(), projectedCenter; tris ((+t0+t1),(+t0-t1),(-t0-t1)) and
+  ((-t0-t1),(-t0+t1),(+t0+t1)) -> same processTriangle.
+- Ball/car ray: rayTestSingleInternal convex branch: btSubsimplexConvexCast with point
+  shape (margin 0) vs shape, needs btVoronoiSimplexSolver port (closest-pt barycentric);
+  sphere support = normalized(dir)*radius (WITH margin path); box support = sign-select
+  getHalfExtentsWithMargin; compound loops children (car: 1 box child with
+  hitboxPosOffset transform). castResult.m_fraction starts at current closest; accept
+  if normal len2>1e-4 && fraction strictly <; normal normalize()d.
+- resolveSingleCollision + resolveSingleBilateral (btContactConstraint.cpp) still to
+  read/port (used by extraPushback + side friction impulse).
+
 ### Next Steps (in order)
-1. Port car pre-tick (Car::_PreTickUpdate incl. btVehicleRL wheel raycasts vs arena -
-   needs GPU mesh/BVH raycast + static planes; 50% of CPU time) with per-sub-phase
-   capture points; then collision (35%), solver+islands, ball/pads/game tail.
-2. RSQRTSS emulation when first normalize() call site is ported (suspension/ball finish).
-3. Extend GpuCarGameState wheel state as the vehicle port defines what persists.
+1. Write src/Cuda/CudaRaycast.cuh: device RayTestClosest replicating the above
+   (planes+meshes first, then sphere/box subsimplex+voronoi solver); upload world geo
+   (mesh tris from btBvhTriangleMeshShape getLockedReadOnlyVertexIndexBase, plane
+   normal/origin/filters) at batch init; fuzz-test rays vs CPU rayTest (new tool or op
+   in cuda_math_test comparing against work-lib world).
+2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
+   (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
+   RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
+   Car::_PreTickUpdate; extend GpuCarGameState wheel state; validate via --gpu-compare.
+3. Then collision (35%), solver+islands, ball/pads/game tail; flip --gpu-step.
 
 ### Open Questions / Blockers
 - None currently.
