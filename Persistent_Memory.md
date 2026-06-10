@@ -485,11 +485,24 @@ verified in source 2026-06-10):**
   (hitDir*relSpeed)*CURVE(relSpeed)*mutator.ballHitExtraForceScale ->
   ball._velocityImpulseCache += *UU_TO_BT. Ball world collision: SOCCAR NO-OP except
   manifold m_isSpecial=true (check m_isSpecial consumer in solver!).
-- Still to read: btSphereTriangle/SphereBox/BoxBox detectors, GJK+EPA, concave wrapper
-  (btConvexTriangleCallback + quantized BVH AABB walk -> TRIANGLE ORDER), compound
-  wrapper, btInternalEdgeUtility, dispatcher needsCollision + manifold ordering,
-  refreshContactPoints + sortCachedPoints tails, solver (btSequentialImpulse incl
-  m_isSpecial RS changes).
+- SphereTriangleDetector READ (RS uses VirxEC fast variants!): collide() in TRIANGLE
+  LOCAL space (sphereInTr = transformB.inverseTimes(transformA)); tri normal cross,
+  l2>=eps^2, normal /= sqrt(l2) [recip-mul], distanceFromPlane sign-flip, inside-plane
+  if < radius+breakingThresh; face containment via BARYCENTRIC pointInTriangle
+  (u x w . n / nLenSq trees); else closestPointTriangle (embree-style, SAME structure
+  as voronoi ClosestPtPointTriangle but RETURNS POINT: a + v*ab forms); contact:
+  contactToCentre dist^2 < (r+thresh)^2 -> depth=-(radius-distance),
+  normal=normalize(contactToCentre) [RSQRT] (or tri normal + depth=-radius if
+  dist2<=eps); output world: transformB.getBasis()*normal, transformB*point,
+  addContactPoint. swapResults variant flips.
+- btSphereBoxCollisionAlgorithm READ: sphere center in box local (invXform); closest
+  pt = per-axis min/max clamp vs halfExtentsWithoutMargin; normal = rel - closest;
+  reject if dist2 > (radius+boxMargin+maxContactDistance)^2; if dist2<=SIMD_EPSILON:
+  deep face fallback getSpherePenetration (6-face min dist, axis normals, sets
+  closestPoint on face) distance = -minDist; else distance=length, normal/=distance
+  [recip-mul]; pointOnBox = closest + normal*boxMargin -> world via m44T(pointOnBox),
+  normal via basis*normal; penetrationDepth = distance - (radius+boxMargin);
+  addContactPoint(normal, pointOnBox, depth); refreshContactPoints if contacts.
 
 ### Next Steps (in order)
 1. Finish narrowphase reads (above list), then implement device collision phase in
