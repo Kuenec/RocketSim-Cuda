@@ -741,10 +741,15 @@ verified in source 2026-06-10):**
    - GpuStaticObj must carry BOTH aabbs: proxy aabb (pair-gen TestAabbAgainstAabb2)
      and RAW shape aabb (compound ProcessChildShape + post-loop tests). They differ
      by the +-0.02 expansion; car-plane at grazing height proved it (tick 745).
-   STATUS: collision compare PASS 200 ticks seed 1337; 20k-tick + multi-seed
-   validation in progress. NEXT: finish validation (fix any further mismatches),
-   then commit; side-effect compare (ballHitInfo/velocityImpulseCache/worldContact)
-   still TODO (only manifolds+proxies compared so far).
+   - CuConvexVsMesh's trailing refreshContactPoints must use the manifold BODY
+     transforms (car body), not the child convex transform: localPointA is in body
+     space; the child offset corrupted distance1 and pruned valid points (tick
+     3063 car-mesh). Other 4 refresh sites audited: already body transforms.
+   STATUS: collision compare PASS 20000 ticks seed 1337 (commit d39f559, gates
+   PASS); multi-seed 20k runs (42/7777/123456789) in flight. TODO: side-effect
+   compare (ballHitInfo/velocityImpulseCache/worldContact/carContact) - only
+   manifolds+proxies compared so far; remove TEMP debug[100+] diagnostics in
+   CudaCollideWorld.cuh/bench when validation done.
    Then solver (btSequentialImpulse - READ NEXT after collision validated), ball
    pre/finish + pads + arena tail, monolithic assembly, flip --gpu-step.
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
