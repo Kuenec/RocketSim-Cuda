@@ -458,6 +458,305 @@ __device__ __forceinline__ bool CuConvexPlaneCollide(
 	return true;
 }
 
+// ---- btGjkPairDetector::getClosestPointsNonVirtual (btGjkPairDetector.cpp:688) ----
+// Shapes: support WITHOUT margin (box: fsel on implicitShapeDimensions =
+// halfExtentsWithoutMargin; sphere: (0,0,0); triangle: max-dot vertex). Margins via
+// getMarginNonVirtual (box margin, triangle margin, sphere radius) passed by caller.
+
+#define CU_REL_ERROR2 1.0e-6f
+
+struct CuGjkShape {
+	int kind;                 // CU_SHAPE_SPHERE / CU_SHAPE_BOX / 3 = triangle
+	CuVec3 boxHalfExtNoMargin; // implicitShapeDimensions
+	CuVec3 triV[3];
+	float margin;             // getMarginNonVirtual
+};
+#define CU_SHAPE_TRIANGLE 3
+
+// btVector3::maxAxis comparison tree
+__device__ __forceinline__ int CuMaxAxis3(float x, float y, float z) {
+	return x < y ? (y < z ? 2 : 1) : (x < z ? 2 : 0);
+}
+
+__device__ __forceinline__ CuVec3 CuSupportNoMargin(const CuGjkShape& s, CuVec3 dir) {
+	if (s.kind == CU_SHAPE_BOX)
+		return CuSupportBox(s.boxHalfExtNoMargin, dir);
+	if (s.kind == CU_SHAPE_TRIANGLE) {
+		float d0 = CuDot3(dir, s.triV[0]);
+		float d1 = CuDot3(dir, s.triV[1]);
+		float d2 = CuDot3(dir, s.triV[2]);
+		return s.triV[CuMaxAxis3(d0, d1, d2)];
+	}
+	return { 0, 0, 0 }; // sphere
+}
+
+// Shape getAabb for the fix-normal-direction branch (local transforms).
+// Box: btTransformAabb - extent = (he+margin) dot3 abs(basis rows). Sphere: RS adds
+// +0.08 to margin (btSphereShape.cpp getAabb). Triangle: 6-support slow path
+// (btPolyhedralConvexShape::getAabbSlow with margin) - VERIFY tree vs source when the
+// compare harness first exercises a triangle fix-normal case.
+__device__ __forceinline__ void CuShapeAabb(const CuGjkShape& s,
+	const CuMat3& basis, CuVec3 origin, CuVec3& aabbMin, CuVec3& aabbMax) {
+	if (s.kind == CU_SHAPE_BOX) {
+		// btTransformAabb(halfExtentsWithoutMargin, margin, t):
+		CuVec3 halfExtentsWithMargin = {
+			s.boxHalfExtNoMargin.x + s.margin,
+			s.boxHalfExtNoMargin.y + s.margin,
+			s.boxHalfExtNoMargin.z + s.margin };
+		// extent = he dot3 |basis rows|
+		CuVec3 r0 = { fabsf(basis.r[0].x), fabsf(basis.r[0].y), fabsf(basis.r[0].z) };
+		CuVec3 r1 = { fabsf(basis.r[1].x), fabsf(basis.r[1].y), fabsf(basis.r[1].z) };
+		CuVec3 r2 = { fabsf(basis.r[2].x), fabsf(basis.r[2].y), fabsf(basis.r[2].z) };
+		CuVec3 extent = { CuDot3(halfExtentsWithMargin, r0), CuDot3(halfExtentsWithMargin, r1), CuDot3(halfExtentsWithMargin, r2) };
+		aabbMin = origin - extent;
+		aabbMax = origin + extent;
+	} else if (s.kind == CU_SHAPE_SPHERE) {
+		float m = s.margin + 0.08f; // ROCKETSIM CHANGE in btSphereShape::getAabb
+		CuVec3 extent = { m, m, m };
+		aabbMin = origin - extent;
+		aabbMax = origin + extent;
+	} else {
+		// triangle: support in +-axis dirs WITH margin (getAabbSlow form)
+		CuVec3 mn, mx;
+		for (int axis = 0; axis < 3; axis++) {
+			CuVec3 dirW = { 0, 0, 0 };
+			(&dirW.x)[axis] = 1.0f;
+			CuVec3 dirL = CuVecMulMat(dirW, basis);
+			CuVec3 sup = CuSupportNoMargin(s, dirL);
+			CuVec3 supW = CuTransformPoint(basis, origin, sup);
+			(&mx.x)[axis] = (&supW.x)[axis] + s.margin;
+			(&dirW.x)[axis] = -1.0f;
+			dirL = CuVecMulMat(dirW, basis);
+			sup = CuSupportNoMargin(s, dirL);
+			supW = CuTransformPoint(basis, origin, sup);
+			(&mn.x)[axis] = (&supW.x)[axis] - s.margin;
+		}
+		aabbMin = mn;
+		aabbMax = mx;
+	}
+}
+
+// EPA penetration solver (btGjkEpaPenetrationDepthSolver -> btGjkEpa2). PENDING PORT:
+// this stub returns false, which on CPU only happens when EPA itself fails. The
+// manifold-compare harness FAILS LOUDLY the first time a deep-penetration pair needs
+// it, so the stub cannot silently ship. Callers pass epaAvailable=true (CPU always
+// has the solver).
+__device__ __forceinline__ bool CuEpaPenDepth(CuSimplexSolver& simplexSolver,
+	const CuGjkShape& shapeA, const CuGjkShape& shapeB,
+	const CuMat3& basisA, CuVec3 originA, const CuMat3& basisB, CuVec3 originB,
+	CuVec3& sepAxis, CuVec3& pOnA, CuVec3& pOnB) {
+	(void)simplexSolver; (void)shapeA; (void)shapeB;
+	(void)basisA; (void)originA; (void)basisB; (void)originB;
+	sepAxis = { 0, 0, 0 };
+	pOnA = { 0, 0, 0 };
+	pOnB = { 0, 0, 0 };
+	return false; // TODO(EPA port): replace with btGjkEpa2 Penetration
+}
+
+struct CuGjkResult {
+	bool hasContact;
+	CuVec3 normalOnB;     // world
+	CuVec3 pointOnBWorld; // world (positionOffset re-added)
+	float distance;
+};
+
+__device__ inline void CuGjkClosestPoints(
+	const CuGjkShape& shapeA, const CuMat3& basisA, CuVec3 originAIn,
+	const CuGjkShape& shapeB, const CuMat3& basisB, CuVec3 originBIn,
+	float maximumDistanceSquared, bool epaAvailable,
+	CuGjkResult& out) {
+
+	out.hasContact = false;
+
+	float distance = 0.0f;
+	CuVec3 normalInB = { 0, 0, 0 };
+	CuVec3 pointOnA = { 0, 0, 0 }, pointOnB = { 0, 0, 0 };
+
+	// positionOffset centering
+	CuVec3 positionOffset = (originAIn + originBIn) * 0.5f;
+	CuVec3 localOriginA = originAIn - positionOffset;
+	CuVec3 localOriginB = originBIn - positionOffset;
+
+	float marginA = shapeA.margin;
+	float marginB = shapeB.margin;
+
+	int curIter = 0;
+	const int gGjkMaxIter = 1000;
+	CuVec3 cachedSeparatingAxis = { 0, 1, 0 };
+
+	bool isValid = false;
+	bool checkSimplex = false;
+	const bool checkPenetration = true;
+	int degenerateSimplex = 0;
+
+	float squaredDistance = 3.402823466e+38f; // BT_LARGE_FLOAT
+	float delta = 0.0f;
+	float margin = marginA + marginB;
+
+	CuSimplexSolver solver;
+	solver.reset();
+
+	while (true) {
+		// (-axis) * basisA / axis * basisB: vec*mat tdot trees
+		CuVec3 seperatingAxisInA = CuVecMulMat(CuNeg(cachedSeparatingAxis), basisA);
+		CuVec3 seperatingAxisInB = CuVecMulMat(cachedSeparatingAxis, basisB);
+
+		CuVec3 pInA = CuSupportNoMargin(shapeA, seperatingAxisInA);
+		CuVec3 qInB = CuSupportNoMargin(shapeB, seperatingAxisInB);
+
+		CuVec3 pWorld = CuTransformPoint(basisA, localOriginA, pInA);
+		CuVec3 qWorld = CuTransformPoint(basisB, localOriginB, qInB);
+
+		CuVec3 w = pWorld - qWorld;
+		delta = CuDot3(cachedSeparatingAxis, w);
+
+		if ((delta > 0.0f) && (delta * delta > squaredDistance * maximumDistanceSquared)) {
+			degenerateSimplex = 10;
+			checkSimplex = true;
+			break;
+		}
+		if (solver.inSimplex(w)) {
+			degenerateSimplex = 1;
+			checkSimplex = true;
+			break;
+		}
+		float f0 = squaredDistance - delta;
+		float f1 = squaredDistance * CU_REL_ERROR2;
+		if (f0 <= f1) {
+			degenerateSimplex = (f0 <= 0.0f) ? 2 : 11;
+			checkSimplex = true;
+			break;
+		}
+
+		solver.addVertex(w, pWorld, qWorld);
+		CuVec3 newCachedSeparatingAxis;
+		if (!solver.closest(newCachedSeparatingAxis)) {
+			degenerateSimplex = 3;
+			checkSimplex = true;
+			break;
+		}
+		if (CuLength2(newCachedSeparatingAxis) < CU_REL_ERROR2) {
+			cachedSeparatingAxis = newCachedSeparatingAxis;
+			degenerateSimplex = 6;
+			checkSimplex = true;
+			break;
+		}
+
+		float previousSquaredDistance = squaredDistance;
+		squaredDistance = CuLength2(newCachedSeparatingAxis);
+
+		if (previousSquaredDistance - squaredDistance <= CU_SIMD_EPSILON * previousSquaredDistance) {
+			checkSimplex = true;
+			degenerateSimplex = 12;
+			break;
+		}
+		cachedSeparatingAxis = newCachedSeparatingAxis;
+
+		if (curIter++ > gGjkMaxIter)
+			break;
+
+		if (solver.numVertices == 4) { // fullSimplex
+			degenerateSimplex = 13;
+			break;
+		}
+	}
+
+	if (checkSimplex) {
+		CuVec3 v;
+		solver.updateClosestVectorAndPoints(); // compute_points
+		pointOnA = solver.cachedP1;
+		pointOnB = solver.cachedP2;
+		(void)v;
+		normalInB = cachedSeparatingAxis;
+		float lenSqr = CuLength2(cachedSeparatingAxis);
+
+		if (lenSqr < 0.0001f)
+			degenerateSimplex = 5;
+		if (lenSqr > CU_SIMD_EPSILON * CU_SIMD_EPSILON) {
+			float rlen = 1.0f / sqrtf(lenSqr);
+			normalInB = normalInB * rlen;
+			float s = sqrtf(squaredDistance);
+			pointOnA = pointOnA - cachedSeparatingAxis * (marginA / s);
+			pointOnB = pointOnB + cachedSeparatingAxis * (marginB / s);
+			distance = (1.0f / rlen) - margin;
+			isValid = true;
+		}
+	}
+
+	// m_catchDegeneracies=1
+	bool catchDegeneratePenetrationCase =
+		(epaAvailable && degenerateSimplex && ((distance + margin) < 0.01f));
+
+	if (checkPenetration && (!isValid || catchDegeneratePenetrationCase)) {
+		if (epaAvailable) {
+			CuVec3 tmpPointOnA, tmpPointOnB;
+			cachedSeparatingAxis = { 0, 0, 0 };
+
+			bool isValid2 = CuEpaPenDepth(solver, shapeA, shapeB,
+				basisA, localOriginA, basisB, localOriginB,
+				cachedSeparatingAxis, tmpPointOnA, tmpPointOnB);
+
+			if (isValid2) {
+				CuVec3 tmpNormalInB = tmpPointOnB - tmpPointOnA;
+				float lenSqr = CuLength2(tmpNormalInB);
+				if (lenSqr <= CU_SIMD_EPSILON * CU_SIMD_EPSILON) {
+					tmpNormalInB = cachedSeparatingAxis;
+					lenSqr = CuLength2(cachedSeparatingAxis);
+				}
+				if (lenSqr > CU_SIMD_EPSILON * CU_SIMD_EPSILON) {
+					float inv = 1.0f / sqrtf(lenSqr); // /= btSqrt
+					tmpNormalInB = tmpNormalInB * inv;
+					CuVec3 dAB = tmpPointOnA - tmpPointOnB;
+					float distance2 = -sqrtf(CuLength2(dAB)); // -(..).length()
+					if (!isValid || (distance2 < distance)) {
+						distance = distance2;
+						pointOnA = tmpPointOnA;
+						pointOnB = tmpPointOnB;
+						normalInB = tmpNormalInB;
+						isValid = true;
+					}
+				}
+			} else {
+				if (CuLength2(cachedSeparatingAxis) > 0.0f) {
+					CuVec3 dAB = tmpPointOnA - tmpPointOnB;
+					float distance2 = sqrtf(CuLength2(dAB)) - margin;
+					if (!isValid || (distance2 < distance)) {
+						distance = distance2;
+						pointOnA = tmpPointOnA;
+						pointOnB = tmpPointOnB;
+						pointOnA = pointOnA - cachedSeparatingAxis * marginA;
+						pointOnB = pointOnB + cachedSeparatingAxis * marginB;
+						normalInB = cachedSeparatingAxis;
+						normalInB = CuNormalize3(normalInB); // normalize() rsqrt
+						isValid = true;
+					}
+				}
+			}
+		}
+	}
+
+	if (isValid && ((distance < 0) || (distance * distance < maximumDistanceSquared))) {
+		// m_fixContactNormalDirection=1: aabb-center check (shape getAabb at LOCAL
+		// transforms). Implemented for our shapes:
+		CuVec3 posA, posB;
+		{
+			CuVec3 mn, mx;
+			CuShapeAabb(shapeA, basisA, localOriginA, mn, mx);
+			posA = (mx + mn) * 0.5f;
+			CuShapeAabb(shapeB, basisB, localOriginB, mn, mx);
+			posB = (mn + mx) * 0.5f; // note CPU writes (aabbMin+aabbMax)*0.5 here
+		}
+		CuVec3 diff = posA - posB;
+		if (CuDot3(diff, normalInB) < 0.0f)
+			normalInB = normalInB * -1.0f;
+
+		out.hasContact = true;
+		out.normalOnB = normalInB;
+		out.pointOnBWorld = pointOnB + positionOffset;
+		out.distance = distance;
+	}
+}
+
 } // namespace rscuda
 
 #endif // __CUDACC__
