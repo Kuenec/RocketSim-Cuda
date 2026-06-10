@@ -437,11 +437,27 @@ domain |args|<=~1).
   refreshContactPoints: still to read tail (prunes pts beyond threshold by recomputed
   distance; called post-processCollision by compound/concave paths?).
 
+- Arena::_BulletContactAddedCallback READ (Arena.cpp:245): skip if either lacks contact
+  response; swap so lower userIndex is A (car=?<ball userindex values: BT_USERINFO_TYPE_CAR
+  vs BALL - check constants); car-ball -> ball->_OnHit(relBallPos local pt *BT_TO_UU,
+  combinedFriction/Restitution, tickCount); car-car -> OVERRIDE manifold friction=
+  CARCAR_COLLISION_FRICTION restitution=CARCAR..., two-way bump test (cooldown by
+  carContact, vel toward other, speed compare, bumper localPoint.x*BT_TO_UU >
+  BUMP_MIN_FORWARD_DIST, demo mode branches - READ TAIL pending Arena.cpp:360-470);
+  car-world -> _BtCallback_OnCarWorldCollision (sets worldContact - read tail);
+  ball-world -> ball->_OnWorldCollision + m_isSpecial=true (non-snowday).
+  THEN btAdjustInternalEdgeContacts always (swap-aware args).
+  STILL TO READ: callback tails (bump impulses via BUMP_VEL curves, demo logic,
+  car-world worldContact set), Ball::_OnHit (extra impulse + BALL_CAR_EXTRA_IMPULSE
+  curve + tickCountWhenHit/ballHitInfo), Ball::_OnWorldCollision,
+  btAdjustInternalEdgeContacts (btInternalEdgeUtility.cpp), then GJK
+  (btGjkPairDetector), EPA (btGjkEpa2), btConvexConcave, btBoxBox, btCompound,
+  dispatcher needsCollision/order, solver handoff.
+
 ### Next Steps (in order)
 1. Read+port in slices with per-slice fuzz/compare: (a) AABB update + pair gen,
-   (b) convex-plane + manifold mechanics + Arena contact callback
-   (Arena::_BulletContactAddedCallback NEXT READ), (c) convex-concave mesh
-   (GJK pair detector + EPA + internal edge), (d) box-box SAT,
+   (b) convex-plane + manifold mechanics + Arena contact callback,
+   (c) convex-concave mesh (GJK pair detector + EPA + internal edge), (d) box-box SAT,
    (e) compound plumbing, (f) dispatch order + solver handoff. Then solver+islands,
    ball/pads/tail, assemble monolithic kernel, flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
