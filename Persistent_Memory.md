@@ -152,7 +152,14 @@ The project is complete ONLY when ALL THREE are true:
 
 ## Current State (2026-06-10)
 
-**Status: Exactness 100% (both gates pass) | CUDA 0% (no GPU code yet) | Throughput 100% (workspace == reference, identical CPU code)**
+**Status: Exactness 100% | CUDA 100% (--gpu-step passes BOTH gates with IDENTICAL hashes; commit 4fbd3de) | Throughput: GPU 10.6k SPS @128 arenas vs CPU 58.5k single-thread (18%) - OPTIMIZATION IS THE REMAINING WORK**
+
+2026-06-10: THE GPU KERNEL OWNS THE ENTIRE SIMULATION STEP. `--gpu-step` runs every
+phase of every tick on-device (one launch per run) and reproduces the CPU reference
+bit-exactly: stable gate (128 arenas x 1000 ticks, hash 3380507951560469826) PASS,
+hard gate (20000 ticks, hash 11764255410181881605) PASS, plus an untested-config
+cross-check (32 arenas x 4 cars x 2000 ticks seed 909090) hash-identical to CPU.
+CPU gates still PASS (reference untouched).
 
 ### Done
 - Repo initialized at project root on branch `Fable` (fresh history, not based on old `main`), pushed to the remote. Work copy verified file-identical to pristine v2.2.1 before import.
@@ -177,7 +184,7 @@ SPS varies a few percent run to run; the hash is the gate, SPS is informational.
 ### Asset Provenance
 - Meshes downloaded from `https://github.com/heresfilly09/rocket-league-collision-meshes` (plain `.cmf`), verified against upstream's known hash set. Game-derived, so NOT committed; re-download to `collision_meshes/soccar/` and the bench's `MESHES: OK (16/16 soccar)` line confirms integrity.
 
-### GPU port progress (CUDA 0% — kernel does not yet produce correct sim output)
+### GPU port progress (CUDA 100% — complete; history below)
 Done so far:
 - Workspace bench forked to `tools/bench_work/main.cpp` with `--profile` and `--gpu-step`.
   Phase profile on hard gate: car_pre_tick 50% (vehicle sim lives in Car::_PreTickUpdate,
@@ -694,16 +701,33 @@ verified in source 2026-06-10):**
    iterations and finish; pools are public) captures contact/friction rows + solver
    bodies; rscuda::DownloadSolveDebug dumps the GPU scratch; the bench solve-FAIL
    block diffs them row by row. Same pattern for future phases.
-   NEXT (task #12, the LAST phases before 100% CUDA): in CPU order per Arena::Step:
-   (1) ball zero-vel sleep check + Ball::_PreTickUpdate (read Ball.cpp + Arena::Step
-   head), (2) pads BoostPad::_PreTickUpdate + _PostTickUpdate (BoostPadGrid::
-   CheckCollision), (3) car _PostTickUpdate (+ _FinishPhysicsTick: velocityImpulse
-   caches, supersonic, rotMat cache write!), (4) ball _FinishPhysicsTick (vel clamps
-   w/ rsqrt, velocityImpulseCache apply), (5) Arena::Step tail (tickCount++, goal
-   scoring soccar = ball y check, _lastCarBumps etc.), then assemble the monolithic
-   kernel phase order incl. car pre-tick (already ported as CuCarPreTick - needs
-   wiring into GpuStepArenasKernel with controls schedule + wheel ray world inputs
-   from GpuDynProxy state), flip --gpu-step, run gates (identical hashes target).
+   GAME TAIL + ASSEMBLY (DONE, commit 4fbd3de): CudaGameTail.cuh (ball sleep check
+   [exact ==0 length2], applyGravity [active only; gravityForce = acc*(1/invMass)
+   in GpuBodyConsts], clearForces, car post-tick [supersonic, contact cooldown,
+   lastControls], car/ball finish [impulse caches + rsqrt-normalized vel clamps],
+   pad pre/grid-check/post [grid int-truncation indices, prevLockedCarID box-vs-
+   cylinder split, Vec all-component compares]). GpuStepArenasKernel runs phases
+   GAME_PRE(0)..GAME_POST(6) per tick: car pre-ticks SEQUENTIAL in the CPU's
+   per-arena _cars unordered_set order (UploadCarOrder permutation; later cars see
+   earlier cars' impulses; ground-body friction impulses written back), controls
+   from the uploaded schedule, solverTimeStep = 1/60 on tick 0 else 1/120.
+   Bench RunGpu uploads everything (geo/BVH/collide/tail/proxies/ball state/car
+   order/schedule) after one updateAabbs(); downloads + writes back into arenas
+   (incl. wheel persists, ball velocityImpulseCache + tickCountSinceUpdate) and
+   hashes with the SAME HashArena as the CPU path.
+   LAST BUG (stable gate FAIL 128 arenas -> arena 2 only): static CuContactBodyInfo
+   used origin=0 for ALL statics; correct for meshes but PLANES carry their position
+   in the rb origin (side wall x=-81.92). localPointB landed in the wrong frame and
+   refresh pruned the contact via the 2D-distance check. The floor plane (origin
+   0,0,0) masked it through every prior validation. Diagnosed with --arena-offset/
+   --no-ball-motion flags replaying arena 2 standalone under the per-phase compare.
+   REMAINING WORK (next session): THROUGHPUT. GPU 10.6k SPS @128 arenas / 84 SPS
+   @1 arena vs CPU 58.5k single-thread. The kernel is single-thread-per-arena for
+   most phases -> scale arenas (thousands) and/or parallelize within phases
+   (per-pair narrowphase, per-row batches), profile with nsight. Also possible:
+   remove TEMP debug[100+/120+] diagnostics in CudaCollideWorld.cuh + bench dumps.
+   Correctness caveats for future modes (documented, not gates): demolitions
+   (proxy removal) and non-soccar game modes are not modeled on device.
    Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
    already bit-exact feeds the solver in the same kernel run; compare body snaps at
    AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
