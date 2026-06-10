@@ -116,6 +116,8 @@ void HostCompute(const Input* inputs, Output* outputs, size_t n) {
 #include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btGjkEpaPenetrationDepthSolver.h"
 #include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btVoronoiSimplexSolver.h"
 #include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btSphereShape.h"
+#include "../../RocketSim-CUDA/libsrc/bullet3-3.24/BulletCollision/CollisionDispatch/SphereTriangleDetector.h"
 
 namespace mathtest {
 
@@ -193,6 +195,38 @@ void HostGjkCompute(const GjkCase* cases, GjkOut* outs, size_t n) {
 		outs[i].normalOnB = res.has ? V3{ res.normal.x(), res.normal.y(), res.normal.z() } : V3{ 0, 0, 0 };
 		outs[i].pointOnB = res.has ? V3{ res.point.x(), res.point.y(), res.point.z() } : V3{ 0, 0, 0 };
 		outs[i].distance = res.has ? (float)res.depth : 0.0f;
+	}
+}
+
+// Sphere-vs-triangle reference via the real detector (triangle at identity, like the
+// static meshes; sphere world transform = identity basis + center)
+void HostSphereTri(const GjkCase* cases, GjkOut* outs, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		const GjkCase& c = cases[i];
+		btSphereShape sphere(c.boxHalfExtentsCtor.x); // reuse field as radius
+		btTriangleShape tri(btVector3(c.triV[0].x, c.triV[0].y, c.triV[0].z),
+			btVector3(c.triV[1].x, c.triV[1].y, c.triV[1].z),
+			btVector3(c.triV[2].x, c.triV[2].y, c.triV[2].z));
+		tri.setMargin(c.triMargin);
+		// detector threshold = manifold breaking threshold (dispatcher computes min)
+		btScalar breaking = btMin(sphere.getContactBreakingThreshold(gContactBreakingThreshold),
+			tri.getContactBreakingThreshold(gContactBreakingThreshold));
+		SphereTriangleDetector det(&sphere, &tri, breaking);
+
+		btGjkPairDetector::ClosestPointInput input;
+		input.m_transformA.setIdentity();
+		input.m_transformA.setOrigin(btVector3(c.boxOrigin.x, c.boxOrigin.y, c.boxOrigin.z));
+		input.m_transformB.setIdentity();
+
+		CollectResult res;
+		det.getClosestPoints(input, res, false);
+
+		outs[i].hasContact = res.has;
+		outs[i].normalOnB = res.has ? V3{ res.normal.x(), res.normal.y(), res.normal.z() } : V3{ 0, 0, 0 };
+		outs[i].pointOnB = res.has ? V3{ res.point.x(), res.point.y(), res.point.z() } : V3{ 0, 0, 0 };
+		outs[i].distance = res.has ? (float)res.depth : 0.0f;
+		// stash breaking threshold for the device in maxDistSq slot
+		((GjkCase*)cases)[i].maxDistSq = breaking;
 	}
 }
 

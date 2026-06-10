@@ -27,6 +27,43 @@ void HostCompute(const Input* inputs, Output* outputs, size_t n);
 void HostTrig(const uint32_t* bits, float* sinOut, float* cosOut, size_t n);
 void HostGjkDerive(GjkCase* cases, size_t n);
 void HostGjkCompute(const GjkCase* cases, GjkOut* outs, size_t n);
+void HostSphereTri(const GjkCase* cases, GjkOut* outs, size_t n);
+}
+
+// Sphere-vs-triangle device kernel: mirrors SphereTriangleDetector::getClosestPoints
+// with triangle at identity (sphereInTr = B.inverseTimes(A): identity-canon trees)
+__global__ void SphereTriKernel(const GjkCase* cases, GjkOut* outs, size_t n) {
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const GjkCase c = cases[i];
+	float radius = c.boxHalfExtentsCtor.x;
+	float breaking = c.maxDistSq; // stashed threshold
+
+	CuMat3 ident = CuIdentity3();
+	// inverseTimes(A): basis = B^T*A = identity; origin = (A.origin - B.origin) * B.basis
+	CuVec3 centerLocal = CuVecMulMat(CuVec3{ c.boxOrigin.x, c.boxOrigin.y, c.boxOrigin.z } - CuVec3{ 0, 0, 0 }, ident);
+
+	CuVec3 point, normal;
+	float depth;
+	bool has = CuSphereTriangleCollide(centerLocal, radius,
+		{ c.triV[0].x, c.triV[0].y, c.triV[0].z },
+		{ c.triV[1].x, c.triV[1].y, c.triV[1].z },
+		{ c.triV[2].x, c.triV[2].y, c.triV[2].z },
+		breaking, point, normal, depth);
+
+	outs[i].hasContact = has;
+	if (has) {
+		// swapResults=false: addContactPoint(B.basis*normal, B*point, depth)
+		CuVec3 nW = CuMat3MulVec(ident, normal);
+		CuVec3 pW = CuTransformPoint(ident, { 0, 0, 0 }, point);
+		outs[i].normalOnB = { nW.x, nW.y, nW.z };
+		outs[i].pointOnB = { pW.x, pW.y, pW.z };
+		outs[i].distance = depth;
+	} else {
+		outs[i].normalOnB = { 0, 0, 0 };
+		outs[i].pointOnB = { 0, 0, 0 };
+		outs[i].distance = 0;
+	}
 }
 
 __global__ void GjkKernel(const GjkCase* cases, GjkOut* outs, size_t n) {
@@ -340,6 +377,57 @@ int main(int argc, char** argv) {
 				devOut[firstBad].normalOnB.x, devOut[firstBad].normalOnB.y, devOut[firstBad].normalOnB.z);
 		} else {
 			printf("MATHTEST %-10s PASS (%zu samples)\n", "gjkBoxTri", gn);
+		}
+	}
+
+	// ---------- sphere-vs-triangle fuzz ----------
+	{
+		size_t gn = samples / 4;
+		std::vector<GjkCase> cases(gn);
+		Gen gg(0x5713ull);
+		for (size_t i = 0; i < gn; i++) {
+			FillGjkCase(gg, cases[i]);
+			cases[i].boxHalfExtentsCtor.x = 1.83f + gg.NextSigned() * 1.0f; // ball-ish radius
+		}
+		std::vector<GjkOut> hostOut(gn), devOut(gn);
+		HostSphereTri(cases.data(), hostOut.data(), gn); // also stashes thresholds
+
+		GjkCase* dCases;
+		GjkOut* dOuts;
+		Check(cudaMalloc(&dCases, gn * sizeof(GjkCase)), "st in");
+		Check(cudaMalloc(&dOuts, gn * sizeof(GjkOut)), "st out");
+		Check(cudaMemcpy(dCases, cases.data(), gn * sizeof(GjkCase), cudaMemcpyHostToDevice), "st up");
+		SphereTriKernel<<<(unsigned)((gn + 127) / 128), 128>>>(dCases, dOuts, gn);
+		Check(cudaGetLastError(), "st launch");
+		Check(cudaMemcpy(devOut.data(), dOuts, gn * sizeof(GjkOut), cudaMemcpyDeviceToHost), "st dl");
+		cudaFree(dCases);
+		cudaFree(dOuts);
+
+		size_t bad = 0, firstBad = (size_t)-1;
+		for (size_t i = 0; i < gn; i++) {
+			bool ok = hostOut[i].hasContact == devOut[i].hasContact;
+			if (ok && hostOut[i].hasContact) {
+				ok = FloatEq(hostOut[i].distance, devOut[i].distance) &&
+					FloatEq(hostOut[i].normalOnB.x, devOut[i].normalOnB.x) &&
+					FloatEq(hostOut[i].normalOnB.y, devOut[i].normalOnB.y) &&
+					FloatEq(hostOut[i].normalOnB.z, devOut[i].normalOnB.z) &&
+					FloatEq(hostOut[i].pointOnB.x, devOut[i].pointOnB.x) &&
+					FloatEq(hostOut[i].pointOnB.y, devOut[i].pointOnB.y) &&
+					FloatEq(hostOut[i].pointOnB.z, devOut[i].pointOnB.z);
+			}
+			if (!ok) {
+				if (bad == 0) firstBad = i;
+				bad++;
+			}
+		}
+		if (bad) {
+			failures++;
+			printf("MATHTEST %-10s FAIL (%zu/%zu differ, first at %zu: cpuHas=%d gpuHas=%d cpuD=%.9g gpuD=%.9g)\n",
+				"sphereTri", bad, gn, firstBad,
+				hostOut[firstBad].hasContact, devOut[firstBad].hasContact,
+				hostOut[firstBad].distance, devOut[firstBad].distance);
+		} else {
+			printf("MATHTEST %-10s PASS (%zu samples)\n", "sphereTri", gn);
 		}
 	}
 
