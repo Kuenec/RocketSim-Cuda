@@ -348,9 +348,15 @@ BOOST_MIN_TIME, applyCentralForce fwd*boostAccel(Ground|Air)*UU_TO_BT*CAR_MASS].
 DECODED ADDITIONS: btMatrix3x3::inverse = cofac(r1,c1,r2,c2)=m[r1][c1]*m[r2][c2]-
 m[r1][c2]*m[r2][c1]; co=(cofac(1,1,2,2),cofac(1,2,2,0),cofac(1,0,2,1)); det=row0.dot(co)
 [SSE dot3 tree]; s=1/det; elements = cofac(...)*s per btMatrix3x3.h:1093.
-Vec::Normalized() (RocketSim Vec): length=sqrtf(LengthSq incl _w: ((x*x+y*y)+z*z)+w*w
-left-assoc... VERIFY exact LengthSq tree + operator/ form in MathTypes.h); if len >
-FLT_EPSILON^2: v/length else zero.
+Vec::Normalized() (RocketSim Vec): length = sqrtf(LengthSq) with LengthSq =
+x*x+y*y+z*z+_w*_w (plain left-assoc, INCLUDES _w - different tree from bullet dot3!);
+if len > FLT_EPSILON^2: operator/(float) = element-wise DIRECT division (x/val incl _w,
+NOT reciprocal-multiply - differs from bullet operator/); else Vec() zero.
+applyCentralForce: m_totalForce += force * m_linearFactor; applyTorque: m_totalTorque
++= torque * m_angularFactor (element mul by (1,1,1) - keep).
+updateWheelTransform origin uses PREVIOUS tick's m_raycastInfo.m_suspensionLength ->
+suspensionLength is another persistent GpuWheelState field (origin is physics-dead,
+basis is what friction reads, but replicate both).
 getForwardVector = basis COLUMN 1 (indexForward=1); getUpVector = COLUMN 2.
 STILL TO DECODE: getEulerYPR/getEulerZYX (autoflip needs roll: ATAN2F+ASINF exact ports
 needed - bounded domain, fuzz-verify; only on autoflip trigger path),
