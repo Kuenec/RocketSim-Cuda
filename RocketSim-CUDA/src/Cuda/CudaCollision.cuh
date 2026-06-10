@@ -2206,11 +2206,7 @@ __device__ inline void CuConvexVsMesh(
 #define CU_MAX_EDGE_ANGLE_THRESHOLD 6.283185307179586232f // SIMD_2_PI
 #define CU_CONVEX_EPSILON 0.0f
 
-struct GpuTriInfo {
-	int flags;
-	float edgeV0V1Angle, edgeV1V2Angle, edgeV2V0Angle;
-	uint8_t hasInfo; // triangle present in the CPU info map
-};
+// (GpuTriInfo lives in GpuTypes.h - host extraction needs it)
 
 // btQuaternion operator*(quat, vec) SSE tree:
 //  x = (w*vx + y*vz) - z*vy ; y = (w*vy + z*vx) - x*vz

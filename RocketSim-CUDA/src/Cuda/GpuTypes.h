@@ -285,4 +285,11 @@ struct GpuMeshBvh {
 	GpuVec3 bvhAabbMin, bvhAabbMax, bvhQuantization;
 };
 
+// Per-triangle internal-edge info (btTriangleInfo; absent entries = zero angles)
+struct GpuTriInfo {
+	int flags;
+	float edgeV0V1Angle, edgeV1V2Angle, edgeV2V0Angle;
+	uint8_t hasInfo;
+};
+
 } // namespace rscuda

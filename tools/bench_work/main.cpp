@@ -24,6 +24,7 @@
 #include "DataStream/DataStreamOut.h"
 #include "Profiling.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btStridingMeshInterface.h"
+#include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btTriangleInfoMap.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btRSBroadphase.h"
 
 #ifdef RS_CUDA
@@ -527,6 +528,79 @@ static void ExtractWorldGeo(Arena* arena,
 	}
 }
 
+// Extract per-mesh BVH arrays + internal-edge triangle info for upload. Mesh order and
+// triangle indexing match ExtractWorldGeo (creation order), so triInfos for mesh i live
+// at [meshes[i].triStart, +triCount). Absent info-map entries get hasInfo=0: the CPU
+// adjustInternalEdgeContacts returns immediately when find() misses, so the device must
+// skip those triangles too.
+static void ExtractMeshBvhs(Arena* arena,
+	std::vector<rscuda::GpuMeshBvh>& bvhs,
+	std::vector<rscuda::GpuBvhNode>& nodes,
+	std::vector<rscuda::GpuBvhSubtree>& subtrees,
+	std::vector<rscuda::GpuTriInfo>& triInfos,
+	std::vector<float>& margins) {
+	for (btRigidBody* rb : arena->_worldCollisionRBs) {
+		btCollisionShape* shape = rb->getCollisionShape();
+		if (shape->getShapeType() != TRIANGLE_MESH_SHAPE_PROXYTYPE)
+			continue;
+		auto* meshShape = (btBvhTriangleMeshShape*)shape;
+		btOptimizedBvh* bvh = meshShape->getOptimizedBvh();
+
+		rscuda::GpuMeshBvh mb;
+		mb.nodeStart = (int)nodes.size();
+		mb.subtreeStart = (int)subtrees.size();
+		mb.bvhAabbMin = ToGpuB(bvh->getBvhAabbMin());
+		mb.bvhAabbMax = ToGpuB(bvh->getBvhAabbMax());
+		mb.bvhQuantization = ToGpuB(bvh->getBvhQuantization());
+
+		const QuantizedNodeArray& na = bvh->getQuantizedNodeArray();
+		for (int i = 0; i < na.size(); i++) {
+			rscuda::GpuBvhNode n;
+			for (int c = 0; c < 3; c++) {
+				n.qmin[c] = na[i].m_quantizedAabbMin[c];
+				n.qmax[c] = na[i].m_quantizedAabbMax[c];
+			}
+			n.escapeIndexOrTriangleIndex = na[i].m_escapeIndexOrTriangleIndex;
+			nodes.push_back(n);
+		}
+		const BvhSubtreeInfoArray& sa = bvh->getSubtreeInfoArray();
+		mb.numSubtrees = sa.size();
+		for (int i = 0; i < sa.size(); i++) {
+			rscuda::GpuBvhSubtree s;
+			for (int c = 0; c < 3; c++) {
+				s.qmin[c] = sa[i].m_quantizedAabbMin[c];
+				s.qmax[c] = sa[i].m_quantizedAabbMax[c];
+			}
+			s.rootNodeIndex = sa[i].m_rootNodeIndex;
+			s.subtreeSize = sa[i].m_subtreeSize;
+			subtrees.push_back(s);
+		}
+		bvhs.push_back(mb);
+		margins.push_back(meshShape->getMargin());
+
+		const unsigned char* vertBase;
+		int numVerts, vertStride;
+		const unsigned char* idxBase;
+		int idxStride, numFaces;
+		meshShape->getMeshInterface()->getLockedReadOnlyVertexIndexBase(
+			&vertBase, numVerts, vertStride, &idxBase, idxStride, numFaces);
+		const btTriangleInfoMap* infoMap = meshShape->getTriangleInfoMap();
+		for (int f = 0; f < numFaces; f++) {
+			rscuda::GpuTriInfo ti = {};
+			// btGetHash(partId=0, triIdx) = (0 << 21) | triIdx = triIdx
+			const btTriangleInfo* info = infoMap ? infoMap->find(f) : nullptr;
+			if (info) {
+				ti.hasInfo = 1;
+				ti.flags = info->m_flags;
+				ti.edgeV0V1Angle = info->m_edgeV0V1Angle;
+				ti.edgeV1V2Angle = info->m_edgeV1V2Angle;
+				ti.edgeV2V0Angle = info->m_edgeV2V0Angle;
+			}
+			triInfos.push_back(ti);
+		}
+	}
+}
+
 // ---- static-world raycast validation (--ray-fuzz N) ----
 // Random rays through the arena volume; CPU bullet rayTest (filtered to statics) vs
 // the device CuRayTestStatic, bitwise.
@@ -854,6 +928,17 @@ static int RunGpuCompare(const Args& args) {
 		rscuda::UploadWorldGeo(batch, planes.data(), (int)planes.size(),
 			meshes.data(), (int)meshes.size(), tris.data(), (int)(tris.size() / 3));
 		rscuda::UploadCarConsts(batch, ExtractCarConsts(arena, slots[0].car));
+
+		std::vector<rscuda::GpuMeshBvh> bvhs;
+		std::vector<rscuda::GpuBvhNode> bvhNodes;
+		std::vector<rscuda::GpuBvhSubtree> bvhSubtrees;
+		std::vector<rscuda::GpuTriInfo> triInfos;
+		std::vector<float> meshMargins;
+		ExtractMeshBvhs(arena, bvhs, bvhNodes, bvhSubtrees, triInfos, meshMargins);
+		rscuda::UploadMeshBvhs(batch, bvhs.data(), (int)bvhs.size(),
+			bvhNodes.data(), (int)bvhNodes.size(),
+			bvhSubtrees.data(), (int)bvhSubtrees.size(),
+			triInfos.data(), (int)triInfos.size(), meshMargins.data());
 	}
 	rscuda::GpuGridParams grid = {};
 	{

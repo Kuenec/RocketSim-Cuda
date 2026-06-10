@@ -72,6 +72,13 @@ struct GpuBatch {
 	GpuWorldGeo geo; // holds device pointers
 
 	GpuCarConsts* dCarConsts; // per-car-slot constants (uploaded once)
+
+	// mesh BVHs + internal-edge data (uploaded once)
+	GpuMeshBvh* dMeshBvhs;
+	GpuBvhNode* dBvhNodes;
+	GpuBvhSubtree* dBvhSubtrees;
+	GpuTriInfo* dTriInfos;
+	float* dMeshMargins;
 };
 
 // Capture this CPU's RSQRTSS into the device emulation table; verify the emulation
@@ -122,7 +129,30 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dMeshes);
 	cudaFree(b->dTris);
 	cudaFree(b->dCarConsts);
+	cudaFree(b->dMeshBvhs);
+	cudaFree(b->dBvhNodes);
+	cudaFree(b->dBvhSubtrees);
+	cudaFree(b->dTriInfos);
+	cudaFree(b->dMeshMargins);
 	delete b;
+}
+
+void UploadMeshBvhs(GpuBatch* b,
+	const GpuMeshBvh* bvhs, int numMeshes,
+	const GpuBvhNode* nodes, int numNodes,
+	const GpuBvhSubtree* subtrees, int numSubtrees,
+	const GpuTriInfo* triInfos, int numTris,
+	const float* meshMargins) {
+	CudaCheck(cudaMalloc(&b->dMeshBvhs, sizeof(GpuMeshBvh) * numMeshes), "alloc bvhs");
+	CudaCheck(cudaMalloc(&b->dBvhNodes, sizeof(GpuBvhNode) * numNodes), "alloc bvh nodes");
+	CudaCheck(cudaMalloc(&b->dBvhSubtrees, sizeof(GpuBvhSubtree) * numSubtrees), "alloc bvh subtrees");
+	CudaCheck(cudaMalloc(&b->dTriInfos, sizeof(GpuTriInfo) * numTris), "alloc tri infos");
+	CudaCheck(cudaMalloc(&b->dMeshMargins, sizeof(float) * numMeshes), "alloc mesh margins");
+	CudaCheck(cudaMemcpy(b->dMeshBvhs, bvhs, sizeof(GpuMeshBvh) * numMeshes, cudaMemcpyHostToDevice), "up bvhs");
+	CudaCheck(cudaMemcpy(b->dBvhNodes, nodes, sizeof(GpuBvhNode) * numNodes, cudaMemcpyHostToDevice), "up bvh nodes");
+	CudaCheck(cudaMemcpy(b->dBvhSubtrees, subtrees, sizeof(GpuBvhSubtree) * numSubtrees, cudaMemcpyHostToDevice), "up bvh subtrees");
+	CudaCheck(cudaMemcpy(b->dTriInfos, triInfos, sizeof(GpuTriInfo) * numTris, cudaMemcpyHostToDevice), "up tri infos");
+	CudaCheck(cudaMemcpy(b->dMeshMargins, meshMargins, sizeof(float) * numMeshes, cudaMemcpyHostToDevice), "up mesh margins");
 }
 
 void UploadCarConsts(GpuBatch* b, const GpuCarConsts& consts) {

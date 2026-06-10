@@ -41,6 +41,16 @@ void RunCarPreTickOnce(GpuBatch* batch, const GpuCarTickState& in,
 	const GpuGridParams& grid, float tickTime,
 	GpuCarTickState& out, GpuWheelScratchOut wheelsOut[4]);
 
+// Mesh BVHs + triangle infos (internal-edge data), uploaded once. Arrays are shared
+// across meshes; per-mesh views via GpuMeshBvh (nodeStart/subtreeStart) and triInfo
+// indexed by (meshIdx triStart + triangleIndex).
+void UploadMeshBvhs(GpuBatch* batch,
+	const GpuMeshBvh* bvhs, int numMeshes,
+	const GpuBvhNode* nodes, int numNodes,
+	const GpuBvhSubtree* subtrees, int numSubtrees,
+	const GpuTriInfo* triInfos, int numTris,
+	const float* meshMargins);
+
 // Diagnostic: closest-hit static-world raycast for ray-fuzz validation vs CPU rayTest.
 struct GpuRayFuzzResult {
 	int hitKind;       // -1 = none, 0 = static
