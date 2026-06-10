@@ -70,12 +70,16 @@ struct GpuBallHitInfo {
 	uint64_t tickCountWhenExtraImpulseApplied;
 };
 
-// Persistent per-wheel state (refined during the vehicle-dynamics port)
+// Persistent per-wheel state: fields written in tick N and read in tick N+1
+// (calcFrictionImpulses runs BEFORE _UpdateWheels within a tick, so it consumes the
+// previous tick's engine/brake/steer/friction values; updateWheelTransform's origin
+// uses the previous tick's suspensionLength)
 struct GpuWheelState {
-	float rotation;
-	float deltaRotation;
 	float steerAngle;
-	uint8_t hasContact;
+	float engineForce;
+	float brake;
+	float latFriction, longFriction;
+	float suspensionLength;
 };
 
 // Mirror of RocketSim CarState game fields + car-internal persistent extras
@@ -117,6 +121,78 @@ struct GpuPadState {
 	float cooldown;
 	uint32_t prevLockedCarID;
 	int32_t lockedCarIdx;           // -1 = none (mirrors BoostPadState::curLockedCar)
+};
+
+// LinearPieceCurve mirror (std::map iterates sorted -> arrays in same order)
+constexpr int GPU_CURVE_MAX = 12;
+struct GpuCurve {
+	float xs[GPU_CURVE_MAX];
+	float ys[GPU_CURVE_MAX];
+	int n;
+};
+
+struct GpuWheelConsts {
+	GpuVec3 connectionPointCS;   // chassis connection (BT units, post addWheel)
+	float suspensionRestLength;  // btWheelInfo m_suspensionRestLength1
+	float wheelRadius;
+	float maxSuspensionTravelCm;
+	float suspensionStiffness;
+	float dampingCompression, dampingRelaxation;
+	float suspensionForceScale;
+};
+
+// Everything constant the car pre-tick phase needs, extracted host-side from the live
+// arena/car/RLConst so no transcription can drift. Products that the CPU compiler
+// constant-folds (parenthesized const subexpressions) are extracted pre-folded; chained
+// multiplies stay raw and the device encodes the same trees.
+struct GpuCarConsts {
+	GpuWheelConsts wheels[4];
+	GpuVec3 wheelDirectionCS, wheelAxleCS;
+	float massBT;
+	float frictionScale;          // chassis getMass()/3, host-evaluated
+	float dodgeDeadzone;
+	int rayCastGroup;             // DefaultFilter | vehicle raycaster addedFilterMask
+	float erp;                    // solverInfo.m_erp (extraPushback)
+	float uuToBT, btToUU;
+
+	// mutator config
+	float jumpAccel, jumpImmediateForce;
+	float boostAccelGround, boostAccelAir, boostUsedPerSecond;
+	uint8_t rechargeBoostEnabled;
+	float rechargeBoostDelay, rechargeBoostPerSecond;
+	uint8_t unlimitedFlips, unlimitedDoubleJumps;
+
+	// RLConst scalars (raw)
+	float powerslideRiseRate, powerslideFallRate;
+	float throttleDeadzone, stoppingForwardVel, coastingBrakeFactor, brakingNoThrottleSpeedThresh;
+	float throttleAirAccel;
+	float jumpMinTime, jumpMaxTime, jumpResetTimePad, doublejumpMaxDelay;
+	float flipZDamp120, flipZDampStart, flipZDampEnd, flipTorqueTime, flipPitchlockExtraTime;
+	float flipInitialVelScale, flipTorqueX, flipTorqueY;
+	float flipForwardImpulseMaxSpeedScale, flipSideImpulseMaxSpeedScale;
+	float flipBackwardImpulseMaxSpeedScale, flipBackwardImpulseScaleX;
+	float carTorqueScale;
+	GpuVec3 carAirControlTorque, carAirControlDamping;
+	float carAutoflipImpulse, carAutoflipTorque, carAutoflipTime;
+	float carAutoflipNormZThresh, carAutoflipRollThresh;
+	float carAutorollForce, carAutorollTorque;
+	float boostMinTime, boostMax;
+	float carMaxSpeed;
+	float suspensionSubtraction; // RLConst::BTVehicle::SUSPENSION_SUBTRACTION
+
+	// pre-folded constant subexpressions (host-evaluated with identical expressions)
+	float throttleTorqueBT;       // THROTTLE_TORQUE_AMOUNT * UU_TO_BT
+	float brakeTorqueBT;          // BRAKE_TORQUE_AMOUNT * UU_TO_BT
+	float gravityZBT;             // GRAVITY_Z * UU_TO_BT
+	float flipZDampFactor;        // powf(1 - FLIP_Z_DAMP_120, tickTimeScale=1)
+
+	// curves (4-wheel variants; gates use octane)
+	GpuCurve driveSpeedTorqueFactor;
+	GpuCurve steerAngleFromSpeed;
+	GpuCurve powerslideSteerAngleFromSpeed;
+	GpuCurve nonStickyFrictionFactor;
+	GpuCurve latFriction, longFriction;
+	GpuCurve handbrakeLatFrictionFactor, handbrakeLongFrictionFactor;
 };
 
 // Dynamic ray-candidate body (ball sphere / car compound box) - shape descriptor plus
