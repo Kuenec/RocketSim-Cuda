@@ -399,10 +399,287 @@ __device__ __forceinline__ CuVec3 CuVecNormalizedRS(CuVec3 v) {
 
 __device__ __forceinline__ float CuSgn(float v) { return (float)((v > 0) - (v < 0)); }
 
-// glibc atan2f/asinf stand-ins for the autoflip path: double-rounded; mismatch rate
-// vs host glibc measured by cuda_math_test (replace with exact ports if nonzero).
-__device__ __forceinline__ float CuAtan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
-__device__ __forceinline__ float CuAsinf(float x) { return (float)asin((double)x); }
+// 2026-06-10: glibc 2.4x atan2f/asinf, ported verbatim from the CORE-MATH-derived
+// glibc sources (sysdeps/ieee754/flt-32/e_atan2f.c rev 9b28a4a, e_asinf.c +
+// s_asincosf_data.c rev bc385c2). These are correctly rounded; every operation
+// used (double +,-,*,/, fma, sqrt, casts) is IEEE-exact on the device, so the
+// results are bit-identical to the host CRT. (The earlier (float)atan2(double)
+// stand-in lost 1 ulp occasionally: CUDA's double atan2 is not correctly
+// rounded - caught by gpu-compare seed 7777 tick 4546 autoFlipTimer.)
+
+__device__ __forceinline__ double CuMulDD(double xh, double xl, double ch, double cl, double* l) {
+	double ahlh = ch * xl;
+	double alhh = cl * xh;
+	double ahhh = ch * xh;
+	double ahhl = fma(ch, xh, -ahhh);
+	ahhl += alhh + ahlh;
+	ch = ahhh + ahhl;
+	*l = (ahhh - ch) + ahhl;
+	return ch;
+}
+
+static __device__ const double g_atan2fC[32][2] = {
+	{  0x1p+0,                -0x1.8c1dac5492248p-87 },
+	{ -0x1.5555555555555p-2,  -0x1.55553bf3a2abep-56 },
+	{  0x1.999999999999ap-3,  -0x1.99deed1ec9071p-57 },
+	{ -0x1.2492492492492p-3,  -0x1.fd99c8d18269ap-58 },
+	{  0x1.c71c71c71c717p-4,  -0x1.651eee4c4d9dp-61 },
+	{ -0x1.745d1745d1649p-4,  -0x1.632683d6c44a6p-58 },
+	{  0x1.3b13b13b11c63p-4,   0x1.bf69c1f8af41dp-58 },
+	{ -0x1.11111110e6338p-4,   0x1.3c3e431e8bb68p-61 },
+	{  0x1.e1e1e1dc45c4ap-5,  -0x1.be2db05c77bbfp-59 },
+	{ -0x1.af286b8164b4fp-5,   0x1.a4673491f0942p-61 },
+	{  0x1.86185e9ad4846p-5,   0x1.e12e32d79fceep-59 },
+	{ -0x1.642c6d5161faep-5,   0x1.3ce76c1ca03fp-59 },
+	{  0x1.47ad6f277e5bfp-5,  -0x1.abd8d85bdb714p-60 },
+	{ -0x1.2f64a2ee8896dp-5,   0x1.ef87d4b615323p-61 },
+	{  0x1.1a6a2b31741b5p-5,   0x1.a5d9d973547eep-62 },
+	{ -0x1.07fbdad65e0a6p-5,  -0x1.65ac07f5d35f4p-61 },
+	{  0x1.ee9932a9a5f8bp-6,   0x1.f8b9623f6f55ap-61 },
+	{ -0x1.ce8b5b9584dc6p-6,   0x1.fe5af96e8ea2dp-61 },
+	{  0x1.ac9cb288087b7p-6,  -0x1.450cdfceaf5cap-60 },
+	{ -0x1.84b025351f3e6p-6,   0x1.579561b0d73dap-61 },
+	{  0x1.52f5b8ecdd52bp-6,   0x1.036bd2c6fba47p-60 },
+	{ -0x1.163a8c44909dcp-6,   0x1.18f735ffb9f16p-60 },
+	{  0x1.a400dce3eea6fp-7,  -0x1.c90569c0c1b5cp-61 },
+	{ -0x1.1caa78ae6db3ap-7,  -0x1.4c60f8161ea09p-61 },
+	{  0x1.52672453c0731p-8,   0x1.834efb598c338p-62 },
+	{ -0x1.5850c5be137cfp-9,  -0x1.445fc150ca7f5p-63 },
+	{  0x1.23eb98d22e1cap-10, -0x1.388fbaf1d783p-64 },
+	{ -0x1.8f4e974a40741p-12,  0x1.271198a97da34p-66 },
+	{  0x1.a5cf2e9cf76e5p-14, -0x1.887eb4a63b665p-68 },
+	{ -0x1.420c270719e32p-16,  0x1.efd595b27888bp-71 },
+	{  0x1.3ba2d69b51677p-19, -0x1.4fb06829cdfc7p-73 },
+	{ -0x1.29b7e6f676385p-23, -0x1.a783b6de718fbp-77 }
+};
+
+__device__ inline double CuPolyDD(double xh, double xl, int n, const double c[][2], double* l) {
+	int i = n - 1;
+	double ch = c[i][0];
+	double cl = c[i][1];
+	while (--i >= 0) {
+		ch = CuMulDD(xh, xl, ch, cl, &cl);
+		double th = ch + c[i][0];
+		double tl = (c[i][0] - th) + ch;
+		ch = th;
+		cl += tl + c[i][1];
+	}
+	*l = cl;
+	return ch;
+}
+
+__device__ inline float CuAtan2fTiny(float y, float x) {
+	double dy = y, dx = x;
+	double z = dy / dx;
+	double e = fma(-z, (double)x, (double)y);
+	const double c = -0x1.5555555555555p-2;
+	double zz = z * z;
+	double cz = c * z;
+	e = e / x + cz * zz;
+	uint64_t t = (uint64_t)__double_as_longlong(z);
+	if ((t & 0xfffffffull) == 0) {
+		if (z * e > 0) t += 1;
+		else t -= 1;
+	}
+	return (float)__longlong_as_double((long long)t);
+}
+
+__device__ inline float CuAtan2f(float y, float x) {
+	const double cn[] = {
+		0x1p+0,               0x1.40e0698f94c35p+1, 0x1.248c5da347f0dp+1,
+		0x1.d873386572976p-1, 0x1.46fa40b20f1dp-3,  0x1.33f5e041eed0fp-7,
+		0x1.546bbf28667c5p-14
+	};
+	const double cd[] = {
+		0x1p+0,               0x1.6b8b143a3f6dap+1, 0x1.8421201d18ed5p+1,
+		0x1.8221d086914ebp+0, 0x1.670657e3a07bap-2, 0x1.0f4951fd1e72dp-5,
+		0x1.b3874b8798286p-11
+	};
+	const double m[] = { 0, 1 };
+	const double pi = 0x1.921fb54442d18p+1;
+	const double pi2 = 0x1.921fb54442d18p+0;
+	const double pi2l = 0x1.1a62633145c07p-54;
+	const double off[] = { 0.0, pi2, pi, pi2, -0.0, -pi2, -pi, -pi2 };
+	const double offl[] = { 0.0, pi2l, 2 * pi2l, pi2l, -0.0, -pi2l, -2 * pi2l, -pi2l };
+	const double sgn[] = { 1, -1 };
+	uint32_t ux = __float_as_uint(x);
+	uint32_t uy = __float_as_uint(y);
+	uint32_t ax = ux & (~0u >> 1);
+	uint32_t ay = uy & (~0u >> 1);
+	if (ay >= (0xffu << 23) || ax >= (0xffu << 23)) {
+		if (ay > (0xffu << 23)) return x + y;
+		if (ax > (0xffu << 23)) return x + y;
+		bool yinf = ay == (0xffu << 23);
+		bool xinf = ax == (0xffu << 23);
+		if (yinf & xinf) {
+			if (ux >> 31) return 0x1.2d97c7f3321d2p+1 * sgn[uy >> 31];
+			else return 0x1.921fb54442d18p-1 * sgn[uy >> 31];
+		}
+		if (xinf) {
+			if (ux >> 31) return pi * sgn[uy >> 31];
+			else return 0.0f * sgn[uy >> 31];
+		}
+		if (yinf) return pi2 * sgn[uy >> 31];
+	}
+	if (ay == 0) {
+		if (!ax) {
+			uint32_t i0 = (uy >> 31) * 4 + (ux >> 31) * 2;
+			if (ux >> 31) return off[i0] + offl[i0];
+			else return off[i0];
+		}
+		if (!(ux >> 31)) return 0.0f * sgn[uy >> 31];
+	}
+	uint32_t gt = ay > ax;
+	uint32_t i = (uy >> 31) * 4 + (ux >> 31) * 2 + gt;
+
+	double zx = x;
+	double zy = y;
+	double z = (m[gt] * zx + m[1 - gt] * zy) / (m[gt] * zy + m[1 - gt] * zx);
+	double r;
+	int d = (int)ax - (int)ay;
+	if (d < (27 << 23) && d > (-(27 << 23))) {
+		double z2 = z * z, z4 = z2 * z2, z8 = z4 * z4;
+		double cn0 = cn[0] + z2 * cn[1];
+		double cn2 = cn[2] + z2 * cn[3];
+		double cn4 = cn[4] + z2 * cn[5];
+		double cn6 = cn[6];
+		cn0 += z4 * cn2;
+		cn4 += z4 * cn6;
+		cn0 += z8 * cn4;
+		double cd0 = cd[0] + z2 * cd[1];
+		double cd2 = cd[2] + z2 * cd[3];
+		double cd4 = cd[4] + z2 * cd[5];
+		double cd6 = cd[6];
+		cd0 += z4 * cd2;
+		cd4 += z4 * cd6;
+		cd0 += z8 * cd4;
+		r = cn0 / cd0;
+	} else
+		r = 1;
+	z *= sgn[gt];
+	r = z * r + off[i];
+	if ((((uint64_t)__double_as_longlong(r) + 8) & 0xfffffffull) <= 16) {
+		if (ay < ax && ((ax - ay) >> 23 >= 25))
+			return CuAtan2fTiny(y, x);
+		double zh, zl;
+		if (gt == 0) {
+			zh = zy / zx;
+			zl = fma(zh, -zx, zy) / zx;
+		} else {
+			zh = zx / zy;
+			zl = fma(zh, -zy, zx) / zy;
+		}
+		double z2l;
+		double z2h = CuMulDD(zh, zl, zh, zl, &z2l);
+		double pl;
+		double ph = CuPolyDD(z2h, z2l, 32, g_atan2fC, &pl);
+		zh *= sgn[gt];
+		zl *= sgn[gt];
+		ph = CuMulDD(zh, zl, ph, pl, &pl);
+		double sh = ph + off[i];
+		double sl = ((off[i] - sh) + ph) + pl + offl[i];
+		float rf = (float)sh;
+		double th = rf;
+		double dh = sh - th;
+		double tm = dh + sl;
+		uint64_t tth = (uint64_t)__double_as_longlong(th);
+		if (th + th * 0x1p-60 == th - th * 0x1p-60) {
+			tth &= 0x7ffull << 52;
+			tth -= 24ull << 52;
+			if (fabs(tm) > __longlong_as_double((long long)tth))
+				tm *= 1.25;
+			else
+				tm *= 0.75;
+		}
+		r = th + tm;
+	}
+	return (float)r;
+}
+
+static __device__ const double g_asinfC0[] = {
+	0x1.555555555529cp-3,  0x1.333333337e0ddp-4, 0x1.6db6db3b4465ep-5,
+	0x1.f1c72e13ac306p-6,  0x1.6e89cebe06bc4p-6, 0x1.1c6dcf5289094p-6,
+	0x1.c6dbbcc7c6315p-7,  0x1.8f8dc2615e996p-7, 0x1.a5833b7bf15e8p-8,
+	0x1.43f44ace1665cp-6, -0x1.0fb17df881c73p-6, 0x1.07520c026b2d6p-5
+};
+static __device__ const double g_asinfC1[] = {
+	0x1.6a09e667f3bcbp+0,   0x1.e2b7dddff2db9p-4,  0x1.b27247ab42dbcp-6,
+	0x1.02995cc4e0744p-7,   0x1.5ffb0276ec8eap-9,  0x1.033885a928decp-10,
+	0x1.911f2be23f8c7p-12,  0x1.4c3c55d2437fdp-13, 0x1.af477e1d7b461p-15,
+	0x1.abd6bdff67dcbp-15, -0x1.1717e86d0fa28p-16, 0x1.6ff526de46023p-16
+};
+
+__device__ inline double CuAsinfPoly12(double z, const double* c) {
+	double z2 = z * z;
+	double z4 = z2 * z2;
+	double c0 = c[0] + z * c[1];
+	double c2 = c[2] + z * c[3];
+	double c4 = c[4] + z * c[5];
+	double c6 = c[6] + z * c[7];
+	double c8 = c[8] + z * c[9];
+	double c10 = c[10] + z * c[11];
+	c0 += c2 * z2;
+	c4 += c6 * z2;
+	c8 += z2 * c10;
+	c0 += z4 * (c4 + z4 * c8);
+	return c0;
+}
+
+__device__ inline float CuAsinf(float x) {
+	const double pi2 = 0x1.921fb54442d18p+0;
+	double xs = x;
+	double r;
+	uint32_t ax = __float_as_uint(x) << 1;
+	if (ax > (0x7fu << 24)) {
+		// as_special: nan in, nan out; |x|>1 -> invalid (nan)
+		if (ax > (0xffu << 24))
+			return x + x;
+		return __int_as_float(0x7fc00000) + 0.0f; // qnan (errno path not modeled)
+	}
+	if (ax < 0x7ec29000u) {
+		if (ax < (115u << 24))
+			return fmaf(x, 0x1p-25f, x);
+		const double b[] = {
+			 0x1.0000000000005p+0,  0x1.55557aeca105dp-3,  0x1.3314ec3db7d12p-4,
+			 0x1.775738a5a6f92p-5,  0x1.5d5f7ce1c8538p-8,  0x1.605c6d58740fp-2,
+			-0x1.5728b732d73c6p+1,  0x1.f152170f151ebp+3, -0x1.f962ea3ca992ep+5,
+			 0x1.71971e17375ap+7,  -0x1.860512b4ba23p+8,   0x1.26a3b8d4bdb14p+9,
+			-0x1.36f2ea5698b51p+9,  0x1.b3d722aebfa2ep+8, -0x1.6cf89703b1289p+7,
+			 0x1.1518af6a65e2dp+5
+		};
+		double z = xs;
+		double z2 = z * z;
+		double z4 = z2 * z2;
+		double z8 = z4 * z4;
+		double z16 = z8 * z8;
+		r = z * ((((b[0] + z2 * b[1]) + z4 * (b[2] + z2 * b[3]))
+			+ z8 * ((b[4] + z2 * b[5]) + z4 * (b[6] + z2 * b[7])))
+			+ z16 * (((b[8] + z2 * b[9]) + z4 * (b[10] + z2 * b[11]))
+				+ z8 * ((b[12] + z2 * b[13])
+					+ z4 * (b[14] + z2 * b[15]))));
+		float ub = (float)r;
+		float lb = (float)(r - z * 0x1.efa8ebp-31);
+		if (ub == lb)
+			return ub;
+	}
+	if (ax < (0x7eu << 24)) {
+		double z = xs;
+		double z2 = z * z;
+		double c0 = CuAsinfPoly12(z2, g_asinfC0);
+		r = z + (z * z2) * c0;
+	} else {
+		if (ax == 0x7e55688au)
+			return copysignf(0x1.75b8a2p-1f, x) + copysignf(0x1p-26f, x);
+		if (ax == 0x7e107434u)
+			return copysignf(0x1.1f4b64p-1f, x) + copysignf(0x1p-26f, x);
+		double bx = fabs(xs);
+		double z = 1.0 - bx;
+		double s = sqrt(z);
+		r = pi2 - s * CuAsinfPoly12(z, g_asinfC1);
+		r = copysign(r, xs);
+	}
+	return (float)r;
+}
 
 struct CuCarTickIO {
 	// chassis body (velocities mutated by impulses; forces accumulated)
@@ -746,7 +1023,10 @@ __device__ __forceinline__ void CuCarPreTick(
 
 			float absRoll = fabsf(roll);
 			if (absRoll > cc.carAutoflipRollThresh) {
-				io.st.autoFlipTimer = cc.carAutoflipTime * (absRoll / CU_PI_F);
+				// CPU: CAR_AUTOFLIP_TIME * (absRoll / M_PI) - M_PI promotes the whole
+				// expression to DOUBLE, with a single rounding at the float store
+				io.st.autoFlipTimer = (float)((double)cc.carAutoflipTime *
+					((double)absRoll / 0x1.921fb54442d18p+1));
 				io.st.autoFlipTorqueScale = (roll > 0) ? 1.0f : -1.0f;
 				io.st.isAutoFlipping = 1;
 				CuVec3 imp = ((CuNeg(CuGetColumn(io.body.basis, 2)) * cc.carAutoflipImpulse) * cc.uuToBT) * cc.massBT;

@@ -8,6 +8,8 @@
 // Exit 0 = all ops bit-exact. Exit 1 = mismatch (details printed).
 
 #include "Cuda/CudaMath.cuh"
+#include "Cuda/CudaRaycast.cuh"
+#include "Cuda/CudaVehicle.cuh"
 #include "Cuda/CudaCollision.cuh"
 #include "Cuda/RsqrtHost.h"
 #include "../../tools/cuda_math_test/test_data.h"
@@ -150,6 +152,18 @@ __global__ void TrigKernel(const uint32_t* bits, float* sinOut, float* cosOut, s
 	memcpy(&x, &bits[i], 4);
 	sinOut[i] = CuSinf(x);
 	cosOut[i] = CuCosf(x);
+}
+
+// glibc-exact atan2f/asinf ports (CudaVehicle.cuh) vs host glibc
+__global__ void Atan2AsinKernel(const uint32_t* yBits, const uint32_t* xBits,
+	float* atanOut, float* asinOut, size_t n) {
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	float y, x;
+	memcpy(&y, &yBits[i], 4);
+	memcpy(&x, &xBits[i], 4);
+	atanOut[i] = rscuda::CuAtan2f(y, x);
+	asinOut[i] = rscuda::CuAsinf(y);
 }
 
 static void Check(cudaError_t e, const char* what) {
@@ -485,6 +499,63 @@ int main(int argc, char** argv) {
 	};
 	report("sinf", sinBad, sinFirst);
 	report("cosf", cosBad, cosFirst);
+
+	// ---------- atan2f/asinf (glibc CORE-MATH device ports vs host glibc) ----------
+	// Autoflip feeds basis components: dense [-1,1] coverage for asinf and [-1,1]^2
+	// pairs for atan2f, plus full-exponent-range pairs for robustness.
+	{
+		size_t n2 = (size_t)16 * 1000 * 1000;
+		uint32_t *dY, *dX;
+		float *dAtan, *dAsin;
+		Check(cudaMalloc(&dY, n2 * 4), "malloc y");
+		Check(cudaMalloc(&dX, n2 * 4), "malloc x");
+		Check(cudaMalloc(&dAtan, n2 * 4), "malloc atan");
+		Check(cudaMalloc(&dAsin, n2 * 4), "malloc asin");
+		std::vector<uint32_t> yB(n2), xB(n2);
+		Gen ag(0xA7A2ull);
+		for (size_t i = 0; i < n2; i++) {
+			if (i % 2 == 0) {
+				// unit-domain: random bits in [0, 1.0] with random signs
+				yB[i] = (uint32_t)(ag.Next() % 0x3F800001ull) | ((ag.Next() & 1) << 31);
+				xB[i] = (uint32_t)(ag.Next() % 0x3F800001ull) | ((ag.Next() & 1) << 31);
+			} else {
+				// arbitrary finite floats (clamp exponent below inf)
+				yB[i] = (uint32_t)ag.Next();
+				xB[i] = (uint32_t)ag.Next();
+				if ((yB[i] & 0x7F800000u) == 0x7F800000u) yB[i] &= ~0x40000000u;
+				if ((xB[i] & 0x7F800000u) == 0x7F800000u) xB[i] &= ~0x40000000u;
+			}
+		}
+		Check(cudaMemcpy(dY, yB.data(), n2 * 4, cudaMemcpyHostToDevice), "up y");
+		Check(cudaMemcpy(dX, xB.data(), n2 * 4, cudaMemcpyHostToDevice), "up x");
+		Atan2AsinKernel<<<(unsigned)((n2 + 255) / 256), 256>>>(dY, dX, dAtan, dAsin, n2);
+		Check(cudaGetLastError(), "atan2 launch");
+		std::vector<float> gAtan(n2), gAsin(n2);
+		Check(cudaMemcpy(gAtan.data(), dAtan, n2 * 4, cudaMemcpyDeviceToHost), "dl atan");
+		Check(cudaMemcpy(gAsin.data(), dAsin, n2 * 4, cudaMemcpyDeviceToHost), "dl asin");
+		size_t atanBad = 0, asinBad = 0;
+		uint64_t atanFirst = ~0ull, asinFirst = ~0ull;
+		for (size_t i = 0; i < n2; i++) {
+			float y, x;
+			memcpy(&y, &yB[i], 4);
+			memcpy(&x, &xB[i], 4);
+			if (!FloatEq(atan2f(y, x), gAtan[i])) { if (!atanBad++) atanFirst = ((uint64_t)yB[i] << 32) | xB[i]; }
+			if (!FloatEq(asinf(y), gAsin[i])) { if (!asinBad++) asinFirst = yB[i]; }
+		}
+		cudaFree(dY); cudaFree(dX); cudaFree(dAtan); cudaFree(dAsin);
+		if (atanBad) {
+			failures++;
+			printf("MATHTEST %-10s FAIL (%zu/%zu differ, first y/x bits 0x%016llX)\n",
+				"atan2f", atanBad, n2, (unsigned long long)atanFirst);
+		} else
+			printf("MATHTEST %-10s PASS (%zu values)\n", "atan2f", n2);
+		if (asinBad) {
+			failures++;
+			printf("MATHTEST %-10s FAIL (%zu/%zu differ, first input bits 0x%08X)\n",
+				"asinf", asinBad, n2, (uint32_t)asinFirst);
+		} else
+			printf("MATHTEST %-10s PASS (%zu values)\n", "asinf", n2);
+	}
 
 	if (failures) {
 		printf("MATHTEST: %d op(s) FAILED\n", failures);
