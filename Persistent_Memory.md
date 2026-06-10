@@ -561,11 +561,20 @@ verified in source 2026-06-10):**
        result for tri side (feeds internal-edge + callbacks); refreshContactPoints at
        end. ALSO btInternalEdgeUtility adjust in contact callback (triangleInfoMap
        extract host-side);
-   PORTED SO FAR (CudaCollision.cuh, builds clean): manifold mechanics (add/sort4/
-   remove/refresh, RS no-replacement), CuAddContactPoint (combine rules, plane-space
-   friction dirs, swap semantics), sphere-triangle collide, sphere-box getSphereDistance,
+   PORTED + VALIDATED (CudaCollision.cuh): manifold mechanics (add/sort4/remove/
+   refresh, RS no-replacement), CuAddContactPoint (combine rules, plane-space friction
+   dirs, swap semantics), sphere-triangle collide, sphere-box getSphereDistance,
    convex-plane collide, FULL GJK (CuGjkClosestPoints incl fix-normal aabb branch +
-   CuShapeAabb box/sphere/triangle); EPA = loud stub (compare harness will flag);
+   CuShapeAabb box/sphere/triangle), FULL EPA (btGjkEpa2 port: Cu2GJK/Cu2EPA/
+   Cu2Penetration/Cu2Distance/CuEpaPenDepth; pointer->index adaptation with initStore
+   for the 4 GJK hull verts preserving the 128-vertex capacity semantics).
+   *** MATHTEST gjkBoxTri PASS: 500k random box-vs-triangle configs (separated ->
+   deeply penetrating) BIT-EXACT vs real btGjkPairDetector+btGjkEpaPenetrationDepthSolver
+   (host ref in cuda_math_test host_ref.cpp links rocketsim_work). NOTE: EPA expand()
+   recursion needs cudaDeviceSetLimit(cudaLimitStackSize, 64KB) - set in cuda_math_test;
+   ADD TO CudaStep init for production kernels! ***
+   Sphere-tri/sphere-box/convex-plane device ports NOT yet fuzz-validated standalone
+   (validated implicitly when the manifold-compare harness lands);
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
        partId/index semantics);
    (g) manifold assembly: per-pair btPersistentManifold (4-pt cache, sortCachedPoints
