@@ -1763,6 +1763,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		rscuda::UploadDynProxies(batch, a, proxies.data(), regCounter);
 		rscuda::GpuBallGameState bs = {};
 		bs.velocityImpulseCache = ToGpu(arenas[a]->ball->_velocityImpulseCache);
+		bs.tickCountSinceUpdate = arenas[a]->ball->_internalState.tickCountSinceUpdate;
 		rscuda::UploadBallState(batch, a, bs);
 		std::vector<int> order;
 		for (Car* car : arenas[a]->_cars)
@@ -1839,7 +1840,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		rscuda::GpuBallGameState bs;
 		rscuda::DownloadBallState(batch, a, &bs);
 		arenas[a]->ball->_velocityImpulseCache = FromGpu(bs.velocityImpulseCache);
-		arenas[a]->ball->_internalState.tickCountSinceUpdate += args.ticks;
+		arenas[a]->ball->_internalState.tickCountSinceUpdate = bs.tickCountSinceUpdate;
 		arenas[a]->tickCount += args.ticks;
 	}
 

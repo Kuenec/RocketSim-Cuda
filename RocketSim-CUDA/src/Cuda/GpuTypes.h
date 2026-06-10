@@ -339,9 +339,10 @@ struct GpuManifoldOut {
 // Capacity == pair capacity (<= 1 manifold per pair, so overflow is impossible)
 #define GPU_MAX_MANIFOLDS 96
 
-// Ball game state touched by collision callbacks (soccar scope)
+// Ball game state touched by collision callbacks + finish (soccar scope)
 struct GpuBallGameState {
 	GpuVec3 velocityImpulseCache;  // Ball::_velocityImpulseCache (BT units)
+	uint64_t tickCountSinceUpdate; // BallState::tickCountSinceUpdate (finish increments)
 };
 
 // Boost pad constants (pad order = arena _boostPads order, identical all arenas)

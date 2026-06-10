@@ -97,8 +97,7 @@ __device__ __forceinline__ void CuCarFinish(GpuBodyState& b, GpuCarGameState& st
 	st.tickCountSinceUpdate++;
 }
 
-// Ball::_FinishPhysicsTick (ballState tick counter lives in GpuBallGameState? -
-// only the impulse cache is modeled; tickCountSinceUpdate not consumed by sim)
+// Ball::_FinishPhysicsTick
 __device__ __forceinline__ void CuBallFinish(GpuBodyState& b, GpuBallGameState& st,
 	const GpuTailConsts& tc) {
 	if (!CuVecIsZero(st.velocityImpulseCache)) {
@@ -107,6 +106,7 @@ __device__ __forceinline__ void CuBallFinish(GpuBodyState& b, GpuBallGameState& 
 		st.velocityImpulseCache = { 0, 0, 0 };
 	}
 	CuClampVelocities(b, tc.ballMaxSpeedBT, tc.ballMaxAngSpeed);
+	st.tickCountSinceUpdate++;
 }
 
 // BoostPad::_PreTickUpdate
