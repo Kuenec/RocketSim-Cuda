@@ -74,6 +74,10 @@ void DownloadCollideResults(GpuBatch* batch, int arenaIdx,
 	GpuManifoldOut* manifolds, int* numManifolds,
 	GpuDynProxy* proxies, GpuBallGameState* ball);
 
+// Diagnostic: the collide phase's broadphase pair list ([0]=numPairs, then h0,h1
+// per pair; handle < numStatics is a static). Buffer must hold 2*96+1 ints.
+void DownloadCollideDebug(GpuBatch* batch, int arenaIdx, int* debugOut);
+
 // Diagnostic: closest-hit static-world raycast for ray-fuzz validation vs CPU rayTest.
 struct GpuRayFuzzResult {
 	int hitKind;       // -1 = none, 0 = static

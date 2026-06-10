@@ -94,8 +94,10 @@ struct GpuBatch {
 	CuManifold* dManifolds;       // [numArenas * GPU_MAX_MANIFOLDS]
 	int* dNumManifolds;           // [numArenas]
 	GpuManifoldOut* dManifoldsOut;// [numArenas * GPU_MAX_MANIFOLDS] (download mirror)
+	int* dCollideDebug;           // [numArenas * (2*96+1)] pair-list diagnostic
 	bool hasCollideData;
 };
+#define COLLIDE_DEBUG_INTS (2 * 96 + 1)
 
 // Capture this CPU's RSQRTSS into the device emulation table; verify the emulation
 // hypothesis on host first so a different CPU fails loudly, never silently.
@@ -143,6 +145,7 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	CudaCheck(cudaMalloc(&b->dNumManifolds, sizeof(int) * numArenas), "alloc nummanifolds");
 	CudaCheck(cudaMemset(b->dNumManifolds, 0, sizeof(int) * numArenas), "zero nummanifolds");
 	CudaCheck(cudaMalloc(&b->dManifoldsOut, sizeof(GpuManifoldOut) * numArenas * GPU_MAX_MANIFOLDS), "alloc manifoldsout");
+	CudaCheck(cudaMalloc(&b->dCollideDebug, sizeof(int) * numArenas * COLLIDE_DEBUG_INTS), "alloc collidedbg");
 	return b;
 }
 
@@ -171,6 +174,7 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dManifolds);
 	cudaFree(b->dNumManifolds);
 	cudaFree(b->dManifoldsOut);
+	cudaFree(b->dCollideDebug);
 	delete b;
 }
 
@@ -237,6 +241,11 @@ void DownloadCollideResults(GpuBatch* b, int arenaIdx,
 		sizeof(GpuDynProxy) * b->bodiesPerArena, cudaMemcpyDeviceToHost), "down proxies");
 	CudaCheck(cudaMemcpy(ball, b->dBallStates + arenaIdx, sizeof(GpuBallGameState),
 		cudaMemcpyDeviceToHost), "down ball state");
+}
+
+void DownloadCollideDebug(GpuBatch* b, int arenaIdx, int* debugOut) {
+	CudaCheck(cudaMemcpy(debugOut, b->dCollideDebug + (size_t)arenaIdx * COLLIDE_DEBUG_INTS,
+		sizeof(int) * COLLIDE_DEBUG_INTS, cudaMemcpyDeviceToHost), "down collide dbg");
 }
 
 void UploadCarConsts(GpuBatch* b, const GpuCarConsts& consts) {
@@ -528,6 +537,7 @@ struct GpuCollideKernelArgs {
 	CuManifold* manifolds;           // [numArenas * GPU_MAX_MANIFOLDS]
 	int* numManifolds;               // [numArenas]
 	GpuManifoldOut* manifoldsOut;    // [numArenas * GPU_MAX_MANIFOLDS]
+	int* debug;                      // [numArenas * COLLIDE_DEBUG_INTS]
 	uint64_t tickBase;
 };
 
@@ -615,6 +625,7 @@ __global__ void GpuStepArenasKernel(
 				cin.dt = dt;
 				cin.manifolds = ca.manifolds + (size_t)arenaIdx * GPU_MAX_MANIFOLDS;
 				cin.numManifolds = ca.numManifolds + arenaIdx;
+				cin.debug = ca.debug ? ca.debug + (size_t)arenaIdx * (2 * 96 + 1) : nullptr;
 				CuCollideTick(cin);
 				EmitManifoldsOut(cin.manifolds, *cin.numManifolds,
 					ca.manifoldsOut + (size_t)arenaIdx * GPU_MAX_MANIFOLDS);
@@ -663,6 +674,7 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.manifolds = b->dManifolds;
 		ca.numManifolds = b->dNumManifolds;
 		ca.manifoldsOut = b->dManifoldsOut;
+		ca.debug = b->dCollideDebug;
 		ca.tickBase = b->tickCount;
 	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(

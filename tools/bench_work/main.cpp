@@ -26,6 +26,7 @@
 #include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btStridingMeshInterface.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btTriangleInfoMap.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btRSBroadphase.h"
+#include "../libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
 
 #ifdef RS_CUDA
 #include "Cuda/CudaStep.h"
@@ -605,6 +606,131 @@ static void ExtractMeshBvhs(Arena* arena,
 	}
 }
 
+// Extract collision-orchestration data: collide consts, static object table in
+// broadphase handle order, per-cell static CSR lists, and the initial dyn proxy
+// state. Mesh/plane shapeIdx match ExtractWorldGeo order (both creation order).
+static rscuda::GpuCurve ExtractCurve(const LinearPieceCurve& c); // defined below
+
+static void ExtractCollideData(Arena* arena, const std::vector<CarSlot>& slots,
+	rscuda::GpuCollideConsts& cc,
+	std::vector<rscuda::GpuStaticObj>& statics,
+	std::vector<int>& cellStart, std::vector<int>& cellList,
+	std::vector<rscuda::GpuDynProxy>& proxies, int& regCounter) {
+	using namespace RLConst;
+	auto* bp = (btRSBroadphase*)arena->_bulletWorldParams.broadphase;
+
+	// static table (handle order) + handle -> static index map
+	std::vector<int> staticIdxOfHandle(bp->m_LastHandleIndex + 1, -1);
+	int meshCount = 0, planeCount = 0;
+	for (int h = 0; h <= bp->m_LastHandleIndex; h++) {
+		btRSBroadphaseProxy* p = &bp->m_pHandles[h];
+		if (!p->m_clientObject || !p->isStatic)
+			continue;
+		auto* obj = (btCollisionObject*)p->m_clientObject;
+		rscuda::GpuStaticObj so = {};
+		if (p->shapeType == TRIANGLE_MESH_SHAPE_PROXYTYPE) {
+			so.kind = 0;
+			so.shapeIdx = meshCount++;
+		} else {
+			so.kind = 1;
+			so.shapeIdx = planeCount++;
+		}
+		so.aabbMin = ToGpuB(p->m_aabbMin);
+		so.aabbMax = ToGpuB(p->m_aabbMax);
+		{
+			btVector3 smn, smx;
+			obj->getCollisionShape()->getAabb(obj->getWorldTransform(), smn, smx);
+			so.shapeAabbMin = ToGpuB(smn);
+			so.shapeAabbMax = ToGpuB(smx);
+		}
+		so.group = p->m_collisionFilterGroup;
+		so.mask = p->m_collisionFilterMask;
+		so.friction = obj->getFriction();
+		so.restitution = obj->getRestitution();
+		so.breakingThreshold = obj->getCollisionShape()->getContactBreakingThreshold(gContactBreakingThreshold);
+		staticIdxOfHandle[h] = (int)statics.size();
+		statics.push_back(so);
+	}
+
+	// per-cell static lists (CSR), preserving CPU smear insertion order
+	cellStart.resize(bp->totalCells + 1);
+	int total = 0;
+	for (int c = 0; c < bp->totalCells; c++) {
+		cellStart[c] = total;
+		total += (int)bp->cells[c].staticHandles.size();
+	}
+	cellStart[bp->totalCells] = total;
+	cellList.reserve(total);
+	for (int c = 0; c < bp->totalCells; c++)
+		for (auto* sh : bp->cells[c].staticHandles)
+			cellList.push_back(staticIdxOfHandle[(int)(sh - bp->m_pHandles)]);
+
+	// initial dyn proxy state (creation order: ball, cars). regSeq = creation order.
+	regCounter = 0;
+	auto addProxy = [&](btRigidBody* rb) {
+		auto* p = (btRSBroadphaseProxy*)rb->getBroadphaseProxy();
+		rscuda::GpuDynProxy dp = {};
+		dp.aabbMin = ToGpuB(p->m_aabbMin);
+		dp.aabbMax = ToGpuB(p->m_aabbMax);
+		dp.cellIdx = p->cellIdx;
+		dp.i = p->iIdx;
+		dp.j = p->jIdx;
+		dp.k = p->kIdx;
+		dp.regSeq = ++regCounter;
+		proxies.push_back(dp);
+	};
+	addProxy(&arena->ball->_rigidBody);
+	for (const CarSlot& slot : slots)
+		addProxy(&slot.car->_rigidBody);
+
+	// collide consts
+	cc = {};
+	Car* car = slots[0].car;
+	const btCompoundShape& comp = car->_compoundShape;
+	cc.carLocalAabbMin = ToGpuB(comp.getLocalAabbMin());
+	cc.carLocalAabbMax = ToGpuB(comp.getLocalAabbMax());
+	cc.carCompoundMargin = comp.getMargin();
+	auto* ballShape = (btSphereShape*)arena->ball->_rigidBody.getCollisionShape();
+	cc.ballRadius = ballShape->getRadius();
+	const btBoxShape& box = car->_childHitboxShape;
+	cc.carBoxHalfExtNoMargin = ToGpuB(box.getHalfExtentsWithoutMargin());
+	cc.carBoxMargin = box.getMargin();
+	cc.carChildOffset = ToGpuB(car->_compoundShape.getChildTransform(0).getOrigin());
+	cc.ballBreakingThreshold = ballShape->getContactBreakingThreshold(gContactBreakingThreshold);
+	cc.carBreakingThreshold = comp.getContactBreakingThreshold(gContactBreakingThreshold);
+	cc.ballFriction = arena->ball->_rigidBody.getFriction();
+	cc.ballRestitution = arena->ball->_rigidBody.getRestitution();
+	cc.carFriction = car->_rigidBody.getFriction();
+	cc.carRestitution = car->_rigidBody.getRestitution();
+	cc.ballFilterGroup = arena->ball->_rigidBody.getBroadphaseProxy()->m_collisionFilterGroup;
+	cc.ballFilterMask = arena->ball->_rigidBody.getBroadphaseProxy()->m_collisionFilterMask;
+	cc.carFilterGroup = car->_rigidBody.getBroadphaseProxy()->m_collisionFilterGroup;
+	cc.carFilterMask = car->_rigidBody.getBroadphaseProxy()->m_collisionFilterMask;
+	cc.numStatics = (int)statics.size();
+	cc.gameMode = (int)arena->gameMode;
+	const MutatorConfig& mc = arena->GetMutatorConfig();
+	cc.demoMode = (int)mc.demoMode;
+	cc.enableTeamDemos = mc.enableTeamDemos;
+	cc.respawnDelay = mc.respawnDelay;
+	cc.bumpCooldownTime = mc.bumpCooldownTime;
+	cc.bumpForceScale = mc.bumpForceScale;
+	cc.ballHitExtraForceScale = mc.ballHitExtraForceScale;
+	cc.carWorldFriction = mc.carWorldFriction;
+	cc.carWorldRestitution = mc.carWorldRestitution;
+	cc.carBallFriction = CARBALL_COLLISION_FRICTION;
+	cc.carBallRestitution = CARBALL_COLLISION_RESTITUTION;
+	cc.carCarFriction = CARCAR_COLLISION_FRICTION;
+	cc.carCarRestitution = CARCAR_COLLISION_RESTITUTION;
+	cc.bumpMinForwardDist = BUMP_MIN_FORWARD_DIST;
+	cc.ballCarExtraZScale = BALL_CAR_EXTRA_IMPULSE_Z_SCALE;
+	cc.ballCarExtraForwardScale = BALL_CAR_EXTRA_IMPULSE_FORWARD_SCALE;
+	cc.ballCarExtraMaxDeltaVelUU = BALL_CAR_EXTRA_IMPULSE_MAXDELTAVEL_UU;
+	cc.ballExtraImpulseFactorCurve = ExtractCurve(BALL_CAR_EXTRA_IMPULSE_FACTOR_CURVE);
+	cc.bumpVelGroundCurve = ExtractCurve(BUMP_VEL_AMOUNT_GROUND_CURVE);
+	cc.bumpVelAirCurve = ExtractCurve(BUMP_VEL_AMOUNT_AIR_CURVE);
+	cc.bumpUpwardVelCurve = ExtractCurve(BUMP_UPWARD_VEL_AMOUNT_CURVE);
+}
+
 // ---- static-world raycast validation (--ray-fuzz N) ----
 // Random rays through the arena volume; CPU bullet rayTest (filtered to statics) vs
 // the device CuRayTestStatic, bitwise.
@@ -888,6 +1014,17 @@ static int RunGpuCompare(const Args& args) {
 	const int numPads = (int)arena->GetBoostPads().size();
 	const int numBodies = 1 + args.cars;
 
+	{ // wake the ball with seed-derived motion so collision compare covers
+	  // ball-world and car-ball contacts (kickoff ball is asleep -> no manifolds)
+		BallState bs = arena->ball->GetState();
+		Rng rng(MixSeed(args.seed, 0xBA11BA11ull));
+		bs.vel = Vec(rng.NextSigned() * 1000.f, rng.NextSigned() * 1000.f,
+			fabsf(rng.NextSigned()) * 800.f);
+		bs.angVel = Vec(rng.NextSigned() * 2.f, rng.NextSigned() * 2.f, rng.NextSigned() * 2.f);
+		arena->ball->SetState(bs);
+		arena->ball->_rigidBody.activate(true);
+	}
+
 	rscuda::GpuBatch* batch = rscuda::CreateBatch(1, args.cars, numPads);
 	UploadConsts(batch, arena, slots);
 
@@ -954,6 +1091,53 @@ static int RunGpuCompare(const Args& args) {
 		grid.cellsY = bp->cellsY;
 		grid.cellsZ = bp->cellsZ;
 	}
+
+	// Statics' proxy aabbs/cell smear change ONCE at the first updateAabbs
+	// (forceUpdateAllAabbs re-runs them through setAabb WITH the +-0.02 expansion,
+	// which createProxy lacked). Apply that update now so the extracted static
+	// state matches what every tick's pair-gen will actually see. Idempotent for
+	// statics; dyn proxies are re-extracted as the lockstep baseline below.
+	arena->_bulletWorld.updateAabbs();
+
+	// collision orchestration data + host-lockstep proxy state (regSeq maintained by
+	// the CPU re-registration rule: cellIdx change && >1 dyn proxies)
+	std::vector<rscuda::GpuDynProxy> hostProxies;
+	int hostRegCounter = 0;
+	{
+		rscuda::GpuCollideConsts ccons;
+		std::vector<rscuda::GpuStaticObj> statics;
+		std::vector<int> cellStart, cellList;
+		ExtractCollideData(arena, slots, ccons, statics, cellStart, cellList,
+			hostProxies, hostRegCounter);
+		// TEMP diagnostic
+		{
+			int c0 = hostProxies[0].cellIdx;
+			printf("DBG: ball cell %d statics [%d..%d):", c0, cellStart[c0], cellStart[c0 + 1]);
+			for (int it = cellStart[c0]; it < cellStart[c0 + 1]; it++)
+				printf(" %d", cellList[it]);
+			printf("\n  totalCells=%zu listLen=%zu numStatics=%zu ballGroup=%d ballMask=%d s16(g=%d,m=%d,kind=%d) aabb z[%.3f,%.3f]\n",
+				cellStart.size() - 1, cellList.size(), statics.size(),
+				ccons.ballFilterGroup, ccons.ballFilterMask,
+				statics.size() > 16 ? statics[16].group : 0,
+				statics.size() > 16 ? statics[16].mask : 0,
+				statics.size() > 16 ? statics[16].kind : -1,
+				statics.size() > 16 ? statics[16].aabbMin.z : 0,
+				statics.size() > 16 ? statics[16].aabbMax.z : 0);
+		}
+		rscuda::UploadCollideData(batch, ccons, statics.data(), (int)statics.size(),
+			cellStart.data(), (int)cellStart.size() - 1,
+			cellList.data(), (int)cellList.size(), grid);
+	}
+	// CPU manifold body -> device id (>=0 dyn slot, <0 static handle -1-h)
+	auto collideBodyId = [&](const void* obj) -> int {
+		if (obj == &arena->ball->_rigidBody) return 0;
+		for (size_t c2 = 0; c2 < slots.size(); c2++)
+			if (obj == &slots[c2].car->_rigidBody) return 1 + (int)c2;
+		for (size_t w = 0; w < arena->_worldCollisionRBs.size(); w++)
+			if (obj == arena->_worldCollisionRBs[w]) return -1 - (int)w;
+		return -1000000;
+	};
+
 	// rb -> shape/filter template (transforms/dynamics filled per snap)
 	struct DynTemplate { const void* rb; rscuda::GpuDynBody base; };
 	std::vector<DynTemplate> dynTemplates;
@@ -1173,9 +1357,161 @@ static int RunGpuCompare(const Args& args) {
 				}
 			}
 		}
+
+		// ---- collision segment: proxies + manifolds vs CPU AFTER_COLLISION ----
+		{
+			mapSnaps(rscap::points[rscap::AFTER_PREDICT], preState);
+			rscuda::UploadArenaState(batch, 0, preState.data(), carsDummy.data(), padsDummy.data());
+			rscuda::UploadDynProxies(batch, 0, hostProxies.data(), hostRegCounter);
+			rscuda::SetTickCount(batch, arena->tickCount - 1); // value during the tick
+			rscuda::RunPhaseSegment(batch, rscuda::GPU_PHASE_COLLISION, rscuda::GPU_PHASE_COLLISION);
+
+			std::vector<rscuda::GpuManifoldOut> gm(GPU_MAX_MANIFOLDS);
+			int gn = 0;
+			std::vector<rscuda::GpuDynProxy> gp(numBodies);
+			rscuda::GpuBallGameState gball;
+			rscuda::DownloadCollideResults(batch, 0, gm.data(), &gn, gp.data(), &gball);
+
+			bool bad = false;
+			auto cpuProxy = [&](int d) -> const rscap::ProxySnap* {
+				for (const auto& s : rscap::proxies)
+					if (s.rb == rbOrder[d])
+						return &s;
+				return nullptr;
+			};
+			for (int d = 0; d < numBodies; d++) {
+				const rscap::ProxySnap* ps = cpuProxy(d);
+				if (!ps)
+					continue;
+				if (memcmp(ps->aabbMin, &gp[d].aabbMin, 12) || memcmp(ps->aabbMax, &gp[d].aabbMax, 12) ||
+					ps->cellIdx != gp[d].cellIdx || ps->iIdx != gp[d].i ||
+					ps->jIdx != gp[d].j || ps->kIdx != gp[d].k) {
+					printf("GPU_COMPARE: FAIL tick %d collision proxy %d:\n"
+						"  cpu aabbMin(%.9g,%.9g,%.9g) aabbMax(%.9g,%.9g,%.9g) cell %d ijk(%d,%d,%d)\n"
+						"  gpu aabbMin(%.9g,%.9g,%.9g) aabbMax(%.9g,%.9g,%.9g) cell %d ijk(%d,%d,%d)\n",
+						tick, d,
+						ps->aabbMin[0], ps->aabbMin[1], ps->aabbMin[2],
+						ps->aabbMax[0], ps->aabbMax[1], ps->aabbMax[2],
+						ps->cellIdx, ps->iIdx, ps->jIdx, ps->kIdx,
+						gp[d].aabbMin.x, gp[d].aabbMin.y, gp[d].aabbMin.z,
+						gp[d].aabbMax.x, gp[d].aabbMax.y, gp[d].aabbMax.z,
+						gp[d].cellIdx, gp[d].i, gp[d].j, gp[d].k);
+					bad = true;
+				}
+			}
+
+			if ((int)rscap::manifolds.size() != gn) {
+				printf("GPU_COMPARE: FAIL tick %d collision manifold count: cpu %zu gpu %d\n",
+					tick, rscap::manifolds.size(), gn);
+				for (size_t i = 0; i < rscap::manifolds.size(); i++)
+					printf("  cpu m%zu: %d vs %d (%d pts)\n", i,
+						collideBodyId(rscap::manifolds[i].body0),
+						collideBodyId(rscap::manifolds[i].body1),
+						rscap::manifolds[i].numContacts);
+				for (int i = 0; i < gn; i++)
+					printf("  gpu m%d: %d vs %d (%d pts)\n", i, gm[i].bodyA, gm[i].bodyB, gm[i].numContacts);
+				int dbg[2 * 96 + 1];
+				rscuda::DownloadCollideDebug(batch, 0, dbg);
+				printf("  gpu pairs (%d):", dbg[0]);
+				for (int i = 0; i < dbg[0] && i < 96; i++)
+					printf(" (%d,%d)", dbg[1 + 2 * i], dbg[2 + 2 * i]);
+				printf("\n");
+				float pz;
+				memcpy(&pz, &dbg[106], 4);
+				printf("  gpu d0: cell %d list[%d..%d) first %d g %d m %d aabbMin.z %.9g nb %d\n",
+					dbg[100], dbg[101], dbg[102], dbg[103], dbg[104], dbg[105], pz, dbg[107]);
+				for (int b2 = 0; b2 < numBodies; b2++)
+					printf("  body %d activation(AFTER_PREDICT)=%d deact=%.6g\n",
+						b2, preState[b2].activationState, preState[b2].deactivationTime);
+				bad = true;
+			}
+			int nCmp = (int)rscap::manifolds.size() < gn ? (int)rscap::manifolds.size() : gn;
+			for (int i = 0; i < nCmp && !bad; i++) {
+				const rscap::ManifoldSnap& cm = rscap::manifolds[i];
+				int cA = collideBodyId(cm.body0), cB = collideBodyId(cm.body1);
+				const rscuda::GpuManifoldOut& g = gm[i];
+				if (cA != g.bodyA || cB != g.bodyB || cm.numContacts != g.numContacts) {
+					printf("GPU_COMPARE: FAIL tick %d collision manifold %d: cpu (%d vs %d, %d pts) gpu (%d vs %d, %d pts)\n",
+						tick, i, cA, cB, cm.numContacts, g.bodyA, g.bodyB, g.numContacts);
+					for (int c = 0; c < cm.numContacts && c < 4; c++)
+						printf("  cpu pt%d d=%.9g n=(%.9g,%.9g,%.9g) wB=(%.9g,%.9g,%.9g) part(%d,%d) idx(%d,%d)\n",
+							c, cm.pts[c].distance, cm.pts[c].normalWorldOnB[0], cm.pts[c].normalWorldOnB[1],
+							cm.pts[c].normalWorldOnB[2], cm.pts[c].positionWorldOnB[0], cm.pts[c].positionWorldOnB[1],
+							cm.pts[c].positionWorldOnB[2], cm.pts[c].partId0, cm.pts[c].partId1,
+							cm.pts[c].index0, cm.pts[c].index1);
+					for (int c = 0; c < g.numContacts && c < 4; c++)
+						printf("  gpu pt%d d=%.9g n=(%.9g,%.9g,%.9g) wB=(%.9g,%.9g,%.9g) part(%d,%d) idx(%d,%d)\n",
+							c, g.pts[c].distance, g.pts[c].normalWorldOnB.x, g.pts[c].normalWorldOnB.y,
+							g.pts[c].normalWorldOnB.z, g.pts[c].positionWorldOnB.x, g.pts[c].positionWorldOnB.y,
+							g.pts[c].positionWorldOnB.z, g.pts[c].partId0, g.pts[c].partId1,
+							g.pts[c].index0, g.pts[c].index1);
+					{
+						int dbg2[2 * 96 + 1];
+						rscuda::DownloadCollideDebug(batch, 0, dbg2);
+						printf("  gpu last car-mesh walk: handle %d leaves %d triAabbPass %d contactsAdded %d\n",
+							dbg2[110], dbg2[111], dbg2[112], dbg2[113]);
+					}
+					bad = true;
+					break;
+				}
+				for (int c = 0; c < cm.numContacts && c < 4; c++) {
+					const rscap::ContactSnap& cp = cm.pts[c];
+					const rscuda::GpuContactOut& gc = g.pts[c];
+					auto cmpV = [&](const char* what, const float* cv, const rscuda::GpuVec3& gv) {
+						if (memcmp(cv, &gv, 12) != 0) {
+							printf("GPU_COMPARE: FAIL tick %d collision m%d pt%d %s: cpu (%.9g,%.9g,%.9g) gpu (%.9g,%.9g,%.9g)\n",
+								tick, i, c, what, cv[0], cv[1], cv[2], gv.x, gv.y, gv.z);
+							bad = true;
+						}
+					};
+					auto cmpF = [&](const char* what, float cv, float gv) {
+						if (memcmp(&cv, &gv, 4) != 0) {
+							printf("GPU_COMPARE: FAIL tick %d collision m%d pt%d %s: cpu %.9g gpu %.9g\n",
+								tick, i, c, what, cv, gv);
+							bad = true;
+						}
+					};
+					cmpV("localPointA", cp.localPointA, gc.localPointA);
+					cmpV("localPointB", cp.localPointB, gc.localPointB);
+					cmpV("positionWorldOnA", cp.positionWorldOnA, gc.positionWorldOnA);
+					cmpV("positionWorldOnB", cp.positionWorldOnB, gc.positionWorldOnB);
+					cmpV("normalWorldOnB", cp.normalWorldOnB, gc.normalWorldOnB);
+					cmpF("distance", cp.distance, gc.distance);
+					cmpF("combinedFriction", cp.combinedFriction, gc.combinedFriction);
+					cmpF("combinedRestitution", cp.combinedRestitution, gc.combinedRestitution);
+					if (cp.partId0 != gc.partId0 || cp.partId1 != gc.partId1 ||
+						cp.index0 != gc.index0 || cp.index1 != gc.index1 ||
+						(int)cp.isSpecial != (int)gc.isSpecial) {
+						printf("GPU_COMPARE: FAIL tick %d collision m%d pt%d ids: cpu part(%d,%d) idx(%d,%d) sp%d gpu part(%d,%d) idx(%d,%d) sp%d\n",
+							tick, i, c, cp.partId0, cp.partId1, cp.index0, cp.index1, cp.isSpecial,
+							gc.partId0, gc.partId1, gc.index0, gc.index1, gc.isSpecial);
+						bad = true;
+					}
+				}
+			}
+			if (bad)
+				return 1;
+
+			// advance host proxy lockstep state from CPU truth (regSeq rule: cell
+			// change && >1 dyn proxies; handle order)
+			for (int d = 0; d < numBodies; d++) {
+				const rscap::ProxySnap* ps = cpuProxy(d);
+				if (!ps)
+					continue;
+				bool cellChanged = hostProxies[d].cellIdx != ps->cellIdx;
+				memcpy(&hostProxies[d].aabbMin, ps->aabbMin, 12);
+				memcpy(&hostProxies[d].aabbMax, ps->aabbMax, 12);
+				hostProxies[d].cellIdx = ps->cellIdx;
+				hostProxies[d].i = ps->iIdx;
+				hostProxies[d].j = ps->jIdx;
+				hostProxies[d].k = ps->kIdx;
+				if (cellChanged && numBodies > 1)
+					hostProxies[d].regSeq = ++hostRegCounter;
+			}
+		}
 	}
 
-	printf("GPU_COMPARE: PASS (%d ticks, phases: car-pretick, predict, integrate, activation; %d bodies bit-exact)\n",
+	printf("GPU_COMPARE: PASS (%d ticks, phases: car-pretick, predict, collision, integrate, activation; %d bodies bit-exact)\n",
 		args.gpuCompare, numBodies);
 	rscuda::DestroyBatch(batch);
 	delete arena;

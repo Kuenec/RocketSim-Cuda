@@ -72,6 +72,10 @@ public:
 
 	btCompoundShape() {}
 
+	// 2026-06-10: read-only accessors for the GPU port host extraction (no behavior change)
+	const btVector3& getLocalAabbMin() const { return m_localAabbMin; }
+	const btVector3& getLocalAabbMax() const { return m_localAabbMax; }
+
 	explicit btCompoundShape(bool enableDynamicAabbTree, const int initialChildCapacity = 0);
 
 	virtual ~btCompoundShape();

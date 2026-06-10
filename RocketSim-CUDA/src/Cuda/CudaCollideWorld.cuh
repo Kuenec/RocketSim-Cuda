@@ -73,6 +73,8 @@ struct CuCollideIn {
 	// outputs (per arena)
 	CuManifold* manifolds;           // capacity GPU_MAX_MANIFOLDS
 	int* numManifolds;
+	// diagnostic channel: [0]=numPairs, then (h0,h1) per pair (h < numStatics: static)
+	int* debug;                      // capacity 2*CU_MAX_PAIRS+1
 };
 
 // btAabbUtil2 TestAabbAgainstAabb2 (x, then z, then y)
@@ -95,11 +97,13 @@ __device__ __forceinline__ CuMat3 CuLoadBasis(const GpuMat3& m) {
 	           { m.row[2].x, m.row[2].y, m.row[2].z } } };
 }
 
-// btSphereShape::getAabb: origin +- (margin,margin,margin), margin == radius
+// btSphereShape::getAabb: origin +- margin where margin = radius + 0.08f
+// ("ROCKETSIM CHANGE: Add 0.08 to sphere margin" - aabb only, GJK keeps radius)
 __device__ __forceinline__ void CuSphereAabbAt(CuVec3 origin, float radius,
 	CuVec3& mn, CuVec3& mx) {
-	mn = { origin.x - radius, origin.y - radius, origin.z - radius };
-	mx = { origin.x + radius, origin.y + radius, origin.z + radius };
+	float margin = radius + 0.08f;
+	mn = { origin.x - margin, origin.y - margin, origin.z - margin };
+	mx = { origin.x + margin, origin.y + margin, origin.z + margin };
 }
 
 // btCompoundShape::getAabb: localHalfExtents = 0.5*(localMax-localMin) + margin,
@@ -211,6 +215,19 @@ __device__ inline int CuCollideGenPairs(const CuCollideIn& in, int2* pairs) {
 		CuVec3 pmin = GV(p.aabbMin), pmax = GV(p.aabbMax);
 		int dg, dm;
 		CuDynFilter(in, d, dg, dm);
+
+		// TEMP diagnostic (debug[100+])
+		if (in.debug && d == 0) {
+			in.debug[100] = p.cellIdx;
+			in.debug[101] = in.cellStaticStart[p.cellIdx];
+			in.debug[102] = in.cellStaticStart[p.cellIdx + 1];
+			in.debug[103] = in.cellStaticStart[p.cellIdx + 1] > in.cellStaticStart[p.cellIdx]
+				? in.cellStaticList[in.cellStaticStart[p.cellIdx]] : -1;
+			in.debug[104] = dg;
+			in.debug[105] = dm;
+			in.debug[106] = __float_as_int(pmin.z);
+			in.debug[107] = in.numBodies;
+		}
 
 		// statics of the aabbMin cell (CSR list order = CPU smear insertion order)
 		for (int it = in.cellStaticStart[p.cellIdx]; it < in.cellStaticStart[p.cellIdx + 1]; it++) {
@@ -461,6 +478,14 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 	int2 pairs[CU_MAX_PAIRS];
 	int numPairs = CuCollideGenPairs(in, pairs);
 
+	if (in.debug) {
+		in.debug[0] = numPairs;
+		for (int i = 0; i < numPairs; i++) {
+			in.debug[1 + 2 * i] = pairs[i].x;
+			in.debug[2 + 2 * i] = pairs[i].y;
+		}
+	}
+
 	CuManifoldList ml = { in.manifolds, 0 };
 
 	const CuMat3 ident = CuIdentity3();
@@ -543,7 +568,8 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 				CuVec3 cmn, cmx;
 				CuBoxAabbAt(GV(in.cc.carBoxHalfExtNoMargin), in.cc.carBoxMargin,
 					childBasis, childOrigin, cmn, cmx);
-				bool overlap = CuTestAabb2(cmn, cmx, GV(so.aabbMin), GV(so.aabbMax));
+				// ProcessChildShape tests against the RAW shape aabb, not the proxy
+				bool overlap = CuTestAabb2(cmn, cmx, GV(so.shapeAabbMin), GV(so.shapeAabbMax));
 				if (overlap) {
 					if (so.kind == 0) {
 						CuGjkShape box;
@@ -554,16 +580,24 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 						CuBvhView bvh = { in.bvhNodes + mb.nodeStart, in.bvhSubtrees + mb.subtreeStart,
 							mb.numSubtrees, GV(mb.bvhAabbMin), GV(mb.bvhAabbMax), GV(mb.bvhQuantization) };
 						int triStart = in.geo.meshes[so.shapeIdx].triStart;
+						if (in.debug) { // TEMP diagnostic: last car-mesh pair walk stats
+							in.debug[110] = h0;
+							in.debug[111] = 0; // leaves visited
+							in.debug[112] = 0; // passed tri-aabb
+							in.debug[113] = 0; // gjk/added contacts
+						}
 						CuConvexVsMesh(box, childBasis, childOrigin, in.geo, so.shapeIdx, bvh,
 							in.meshMargins[so.shapeIdx], carInfo, staticInfo, m, breaking,
 							-1, 0,
 							[&](int idx, int triIdx) {
+								if (in.debug) in.debug[113]++;
 								CuContactAddedCallback(in, m.pts[idx], d, -1 - h0);
 								const GpuVec3* tv = in.geo.meshTris + (size_t)triStart * 3;
 								CuAdjustInternalEdgeContacts(m.pts[idx],
 									GV(tv[triIdx * 3]), GV(tv[triIdx * 3 + 1]), GV(tv[triIdx * 3 + 2]),
 									in.triInfos[triStart + triIdx]);
-							});
+							},
+							in.debug ? in.debug + 111 : nullptr);
 					} else {
 						const GpuPlane& pl = in.geo.planes[so.shapeIdx];
 						CuConvexShape box = { CU_SHAPE_BOX, 0.0f,

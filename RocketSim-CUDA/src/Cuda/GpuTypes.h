@@ -310,7 +310,10 @@ struct GpuDynProxy {
 struct GpuStaticObj {
 	int kind;                  // 0 = triangle mesh, 1 = static plane
 	int shapeIdx;              // into the uploaded mesh / plane arrays
-	GpuVec3 aabbMin, aabbMax;  // proxy aabb == shape world aabb (no expansion)
+	// proxy aabb (pair-gen): shape aabb +-0.02 after the first updateAabbs
+	GpuVec3 aabbMin, aabbMax;
+	// raw shape->getAabb (compound ProcessChildShape tests; NO expansion)
+	GpuVec3 shapeAabbMin, shapeAabbMax;
 	int group, mask;
 	float friction, restitution;  // rigid body material (combine inputs)
 	float breakingThreshold;      // shape->getContactBreakingThreshold(0.02)

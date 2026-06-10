@@ -2079,7 +2079,8 @@ __device__ inline void CuConvexVsMesh(
 	const CuContactBodyInfo& convexBody, const CuContactBodyInfo& meshBody,
 	CuManifold& manifold, float manifoldBreakingThreshold,
 	int partIdConvex, int indexConvex, // result A-side ids: ball (-1,-1), car child (-1,0)
-	FCallback&& onContactAdded /*(insertIndex, triangleIndex)*/) {
+	FCallback&& onContactAdded /*(insertIndex, triangleIndex)*/,
+	int* dbgCounters = nullptr /*[0] leaves, [1] passed tri-aabb*/) {
 
 	// convexInTriangleSpace = meshWT.inverse() * convexWT (mesh = identity transform:
 	// canon trees). Identity inverse: basisT = I, invOrigin = I * -(0,0,0)
@@ -2103,6 +2104,8 @@ __device__ inline void CuConvexVsMesh(
 	const GpuVec3* tv = geo.meshTris + (size_t)mi.triStart * 3;
 
 	CuBvhWalk(bvh, qmin, qmax, [&](int triIdx) {
+		if (dbgCounters)
+			dbgCounters[0]++;
 		CuVec3 t0 = GV(tv[triIdx * 3]);
 		CuVec3 t1 = GV(tv[triIdx * 3 + 1]);
 		CuVec3 t2 = GV(tv[triIdx * 3 + 2]);
@@ -2110,6 +2113,8 @@ __device__ inline void CuConvexVsMesh(
 		// btConvexTriangleCallback::processTriangle
 		if (!CuTestTriangleAabb(t0, t1, t2, aabbMin, aabbMax))
 			return;
+		if (dbgCounters)
+			dbgCounters[1]++;
 
 		{ // early-out: support projection on both sides of the world triangle plane
 			// (mesh world transform = identity: tri verts already world, but CPU runs
@@ -2187,8 +2192,10 @@ __device__ inline void CuConvexVsMesh(
 		}
 	});
 
-	// resultOut->refreshContactPoints() at the end of the concave pass
-	CuManifoldRefresh(manifold, convexBasis, convexOrigin, ident, { 0, 0, 0 });
+	// resultOut->refreshContactPoints() at the end of the concave pass. Uses the
+	// manifold BODY transforms (for a compound child the body != convex transform:
+	// localPointA is in body space).
+	CuManifoldRefresh(manifold, convexBody.basis, convexBody.origin, meshBody.basis, meshBody.origin);
 }
 
 // ================== btInternalEdgeUtility port =====================================

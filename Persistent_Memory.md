@@ -711,27 +711,40 @@ verified in source 2026-06-10):**
      ball-world -> Ball::_OnWorldCollision (soccar: no-op) + m_isSpecial=true (non-
      snowday). THEN btAdjustInternalEdgeContacts(cp, trimeshWrapSide, otherSide,
      partId, index) ALWAYS (early-out if shape != trimesh).
-   REMAINING IMPLEMENTATION (in order):
-   a. Host extraction: static object table in handle order (kind mesh/plane, proxy
-      aabbMin/Max consts, group/mask, shape breaking threshold), static CSR cell
-      lists from bp->cells (staticHandles per cell), dyn proxy initial state
-      (aabbMin/Max/cellIdx/ijk from CPU proxies after setup), per-body collide
-      consts (compound localAabbMin/Max+margin, box halfExt+margin, sphere radius,
-      angular motion discs, processing thresholds), game consts (CARBALL_*/CARCAR_*/
-      carWorld fric+rest, BUMP curves already in GpuCarConsts? bump curves =
-      BUMP_VEL_AMOUNT_GROUND/AIR/UPWARD curves - extract), userIndex mapping.
-   b. Device CudaCollideWorld.cuh: CuCollidePhase(arena): dyn aabb update + cell
-      maintenance (regSeq model), pair gen (ordered, filtered, deduped), dispatch
-      per pair type exactly as spec above, manifolds into per-arena buffer in
-      creation order (incl. EMPTY manifolds for ordering!), contact callbacks
-      mutating GpuCarGameState/ball state + _velocityImpulseCache accumulators,
-      internal-edge adjust for mesh contacts. Kernel phase GPU_PHASE_COLLIDE,
-      single thread per arena (like other phases).
-   c. Bench --gpu-compare extension: upload AFTER_PREDICT state + proxy snaps,
-      run collide segment, download manifolds + proxy state, compare vs rscap
-      AFTER_COLLISION (bitwise: aabbs, cells, manifold order/bodies/points all
-      fields). NOTE ball asleep at kickoff -> need ball-motion coverage: give ball
-      initial velocity in compare setup (bench-side state injection) + multi-seed.
+   IMPLEMENTED (2026-06-10, commits after ee5e371):
+   a. DONE Host extraction (bench ExtractCollideData): static table (handle order,
+      proxy aabb + RAW shape aabb + group/mask/material/breaking), static CSR cell
+      lists from bp->cells, initial dyn proxies, GpuCollideConsts (compound
+      localAabb via NEW btCompoundShape accessors getLocalAabbMin/Max, mutator +
+      RLConst values, 4 curves).
+   b. DONE Device CudaCollideWorld.cuh (CuCollideTick: CuCollideUpdateAabbs +
+      CuCollideGenPairs + dispatch per pair type + CuContactAddedCallback +
+      internal-edge; manifold create/release order incl. compound post-loop
+      swap-remove). Wired as GPU_PHASE_COLLISION in GpuStepArenasKernel (thread 0
+      per arena); GpuBatch grew proxy/static/cell/manifold/ballstate/debug buffers;
+      APIs UploadCollideData/UploadDynProxies/UploadBallState/SetTickCount/
+      DownloadCollideResults/DownloadCollideDebug. cudaDeviceSetLimit(stack 64KB)
+      now set in CreateBatch (EPA recursion).
+   c. DONE Bench collision compare in --gpu-compare: ball given seed-derived
+      velocity + activate at setup (coverage); per tick uploads AFTER_PREDICT
+      bodies + host-lockstep proxies (regSeq maintained by host via cell-change
+      rule), runs the segment, compares proxies + manifolds (order/bodies/points,
+      bitwise) vs rscap AFTER_COLLISION, then advances host proxies from CPU truth.
+   BUGS FOUND/FIXED by the compare (all root-caused):
+   - btSphereShape::getAabb is RS-MODIFIED: margin = radius + 0.08f (aabb only;
+     GJK margins keep radius). Device CuSphereAabbAt fixed.
+   - Statics' PROXY aabbs change ONCE at the first updateAabbs (forceUpdateAllAabbs
+     pushes them through setAabb WITH +-0.02, which createProxy lacked) and the
+     static cell smear is REDONE then (per-cell order stays handle order). Fix:
+     bench calls arena->_bulletWorld.updateAabbs() once before extraction so the
+     snapshot equals steady state. Production GPU runs must extract the same way.
+   - GpuStaticObj must carry BOTH aabbs: proxy aabb (pair-gen TestAabbAgainstAabb2)
+     and RAW shape aabb (compound ProcessChildShape + post-loop tests). They differ
+     by the +-0.02 expansion; car-plane at grazing height proved it (tick 745).
+   STATUS: collision compare PASS 200 ticks seed 1337; 20k-tick + multi-seed
+   validation in progress. NEXT: finish validation (fix any further mismatches),
+   then commit; side-effect compare (ballHitInfo/velocityImpulseCache/worldContact)
+   still TODO (only manifolds+proxies compared so far).
    Then solver (btSequentialImpulse - READ NEXT after collision validated), ball
    pre/finish + pads + arena tail, monolithic assembly, flip --gpu-step.
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
