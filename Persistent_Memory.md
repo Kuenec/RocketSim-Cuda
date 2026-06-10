@@ -222,13 +222,24 @@ Done so far:
 - CUDA arch gotcha: CMAKE_CUDA_ARCHITECTURES must be set BEFORE enable_language(CUDA)
   or it locks to compiler default (was 75); now `native` (sm_120 here).
 
+**PORTED + VALIDATED BIT-EXACT (2026-06-10):** kernel phases predict (damping),
+integrate (transform + inertia tensor), activation (deactivation/sleeping) — verified by
+`--gpu-compare 20000` lockstep: every tick, CPU phase-boundary captures (rscap, hooks in
+work btDiscreteDynamicsWorld.cpp) vs GPU phase segments, full GpuBodyState bitwise equal
+for ball+2 cars. Validation command:
+  `./build/rocketsim_bench --mesh-dir collision_meshes --ticks 1 --gpu-compare 20000 --cars 2 --seed 1337`
+GPU bridge now carries BULLET-unit body state (basis/pos/vel/angVel/forces/invInertiaWorld/
+activation); bench_work has SnapshotBody/WritebackBody + MakeBodyConsts (damping factors
+precomputed host-side; sleep thresholds squared; noRot). Kernel supports phase windows
+(RunPhaseSegment) for isolation; production StepTicks runs the full range in one launch.
+`--gpu-step`/`--gpu-compare` REQUIRE glibc_trig_fix.bin (actionable error if missing).
+
 ### Next Steps (in order)
-1. Implement kernel phases predict/integrate/activation using CudaMath; add CPU capture
-   hooks (work copy, diagnostic) at phase boundaries + `--gpu-compare` lockstep mode in
-   bench_work: per tick upload CPU pre-bullet state, run GPU tick prefix, bit-compare
-   at each phase point, report first divergence (tick/phase/body/field/bits).
-2. Then per profile order: vehicle+car logic (50%), collision (35%), solver, ball/pads.
-3. RSQRTSS emulation when first normalize() call site is ported.
+1. Port car pre-tick (Car::_PreTickUpdate incl. btVehicleRL wheel raycasts vs arena -
+   needs GPU mesh/BVH raycast + static planes; 50% of CPU time) with per-sub-phase
+   capture points; then collision (35%), solver+islands, ball/pads/game tail.
+2. RSQRTSS emulation when first normalize() call site is ported (suspension/ball finish).
+3. Extend GpuCarGameState wheel state as the vehicle port defines what persists.
 
 ### Open Questions / Blockers
 - None currently.
