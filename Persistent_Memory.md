@@ -61,9 +61,15 @@ CUDA is either 0% or 100%. There is no in-between for the final deliverable.
    - Every change must be validated against the reference hash gates.
    - Workspace-vs-workspace agreement is not sufficient.
 
-3. **Validation gates (deterministic), You have to do this yourself to start:**
-   - Stable gate:
-   - Hard gate:
+3. **Validation gates (deterministic), established 2026-06-10 on this Linux machine:**
+   - Stable gate: 128 arenas / 1000 ticks / 2 cars / seed 1337 -> hash `3380507951560469826` (verified identical across 5 fresh-process runs)
+   - Hard gate: 1 arena / 20000 ticks / 2 cars / seed 1337 -> hash `11764255410181881605` (verified identical across 6 fresh-process runs)
+   - Commands (from repo root, after `cmake -B build -G Ninja && ninja -C build`):
+     ```
+     ./build/rocketsim_bench --mesh-dir collision_meshes --ticks 1000  --arenas 128 --cars 2 --seed 1337 --expected-state-hash 3380507951560469826
+     ./build/rocketsim_bench --mesh-dir collision_meshes --ticks 20000 --arenas 1   --cars 2 --seed 1337 --expected-state-hash 11764255410181881605
+     ```
+     (`rocketsim_reference_bench` takes the same args and must produce the same hashes; prints `GATE: PASS/FAIL`, exit code 0/1.)
    - Both gates must pass after every change.
    - FP drift from GPU execution is acceptable IF it is minimized and the simulation behavior is negligibly different. New deterministic hashes for the GPU path are acceptable if the physics behavior is correct.
 
@@ -75,22 +81,26 @@ CUDA is either 0% or 100%. There is no in-between for the final deliverable.
    - "CUDA ownership" means the GPU produces the result that the simulation uses. Shadow/dry-run GPU kernels that run alongside CPU do not count.
 
 5. **Build with Ninja.**
-   - CMake + Ninja + MSVC x64 + CUDA.
-   - Build script: `build.ps1 -Target <bench|reference|both> [-Clean]`
-   - If you cannot use ninja or the others on linux, find the best alternative that is good and optimized for speed like ninja.
+   - This machine (Linux/CachyOS): CMake 4.3.3 + Ninja 1.13.2 + GCC 16.1.1, top-level `CMakeLists.txt`.
+   - Commands: `cmake -B build -G Ninja` then `ninja -C build` (Release/-O3 by default).
+   - `-ffp-contract=off` is pinned on all targets so the CPU reference defines plain
+     mul+add FP semantics the GPU port can reproduce exactly (nvcc `-fmad=false`).
+   - CUDA toolkit (`nvcc`) is NOT yet installed on this machine — required before GPU work can build.
 
 ---
 
 ## Workspace Layout
 
 ```
-reference/RocketSim-ORIGINAL/    # pristine upstream (NEVER modify)
-work/RocketSim-cuda/             # working copy (modify here)
-  src/Profiling.h                # phase timing counters (active)
-  src/Cuda/                      # ALL GPU kernel code goes here
-  libsrc/bullet3-3.24/           # Bullet physics (compiled by MSVC as .cpp, NOT by NVCC)
-tools/rocketsim_bench/           # workspace benchmark (--profile flag, --gpu-step flag)
-tools/rocketsim_reference_bench/ # reference benchmark (never modify)
+RocketSim-ORIGINAL/   # pristine upstream v2.2.1 @ f80f9d90 (NEVER modify; gitignored, re-clone per .gitignore note if missing)
+RocketSim-CUDA/       # working copy (modify here; ALL GPU kernel code goes in src/Cuda/)
+  libsrc/bullet3-3.24/  # Bullet physics (compiled as C++, not by NVCC)
+tools/bench/main.cpp  # ONE bench source compiled twice: rocketsim_reference_bench (frozen now
+                      #   that the baseline is set) and rocketsim_bench (workspace bench; fork
+                      #   into its own source file when GPU flags like --gpu-step are added)
+collision_meshes/     # soccar .cmf assets (gitignored; see Asset Provenance below)
+CMakeLists.txt        # top-level build: rocketsim_ref + rocketsim_work libs, both benches
+build/                # ninja output (gitignored)
 ```
 
 ---
@@ -126,9 +136,47 @@ The project is complete ONLY when ALL THREE are true:
 
 - **Remote**: https://github.com/Kuenec/RocketSim-Cuda
 - **Branch**: Push directly to `Fable`
-- **Author**: All commits under the user's git config — NO co-authoring, NO `Co-Authored-By` lines
+- **Author**: All commits under the user's git config — NO co-authoring, NO `Co-Authored-By` lines Username: Kuenec Email: Kuenec44@gmail.com
 - **Commit after every kept change** that passes both gates. Don't batch up multiple changes.
 - **Push to GitHub after every commit.** The remote must always reflect the latest working state.
 - **Commits**: All commits Must be short and Consise about what you changed
+- **`main` and all other remote branches are a dead failed experiment. Never read from, merge, or push to them. This folder + `Fable` is the only truth.**
+
+---
+
+## Current State (2026-06-10)
+
+**Status: Exactness 100% (both gates pass) | CUDA 0% (no GPU code yet) | Throughput 100% (workspace == reference, identical CPU code)**
+
+### Done
+- Repo initialized at project root on branch `Fable` (fresh history, not based on old `main`), pushed to the remote. Work copy verified file-identical to pristine v2.2.1 before import.
+- Soccar collision meshes obtained and verified: all 16 `.cmf` hashes match the known-good set hardcoded in upstream `src/RocketSim.cpp` (`MeshHashSet`). Bench re-verifies them on every run before Init.
+- Bench tools built and gates established (values + commands above).
+
+### Baseline reference throughput (single thread, this machine: CachyOS Linux, GCC 16.1.1 -O3 -ffp-contract=off)
+| Gate | Reference SPS | Workspace SPS |
+|------|--------------|----------------|
+| Stable (128a/1000t) | ~58,000 | ~58,300 |
+| Hard (1a/20000t) | ~242,000 | ~242,600 |
+SPS varies a few percent run to run; the hash is the gate, SPS is informational.
+
+### Key decisions (with evidence)
+1. **Gates run with `DemoMode::DISABLED`.** Upstream demolition respawn calls `Math::RandInt(.., seed=-1)` -> `Math::GetRandEngine()`, which is seeded from wall-clock + thread id (`src/Math/Math.cpp`). Any demo would inject non-reproducible randomness. Demo LOGIC must still be ported to GPU; the gates just cannot cover the respawn path. Bump/demo checks still execute every tick.
+2. **Bench masks `BallState.dsInfo.lastDamageTick` when `!hasDamaged`.** That field has NO initializer upstream and is only written in dropshot, but `BallState::Serialize` writes it regardless. Unmasked, the state hash ingests uninitialized heap bytes — diagnosed as the root cause of a nondeterministic stable gate (per-arena hash dump + 4-byte blob diff at exactly that field's offset; only soccar-mode read of the field is inside a `gameMode == DROPSHOT` guard, so physics is unaffected).
+3. **No `ResetToRandomKickoff`, explicit spawns instead.** It iterates `_cars` (a pointer-keyed `unordered_set`, ASLR-order) and uses `std::shuffle`/`std::default_random_engine` (implementation-defined). Bench sets car states explicitly.
+4. **Bench randomness is splitmix64 with power-of-two float quantization** — input schedule is bit-identical on any platform/compiler. Never use std distributions for gate-relevant randomness.
+5. **`unordered_set<Car*>` iteration-order hazard.** `Arena::Step` iterates `_cars` in pointer order for pre/post-tick. With the current gates this is provably benign (hashes stable across fresh processes), but any future change that makes per-car work order-dependent (e.g. same-tick boost pad contests) can break determinism. The GPU port must define a FIXED car order (by car id) and validate against the gates.
+6. **`-ffp-contract=off` everywhere** so CPU semantics are plain IEEE mul+add, matchable on GPU with `nvcc -fmad=false`.
+
+### Asset Provenance
+- Meshes downloaded from `https://github.com/heresfilly09/rocket-league-collision-meshes` (plain `.cmf`), verified against upstream's known hash set. Game-derived, so NOT committed; re-download to `collision_meshes/soccar/` and the bench's `MESHES: OK (16/16 soccar)` line confirms integrity.
+
+### Next Steps (in order)
+1. Install the CUDA toolkit (nvcc missing) and verify a trivial kernel builds/runs on this machine's GPU.
+2. Add phase profiling counters to the WORK copy only (`--profile` flag in `rocketsim_bench`; fork `tools/bench/main.cpp` into a workspace-only source at that point so the reference bench stays frozen).
+3. Begin the GPU port: batch arena state into GPU buffers, start with predict/integrate, validate each phase against CPU per-phase state before adding the next (per Behavioral Requirements).
+
+### Open Questions / Blockers
+- No CUDA toolkit on this machine (blocker for step 1). GPU model unverified — check `nvidia-smi` / install drivers as needed.
 
 ---
