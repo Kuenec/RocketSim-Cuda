@@ -1,0 +1,11 @@
+# Build output
+/build/
+
+# Pristine upstream reference (ZealanL/RocketSim @ f80f9d9, v2.2.1).
+# Not versioned here - re-clone it if missing:
+#   git clone https://github.com/ZealanL/RocketSim RocketSim-ORIGINAL
+#   git -C RocketSim-ORIGINAL checkout f80f9d90f922315c5877a81987845d3242ff1780
+/RocketSim-ORIGINAL/
+
+# Game-derived arena collision meshes (not redistributable, see Persistent_Memory.md)
+/collision_meshes/
