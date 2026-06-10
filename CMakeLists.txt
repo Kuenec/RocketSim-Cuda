@@ -36,13 +36,14 @@ add_rocketsim_lib(rocketsim_work ${WORK_DIR})
 #         -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-15
 # (login shells get both via /etc/profile.d/cuda.sh, see Persistent_Memory.md)
 include(CheckLanguage)
+# Must be set BEFORE enable_language(CUDA), which otherwise locks in a default arch
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+	set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
 check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
 	enable_language(CUDA)
 	find_package(CUDAToolkit REQUIRED)
-	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-		set(CMAKE_CUDA_ARCHITECTURES native)
-	endif()
 	file(GLOB_RECURSE WORK_CUDA_SRC CONFIGURE_DEPENDS ${WORK_DIR}/src/Cuda/*.cu)
 	target_sources(rocketsim_work PRIVATE ${WORK_CUDA_SRC})
 	set_target_properties(rocketsim_work PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
@@ -50,6 +51,17 @@ if(CMAKE_CUDA_COMPILER)
 	# -fmad=false: GPU math must be plain IEEE mul+add to match the -ffp-contract=off CPU reference
 	target_compile_options(rocketsim_work PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 	target_link_libraries(rocketsim_work PUBLIC CUDA::cudart_static)
+
+	# Bit-exactness regression guard for the device math layer (see CudaMath.cuh)
+	add_executable(cuda_math_test tools/cuda_math_test/main.cu tools/cuda_math_test/host_ref.cpp)
+	target_include_directories(cuda_math_test PRIVATE ${WORK_DIR}/src)
+	set_target_properties(cuda_math_test PROPERTIES
+		CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON
+		CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+	target_compile_options(cuda_math_test PRIVATE
+		$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
+		$<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+
 	message(STATUS "CUDA enabled (arch: ${CMAKE_CUDA_ARCHITECTURES})")
 else()
 	message(STATUS "CUDA toolkit not found - GPU path disabled, --gpu-step unavailable")

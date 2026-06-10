@@ -1,0 +1,270 @@
+// 2026-06-10: Device half of cuda_math_test - computes every CudaMath op on the GPU
+// over fuzzed inputs and demands BIT-EXACT equality with the Bullet host reference
+// (host_ref.cpp, compiled by the same compiler/flags as the physics build).
+// Both-NaN results compare equal (payloads differ across architectures by design);
+// the gates prove the real simulation never produces NaN.
+//
+// Usage: cuda_math_test [--samples N] [--trig-exhaustive]
+// Exit 0 = all ops bit-exact. Exit 1 = mismatch (details printed).
+
+#include "Cuda/CudaMath.cuh"
+#include "../../tools/cuda_math_test/test_data.h"
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <vector>
+
+using namespace rscuda;
+using namespace mathtest;
+
+namespace mathtest {
+void HostFillDerived(Input* inputs, size_t n);
+void HostCompute(const Input* inputs, Output* outputs, size_t n);
+void HostTrig(const uint32_t* bits, float* sinOut, float* cosOut, size_t n);
+}
+
+static CuVec3 CV(const V3& v) { return { v.x, v.y, v.z }; }
+static __device__ CuVec3 DV(const V3& v) { return { v.x, v.y, v.z }; }
+static __device__ V3 VD(const CuVec3& v) { return { v.x, v.y, v.z }; }
+static __device__ CuQuat DQ(const Q4& q) { return { q.x, q.y, q.z, q.w }; }
+static __device__ Q4 QD(const CuQuat& q) { return { q.x, q.y, q.z, q.w }; }
+static __device__ CuMat3 DM(const M3& m) {
+	return { { DV(m.r[0]), DV(m.r[1]), DV(m.r[2]) } };
+}
+static __device__ M3 MD(const CuMat3& m) {
+	return { { VD(m.r[0]), VD(m.r[1]), VD(m.r[2]) } };
+}
+
+__global__ void ComputeKernel(const Input* inputs, Output* outputs, size_t n) {
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	const Input in = inputs[i];
+	Output o;
+
+	o.dot3 = CuDot3(DV(in.a), DV(in.b));
+	o.cross = VD(CuCross(DV(in.a), DV(in.b)));
+	o.quatMul = QD(CuQuatMul(DQ(in.qa), DQ(in.qb)));
+	o.quatDot = CuQuatDot4(DQ(in.qa), DQ(in.qb));
+	o.quatNorm = QD(CuQuatSafeNormalize(DQ(in.qa)));
+	o.mat3Mul = MD(CuMat3Mul(DM(in.ma), DM(in.mb)));
+	o.getRot = QD(CuMat3GetRotation(DM(in.ma)));
+	o.setRot = MD(CuMat3SetRotation(DQ(in.qb)));
+	o.inertia = MD(CuUpdateInertiaTensor(DM(in.ma), DV(in.a)));
+
+	CuMat3 ib;
+	CuVec3 ip;
+	CuIntegrateTransform(DM(in.ma), DV(in.a), DV(in.b), DV(in.w), in.dt, false, ib, ip);
+	o.integBasis = MD(ib);
+	o.integPos = VD(ip);
+
+	outputs[i] = o;
+}
+
+__global__ void TrigKernel(const uint32_t* bits, float* sinOut, float* cosOut, size_t n) {
+	size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= n) return;
+	float x;
+	memcpy(&x, &bits[i], 4);
+	sinOut[i] = CuSinf(x);
+	cosOut[i] = CuCosf(x);
+}
+
+static void Check(cudaError_t e, const char* what) {
+	if (e != cudaSuccess) {
+		fprintf(stderr, "CUDA error (%s): %s\n", what, cudaGetErrorString(e));
+		exit(2);
+	}
+}
+
+// bit compare treating both-NaN as equal
+static bool FloatEq(float a, float b) {
+	uint32_t ua, ub;
+	memcpy(&ua, &a, 4);
+	memcpy(&ub, &b, 4);
+	if (ua == ub) return true;
+	bool aNan = (ua & 0x7F800000u) == 0x7F800000u && (ua & 0x7FFFFFu);
+	bool bNan = (ub & 0x7F800000u) == 0x7F800000u && (ub & 0x7FFFFFu);
+	return aNan && bNan;
+}
+
+struct FieldDef { const char* name; size_t offset; size_t count; }; // count floats
+static const FieldDef FIELDS[] = {
+	{ "dot3", offsetof(Output, dot3), 1 },
+	{ "cross", offsetof(Output, cross), 3 },
+	{ "quatMul", offsetof(Output, quatMul), 4 },
+	{ "quatDot", offsetof(Output, quatDot), 1 },
+	{ "quatNorm", offsetof(Output, quatNorm), 4 },
+	{ "mat3Mul", offsetof(Output, mat3Mul), 9 },
+	{ "getRot", offsetof(Output, getRot), 4 },
+	{ "setRot", offsetof(Output, setRot), 9 },
+	{ "inertia", offsetof(Output, inertia), 9 },
+	{ "integBasis", offsetof(Output, integBasis), 9 },
+	{ "integPos", offsetof(Output, integPos), 3 },
+};
+
+// Exhaustively scan [0, domHi] comparing glibc sinf/cosf vs double-rounded sin/cos;
+// write all mismatches as (inputBits, glibcBits) pairs: header TFIX, sinN, cosN.
+static void EmitTrigTable(const char* path, uint32_t domHi) {
+	std::vector<TrigFixEntry> sinFix, cosFix;
+	for (uint64_t u = 0; u <= domHi; u++) {
+		float x;
+		uint32_t ub = (uint32_t)u;
+		memcpy(&x, &ub, 4);
+		float hs = sinf(x), hc = cosf(x);
+		float ds = (float)sin((double)x), dc = (float)cos((double)x);
+		uint32_t hsb, hcb, dsb, dcb;
+		memcpy(&hsb, &hs, 4); memcpy(&hcb, &hc, 4);
+		memcpy(&dsb, &ds, 4); memcpy(&dcb, &dc, 4);
+		if (hsb != dsb) sinFix.push_back({ ub, hsb });
+		if (hcb != dcb) cosFix.push_back({ ub, hcb });
+	}
+	FILE* f = fopen(path, "wb");
+	if (!f) { fprintf(stderr, "cannot write %s\n", path); exit(2); }
+	uint32_t magic = 0x54464958u, sn = (uint32_t)sinFix.size(), cn = (uint32_t)cosFix.size();
+	fwrite(&magic, 4, 1, f); fwrite(&sn, 4, 1, f); fwrite(&cn, 4, 1, f);
+	fwrite(sinFix.data(), sizeof(TrigFixEntry), sn, f);
+	fwrite(cosFix.data(), sizeof(TrigFixEntry), cn, f);
+	fclose(f);
+	printf("TRIG TABLE: wrote %s (%u sin fixes, %u cos fixes)\n", path, sn, cn);
+}
+
+int main(int argc, char** argv) {
+	size_t samples = 4 * 1000 * 1000;
+	bool trigExhaustive = false;
+	const char* emitPath = nullptr;
+	const char* tablePath = nullptr;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--samples") && i + 1 < argc) samples = strtoull(argv[++i], nullptr, 10);
+		else if (!strcmp(argv[i], "--trig-exhaustive")) trigExhaustive = true;
+		else if (!strcmp(argv[i], "--emit-trig-table") && i + 1 < argc) emitPath = argv[++i];
+		else if (!strcmp(argv[i], "--trig-table") && i + 1 < argc) tablePath = argv[++i];
+	}
+
+	uint32_t domHiBits;
+	{ float t = CU_ANGULAR_MOTION_THRESHOLD; memcpy(&domHiBits, &t, 4); }
+
+	if (emitPath) {
+		EmitTrigTable(emitPath, domHiBits);
+		tablePath = emitPath;
+	}
+	if (tablePath) {
+		if (!CuLoadTrigFix(tablePath)) {
+			fprintf(stderr, "failed to load trig table %s\n", tablePath);
+			return 2;
+		}
+		printf("TRIG TABLE: loaded %s\n", tablePath);
+	}
+
+	// ---------- op fuzz ----------
+	std::vector<Input> inputs(samples);
+	Gen gen(0x5EED5EEDull);
+	for (size_t i = 0; i < samples; i++)
+		FillInput(gen, inputs[i]);
+	HostFillDerived(inputs.data(), samples);
+
+	std::vector<Output> hostOut(samples), devOut(samples);
+	HostCompute(inputs.data(), hostOut.data(), samples);
+
+	Input* dIn; Output* dOut;
+	Check(cudaMalloc(&dIn, samples * sizeof(Input)), "malloc in");
+	Check(cudaMalloc(&dOut, samples * sizeof(Output)), "malloc out");
+	Check(cudaMemcpy(dIn, inputs.data(), samples * sizeof(Input), cudaMemcpyHostToDevice), "upload");
+	ComputeKernel<<<(unsigned)((samples + 255) / 256), 256>>>(dIn, dOut, samples);
+	Check(cudaGetLastError(), "launch");
+	Check(cudaDeviceSynchronize(), "sync");
+	Check(cudaMemcpy(devOut.data(), dOut, samples * sizeof(Output), cudaMemcpyDeviceToHost), "download");
+	cudaFree(dIn); cudaFree(dOut);
+
+	int failures = 0;
+	for (const FieldDef& f : FIELDS) {
+		size_t bad = 0, firstBad = (size_t)-1;
+		for (size_t i = 0; i < samples; i++) {
+			const float* h = (const float*)((const char*)&hostOut[i] + f.offset);
+			const float* d = (const float*)((const char*)&devOut[i] + f.offset);
+			for (size_t k = 0; k < f.count; k++) {
+				if (!FloatEq(h[k], d[k])) {
+					if (bad == 0) firstBad = i;
+					bad++;
+					break;
+				}
+			}
+		}
+		if (bad) {
+			failures++;
+			printf("MATHTEST %-10s FAIL (%zu/%zu samples differ, first at %zu)\n", f.name, bad, samples, firstBad);
+			const float* h = (const float*)((const char*)&hostOut[firstBad] + f.offset);
+			const float* d = (const float*)((const char*)&devOut[firstBad] + f.offset);
+			for (size_t k = 0; k < f.count; k++) {
+				uint32_t hb, db;
+				memcpy(&hb, &h[k], 4); memcpy(&db, &d[k], 4);
+				if (hb != db)
+					printf("    [%zu] host %.9g (0x%08X) dev %.9g (0x%08X)\n", k, h[k], hb, d[k], db);
+			}
+			const uint32_t* ib = (const uint32_t*)&inputs[firstBad];
+			printf("    input qa=%08X %08X %08X %08X qb=%08X %08X %08X %08X w=%08X %08X %08X\n",
+				ib[offsetof(Input, qa) / 4], ib[offsetof(Input, qa) / 4 + 1],
+				ib[offsetof(Input, qa) / 4 + 2], ib[offsetof(Input, qa) / 4 + 3],
+				ib[offsetof(Input, qb) / 4], ib[offsetof(Input, qb) / 4 + 1],
+				ib[offsetof(Input, qb) / 4 + 2], ib[offsetof(Input, qb) / 4 + 3],
+				ib[offsetof(Input, w) / 4], ib[offsetof(Input, w) / 4 + 1], ib[offsetof(Input, w) / 4 + 2]);
+		} else {
+			printf("MATHTEST %-10s PASS (%zu samples)\n", f.name, samples);
+		}
+	}
+
+	// ---------- trig domain check ----------
+	// integrateTransform trig args lie in [0, ANGULAR_MOTION_THRESHOLD]
+	const uint32_t domLo = 0;
+	const uint32_t domHi = domHiBits;
+
+	size_t trigN = trigExhaustive ? (size_t)(domHi - domLo + 1) : (size_t)16 * 1000 * 1000;
+	const size_t CHUNK = 16 * 1000 * 1000;
+	uint32_t* dBits; float *dSin, *dCos;
+	Check(cudaMalloc(&dBits, CHUNK * 4), "malloc bits");
+	Check(cudaMalloc(&dSin, CHUNK * 4), "malloc sin");
+	Check(cudaMalloc(&dCos, CHUNK * 4), "malloc cos");
+	std::vector<uint32_t> bits(CHUNK);
+	std::vector<float> dSinH(CHUNK), dCosH(CHUNK), hSin(CHUNK), hCos(CHUNK);
+
+	size_t sinBad = 0, cosBad = 0;
+	uint64_t sinFirst = ~0ull, cosFirst = ~0ull;
+	Gen tg(0x7717ull);
+	for (size_t done = 0; done < trigN; done += CHUNK) {
+		size_t n = (trigN - done < CHUNK) ? (trigN - done) : CHUNK;
+		for (size_t i = 0; i < n; i++)
+			bits[i] = trigExhaustive ? (uint32_t)(domLo + done + i)
+			                         : (uint32_t)(domLo + tg.Next() % (uint64_t)(domHi - domLo + 1));
+		Check(cudaMemcpy(dBits, bits.data(), n * 4, cudaMemcpyHostToDevice), "upload bits");
+		TrigKernel<<<(unsigned)((n + 255) / 256), 256>>>(dBits, dSin, dCos, n);
+		Check(cudaGetLastError(), "trig launch");
+		Check(cudaMemcpy(dSinH.data(), dSin, n * 4, cudaMemcpyDeviceToHost), "dl sin");
+		Check(cudaMemcpy(dCosH.data(), dCos, n * 4, cudaMemcpyDeviceToHost), "dl cos");
+		HostTrig(bits.data(), hSin.data(), hCos.data(), n);
+		for (size_t i = 0; i < n; i++) {
+			if (!FloatEq(hSin[i], dSinH[i])) { if (!sinBad++) sinFirst = bits[i]; }
+			if (!FloatEq(hCos[i], dCosH[i])) { if (!cosBad++) cosFirst = bits[i]; }
+		}
+	}
+	cudaFree(dBits); cudaFree(dSin); cudaFree(dCos);
+
+	auto report = [&](const char* name, size_t bad, uint64_t first) {
+		if (bad) {
+			failures++;
+			float x; uint32_t fb = (uint32_t)first; memcpy(&x, &fb, 4);
+			printf("MATHTEST %-10s FAIL (%zu/%zu differ, first input %.9g / 0x%08X)\n", name, bad, trigN, x, fb);
+		} else {
+			printf("MATHTEST %-10s PASS (%zu values%s)\n", name, trigN, trigExhaustive ? ", exhaustive domain" : "");
+		}
+	};
+	report("sinf", sinBad, sinFirst);
+	report("cosf", cosBad, cosFirst);
+
+	if (failures) {
+		printf("MATHTEST: %d op(s) FAILED\n", failures);
+		return 1;
+	}
+	printf("MATHTEST: ALL PASS\n");
+	return 0;
+}
