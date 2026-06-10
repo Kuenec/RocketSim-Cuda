@@ -288,10 +288,31 @@ only +-0 sign on normal components.
 NOTE: RocketSim uses a custom btRSBroadphase ("voxel broadphase", warns on rays >7.4uu)
 - relevant for the collision-phase port later.
 
+**DONE (2026-06-10): FULL-world device raycast bit-exact** (`--ray-fuzz 200000` PASS,
+seeds 1337+99, statics + ball sphere + car compound box). CudaConvexCast.cuh: faithful
+btVoronoiSimplexSolver + btSubsimplexConvexCast (point cast, 32 iters, eps 1e-4,
+equal-vertex 1e-4) + sphere/box supports. CRITICAL LESSONS:
+- CPU re-lerps BOTH transforms each lambda update; lerp(o,o,lambda) = o*(1-l)+o*l is
+  NOT bitwise o -> must interpolate the static shape's origin too.
+- btRSBroadphase voxel grid GATES candidates: short rays (len^2 < cellSizeSq) test ONLY
+  proxies registered in rayFrom's cell. Statics smear +-1 cell (brute force provably
+  equivalent); DYNAMICS register in 3x3x3 around their aabbMin's cell -> device gate:
+  |cellIdx(rayFrom) - cellIdx(dyn aabbMin)| <= 1 per axis (CuGetCellIndices replicates
+  (pos-min)*(1/cellSize) trunc+clamp). CPU MISSES geometrically-hit dynamics outside
+  the gate - reference behavior, bugs included. GpuDynBody carries aabbMin; production
+  kernel must track proxy aabbMin per body (updated in collision phase / updateAabbs,
+  NOT every position change - aabbMin lags to last updateAabbs!).
+- Grid params live in btRSBroadphase (public): minPos/cellSize/cells dims; same grid
+  drives COLLISION pair generation (calculateOverlappingPairs) for task 10.
+
 ### Next Steps (in order)
-1. Dynamic-shape ray path: port btVoronoiSimplexSolver (closest-pt) + btSubsimplexConvexCast
-   + sphere/box/compound supports for ball/car ray hits; extend ray-fuzz with ball+cars
-   in candidate set (CPU mask AllFilter vs device with dynamic shapes).
+1. Port resolveSingleCollision + resolveSingleBilateral (btContactConstraint.cpp), then
+   btVehicleRL updateVehicleFirst/Second device port (wheel transforms incl. steering
+   quat + basis assembly + fwd normalize; rayCast wrapper = castRay semantics incl.
+   hasContactResponse no-hit rule + normal normalize; suspension; friction impulses)
+   with per-sub-phase capture in Car::_PreTickUpdate; then Car game-logic state
+   machines (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll + RLConst
+   curves); validate via --gpu-compare with car pre-tick segment.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
