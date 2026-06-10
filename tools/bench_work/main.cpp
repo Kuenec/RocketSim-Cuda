@@ -26,6 +26,7 @@
 
 #ifdef RS_CUDA
 #include "Cuda/CudaStep.h"
+#include "Cuda/PhaseCapture.h"
 #endif
 
 #include <chrono>
@@ -89,6 +90,8 @@ struct Args {
 	std::string dumpStateDir;       // diagnostic: write per-arena serialized state blobs
 	bool profile = false;           // print per-phase timing breakdown after the run
 	bool gpuStep = false;           // GPU produces the simulation result (monolithic kernel)
+	int gpuCompare = 0;             // lockstep-validate ported GPU phases for N ticks
+	std::string trigTable = "glibc_trig_fix.bin"; // libm correction table (see CudaMath.cuh)
 };
 
 static void PrintUsage(const char* argv0) {
@@ -129,6 +132,12 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 			out.profile = true;
 		} else if (!strcmp(argv[i], "--gpu-step")) {
 			out.gpuStep = true;
+		} else if (!strcmp(argv[i], "--gpu-compare")) {
+			const char* v = need("--gpu-compare"); if (!v) return false;
+			out.gpuCompare = atoi(v);
+		} else if (!strcmp(argv[i], "--trig-table")) {
+			const char* v = need("--trig-table"); if (!v) return false;
+			out.trigTable = v;
 		} else if (!strcmp(argv[i], "--dump-arena-hashes")) {
 			out.dumpArenaHashes = true;
 		} else if (!strcmp(argv[i], "--dump-state-dir")) {
@@ -311,16 +320,58 @@ static uint64_t RunCpu(const Args& args, double& elapsedS) {
 static rscuda::GpuVec3 ToGpu(const Vec& v) { return { v.x, v.y, v.z }; }
 static Vec FromGpu(const rscuda::GpuVec3& v) { return Vec(v.x, v.y, v.z); }
 
-// GpuMat3 rows = RocketSim RotMat forward/right/up
-static rscuda::GpuMat3 ToGpu(const RotMat& m) {
-	return { { ToGpu(m.forward), ToGpu(m.right), ToGpu(m.up) } };
+static rscuda::GpuVec3 ToGpuB(const btVector3& v) { return { v.x(), v.y(), v.z() }; }
+static btVector3 FromGpuB(const rscuda::GpuVec3& v) { return btVector3(v.x, v.y, v.z); }
+
+// GpuMat3 rows = btMatrix3x3 rows (row-major, BULLET basis - not RocketSim RotMat)
+static rscuda::GpuMat3 ToGpuB(const btMatrix3x3& m) {
+	return { { ToGpuB(m[0]), ToGpuB(m[1]), ToGpuB(m[2]) } };
 }
-static RotMat FromGpu(const rscuda::GpuMat3& m) {
-	RotMat r;
-	r.forward = FromGpu(m.row[0]);
-	r.right = FromGpu(m.row[1]);
-	r.up = FromGpu(m.row[2]);
-	return r;
+static btMatrix3x3 FromGpuB(const rscuda::GpuMat3& m) {
+	return btMatrix3x3(
+		m.row[0].x, m.row[0].y, m.row[0].z,
+		m.row[1].x, m.row[1].y, m.row[1].z,
+		m.row[2].x, m.row[2].y, m.row[2].z);
+}
+
+// Full bullet-unit dynamic state of a rigid body -> GPU mirror
+static void SnapshotBody(const btRigidBody& rb, rscuda::GpuBodyState& b) {
+	const btTransform& t = rb.getWorldTransform();
+	b.basis = ToGpuB(t.getBasis());
+	b.pos = ToGpuB(t.getOrigin());
+	b.linVel = ToGpuB(rb.getLinearVelocity());
+	b.angVel = ToGpuB(rb.getAngularVelocity());
+	b.totalForce = ToGpuB(rb.getTotalForce());
+	b.totalTorque = ToGpuB(rb.getTotalTorque());
+	b.invInertiaWorld = ToGpuB(rb.getInvInertiaTensorWorld());
+	b.activationState = rb.getActivationState();
+	b.deactivationTime = rb.getDeactivationTime();
+}
+
+static void WritebackBody(btRigidBody& rb, const rscuda::GpuBodyState& b) {
+	btTransform t;
+	t.setBasis(FromGpuB(b.basis));
+	t.setOrigin(FromGpuB(b.pos));
+	rb.setWorldTransform(t);
+	rb.setLinearVelocity(FromGpuB(b.linVel));
+	rb.setAngularVelocity(FromGpuB(b.angVel));
+	rb.updateInertiaTensor(); // same result as GPU's carried tensor when basis matches
+	rb.forceActivationState(b.activationState);
+	rb.setDeactivationTime(b.deactivationTime);
+}
+
+static rscuda::GpuBodyConsts MakeBodyConsts(const btRigidBody& rb, float dt) {
+	rscuda::GpuBodyConsts c = {};
+	c.invMass = rb.getInvMass();
+	c.invInertiaLocal = ToGpuB(rb.getInvInertiaDiagLocal());
+	// CPU recomputes btPow(1-damping, dt) every applyDamping call with constant args;
+	// computing it once here with the same expression gives the identical float
+	c.linDampFactor = powf(1.0f - rb.getLinearDamping(), dt);
+	c.angDampFactor = powf(1.0f - rb.getAngularDamping(), dt);
+	c.linSleepThreshSq = rb.getLinearSleepingThreshold() * rb.getLinearSleepingThreshold();
+	c.angSleepThreshSq = rb.getAngularSleepingThreshold() * rb.getAngularSleepingThreshold();
+	c.noRot = rb.m_noRot;
+	return c;
 }
 
 static rscuda::GpuCarControls ToGpu(const CarControls& c) {
@@ -337,12 +388,7 @@ static CarControls FromGpu(const rscuda::GpuCarControls& g) {
 
 static void SnapshotCar(Car* car, rscuda::GpuBodyState& body, rscuda::GpuCarGameState& g) {
 	CarState cs = car->GetState();
-	body.basis = ToGpu(cs.rotMat);
-	body.pos = ToGpu(cs.pos);
-	body.linVel = ToGpu(cs.vel);
-	body.angVel = ToGpu(cs.angVel);
-	body.activationState = car->_rigidBody.getActivationState();
-	body.deactivationTime = car->_rigidBody.getDeactivationTime();
+	SnapshotBody(car->_rigidBody, body);
 
 	g = {};
 	g.tickCountSinceUpdate = cs.tickCountSinceUpdate;
@@ -377,11 +423,11 @@ static void SnapshotCar(Car* car, rscuda::GpuBodyState& body, rscuda::GpuCarGame
 }
 
 static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscuda::GpuCarGameState& g) {
-	CarState cs = car->GetState();
-	cs.rotMat = FromGpu(body.basis);
-	cs.pos = FromGpu(body.pos);
-	cs.vel = FromGpu(body.linVel);
-	cs.angVel = FromGpu(body.angVel);
+	WritebackBody(car->_rigidBody, body);
+	CarState& cs = car->_internalState;
+	// Car::GetState refreshes pos/vel/angVel from the body but NOT rotMat (that happens
+	// in _PostTickUpdate, which doesn't run in GPU mode) - sync it here
+	cs.rotMat = (RotMat)car->_rigidBody.getWorldTransform().getBasis();
 	cs.isOnGround = g.isOnGround;
 	for (int w = 0; w < 4; w++) cs.wheelsWithContact[w] = g.wheelsWithContact[w];
 	cs.hasJumped = g.hasJumped; cs.hasDoubleJumped = g.hasDoubleJumped; cs.hasFlipped = g.hasFlipped;
@@ -407,10 +453,141 @@ static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscud
 	cs.ballHitInfo.tickCountWhenHit = g.ballHitInfo.tickCountWhenHit;
 	cs.ballHitInfo.tickCountWhenExtraImpulseApplied = g.ballHitInfo.tickCountWhenExtraImpulseApplied;
 	cs.lastControls = FromGpu(g.lastControls);
-	car->SetState(cs);
-	// SetState resets tickCountSinceUpdate; restore the GPU-tracked value
-	car->_internalState.tickCountSinceUpdate = g.tickCountSinceUpdate;
+	cs.tickCountSinceUpdate = g.tickCountSinceUpdate;
 	car->_velocityImpulseCache = FromGpu(g.velocityImpulseCache);
+}
+
+static constexpr float TICK_TIME = 1.0f / 120.0f;
+
+static void RequireTrigTable(const Args& args) {
+	if (!rscuda::LoadTrigFix(args.trigTable.c_str())) {
+		fprintf(stderr, "GPU: FAIL - missing/corrupt trig correction table '%s'.\n"
+			"Generate it once on this machine with:\n"
+			"  ./build/cuda_math_test --samples 1000 --emit-trig-table %s\n",
+			args.trigTable.c_str(), args.trigTable.c_str());
+		exit(2);
+	}
+}
+
+static void UploadConsts(rscuda::GpuBatch* batch, Arena* arena, std::vector<CarSlot>& slots) {
+	std::vector<rscuda::GpuBodyConsts> consts(1 + slots.size());
+	consts[0] = MakeBodyConsts(arena->ball->_rigidBody, TICK_TIME);
+	for (size_t c = 0; c < slots.size(); c++)
+		consts[1 + c] = MakeBodyConsts(slots[c].car->_rigidBody, TICK_TIME);
+	rscuda::UploadBodyConsts(batch, consts.data());
+}
+
+// ---- lockstep phase validation (--gpu-compare N) ----
+// Per tick: run the CPU step with capture enabled, then for each ported phase upload
+// the CPU pre-phase state, run JUST that phase on the GPU, and bit-compare the result
+// against the CPU post-phase capture. Localizes any divergence to (tick, phase, body,
+// field, bits).
+
+static rscuda::GpuBodyState SnapToGpu(const rscap::BodySnap& s) {
+	rscuda::GpuBodyState b;
+	for (int i = 0; i < 3; i++) {
+		b.basis.row[i] = { s.basis[i * 3], s.basis[i * 3 + 1], s.basis[i * 3 + 2] };
+		b.invInertiaWorld.row[i] = { s.invInertiaWorld[i * 3], s.invInertiaWorld[i * 3 + 1], s.invInertiaWorld[i * 3 + 2] };
+	}
+	b.pos = { s.pos[0], s.pos[1], s.pos[2] };
+	b.linVel = { s.linVel[0], s.linVel[1], s.linVel[2] };
+	b.angVel = { s.angVel[0], s.angVel[1], s.angVel[2] };
+	b.totalForce = { s.totalForce[0], s.totalForce[1], s.totalForce[2] };
+	b.totalTorque = { s.totalTorque[0], s.totalTorque[1], s.totalTorque[2] };
+	b.activationState = s.activationState;
+	b.deactivationTime = s.deactivationTime;
+	return b;
+}
+
+// returns index of first differing float (-1 if equal); NaN==NaN
+static int BodyStateDiff(const rscuda::GpuBodyState& a, const rscuda::GpuBodyState& b) {
+	const uint32_t* ua = (const uint32_t*)&a;
+	const uint32_t* ub = (const uint32_t*)&b;
+	for (size_t i = 0; i < sizeof(a) / 4; i++)
+		if (ua[i] != ub[i])
+			return (int)i;
+	return -1;
+}
+
+static int RunGpuCompare(const Args& args) {
+	if (!rscuda::Available()) {
+		fprintf(stderr, "GPU_COMPARE: FAIL (no usable CUDA device)\n");
+		return 2;
+	}
+	RequireTrigTable(args);
+
+	std::vector<CarSlot> slots;
+	Arena* arena = SetupArena(args, 0, slots);
+	const int numPads = (int)arena->GetBoostPads().size();
+	const int numBodies = 1 + args.cars;
+
+	rscuda::GpuBatch* batch = rscuda::CreateBatch(1, args.cars, numPads);
+	UploadConsts(batch, arena, slots);
+
+	// body index mapping: our order is [ball, car0, car1...]
+	std::vector<const void*> rbOrder(numBodies);
+	rbOrder[0] = &arena->ball->_rigidBody;
+	for (int c = 0; c < args.cars; c++)
+		rbOrder[1 + c] = &slots[c].car->_rigidBody;
+	auto mapSnaps = [&](const std::vector<rscap::BodySnap>& snaps, std::vector<rscuda::GpuBodyState>& out) {
+		for (const rscap::BodySnap& s : snaps) {
+			for (int i = 0; i < numBodies; i++) {
+				if (rbOrder[i] == s.rb) {
+					out[i] = SnapToGpu(s);
+					break;
+				}
+			}
+		}
+	};
+
+	// (uploaded once; cars/pads device buffers are untouched by these phases)
+	std::vector<rscuda::GpuCarGameState> carsDummy(args.cars);
+	std::vector<rscuda::GpuPadState> padsDummy(numPads);
+	std::vector<rscuda::GpuBodyState> preState(numBodies), refState(numBodies), gotState(numBodies);
+
+	struct Segment {
+		rscap::Point pre, post;
+		int phase;
+		const char* name;
+	};
+	const Segment SEGMENTS[] = {
+		{ rscap::PRE_BULLET, rscap::AFTER_PREDICT, rscuda::GPU_PHASE_PREDICT, "predict" },
+		{ rscap::AFTER_SOLVE, rscap::AFTER_INTEGRATE, rscuda::GPU_PHASE_INTEGRATE, "integrate" },
+		{ rscap::AFTER_INTEGRATE, rscap::AFTER_ACTIVATION, rscuda::GPU_PHASE_ACTIVATION, "activation" },
+	};
+
+	for (int tick = 0; tick < args.gpuCompare; tick++) {
+		for (CarSlot& slot : slots)
+			UpdateControls(slot);
+		rscap::enabled = true;
+		arena->Step(1);
+		rscap::enabled = false;
+
+		for (const Segment& seg : SEGMENTS) {
+			mapSnaps(rscap::points[seg.pre], preState);
+			mapSnaps(rscap::points[seg.post], refState);
+			rscuda::UploadArenaState(batch, 0, preState.data(), carsDummy.data(), padsDummy.data());
+			rscuda::RunPhaseSegment(batch, seg.phase, seg.phase);
+			rscuda::DownloadArenaState(batch, 0, gotState.data(), carsDummy.data(), padsDummy.data());
+
+			for (int bIdx = 0; bIdx < numBodies; bIdx++) {
+				int d = BodyStateDiff(refState[bIdx], gotState[bIdx]);
+				if (d >= 0) {
+					const uint32_t* cr = (const uint32_t*)&refState[bIdx];
+					const uint32_t* gr = (const uint32_t*)&gotState[bIdx];
+					printf("GPU_COMPARE: FAIL tick %d phase %s body %d (%s) float[%d]: cpu 0x%08X gpu 0x%08X\n",
+						tick, seg.name, bIdx, bIdx == 0 ? "ball" : "car", d, cr[d], gr[d]);
+					return 1;
+				}
+			}
+		}
+	}
+
+	printf("GPU_COMPARE: PASS (%d ticks, phases: predict, integrate, activation; %d bodies bit-exact)\n",
+		args.gpuCompare, numBodies);
+	rscuda::DestroyBatch(batch);
+	delete arena;
+	return 0;
 }
 
 static uint64_t RunGpu(const Args& args, double& elapsedS) {
@@ -427,6 +604,8 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 
 	const int numPads = (int)arenas[0]->GetBoostPads().size();
 	rscuda::GpuBatch* batch = rscuda::CreateBatch(args.arenas, args.cars, numPads);
+	RequireTrigTable(args);
+	UploadConsts(batch, arenas[0], slotsPerArena[0]);
 
 	// Precompute the full control schedule (identical Rng sequence to the CPU path)
 	std::vector<rscuda::GpuCarControls> schedule((size_t)args.arenas * args.cars * args.ticks);
@@ -454,13 +633,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 	std::vector<rscuda::GpuPadState> pads(numPads);
 	for (int a = 0; a < args.arenas; a++) {
 		Ball* ball = arenas[a]->ball;
-		BallState bs = ball->GetState();
-		bodies[0].basis = ToGpu(bs.rotMat);
-		bodies[0].pos = ToGpu(bs.pos);
-		bodies[0].linVel = ToGpu(bs.vel);
-		bodies[0].angVel = ToGpu(bs.angVel);
-		bodies[0].activationState = ball->_rigidBody.getActivationState();
-		bodies[0].deactivationTime = ball->_rigidBody.getDeactivationTime();
+		SnapshotBody(ball->_rigidBody, bodies[0]);
 		for (int c = 0; c < args.cars; c++)
 			SnapshotCar(slotsPerArena[a][c].car, bodies[1 + c], cars[c]);
 		auto& padList = arenas[a]->GetBoostPads();
@@ -485,13 +658,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 	uint64_t combinedHash = FNV_BASIS;
 	for (int a = 0; a < args.arenas; a++) {
 		rscuda::DownloadArenaState(batch, a, bodies.data(), cars.data(), pads.data());
-		Ball* ball = arenas[a]->ball;
-		BallState bs = ball->GetState();
-		bs.rotMat = FromGpu(bodies[0].basis);
-		bs.pos = FromGpu(bodies[0].pos);
-		bs.vel = FromGpu(bodies[0].linVel);
-		bs.angVel = FromGpu(bodies[0].angVel);
-		ball->SetState(bs);
+		WritebackBody(arenas[a]->ball->_rigidBody, bodies[0]);
 		for (int c = 0; c < args.cars; c++)
 			WritebackCar(slotsPerArena[a][c].car, bodies[1 + c], cars[c]);
 		auto& padList = arenas[a]->GetBoostPads();
@@ -535,6 +702,15 @@ int main(int argc, char** argv) {
 	RocketSim::Init(args.meshDir, true);
 
 	rsprof::enabled = args.profile;
+
+	if (args.gpuCompare > 0) {
+#ifdef RS_CUDA
+		return RunGpuCompare(args);
+#else
+		fprintf(stderr, "GPU_COMPARE: FAIL (built without CUDA toolkit)\n");
+		return 2;
+#endif
+	}
 
 	double elapsedS = 0;
 	uint64_t combinedHash;

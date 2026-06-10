@@ -15,8 +15,9 @@ subject to the following restrictions:
 
 #include "btDiscreteDynamicsWorld.h"
 
-// 2026-06-10: phase timing for the CUDA port (work copy only)
+// 2026-06-10: phase timing + phase-boundary capture for the CUDA port (work copy only)
 #include "../../../../src/Profiling.h"
+#include "../../../../src/Cuda/PhaseCapture.h"
 
 //collision detection
 #include "../../BulletCollision/CollisionDispatch/btCollisionDispatcher.h"
@@ -402,11 +403,16 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 		(*m_internalPreTickCallback)(this, timeStep);
 	}
 
+	if (rscap::enabled)
+		rscap::Capture(rscap::PRE_BULLET, this);
+
 	///apply gravity, predict motion
 	{
 		rsprof::Scope _ps(rsprof::BT_PREDICT);
 		predictUnconstraintMotion(timeStep);
 	}
+	if (rscap::enabled)
+		rscap::Capture(rscap::AFTER_PREDICT, this);
 
 	btDispatcherInfo& dispatchInfo = getDispatchInfo();
 
@@ -420,11 +426,15 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 		rsprof::Scope _ps(rsprof::BT_COLLISION);
 		performDiscreteCollisionDetection();
 	}
+	if (rscap::enabled)
+		rscap::Capture(rscap::AFTER_COLLISION, this);
 
 	{
 		rsprof::Scope _ps(rsprof::BT_ISLANDS);
 		calculateSimulationIslands();
 	}
+	if (rscap::enabled)
+		rscap::Capture(rscap::AFTER_ISLANDS, this);
 
 	getSolverInfo().m_timeStep = timeStep;
 
@@ -433,6 +443,8 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 		rsprof::Scope _ps(rsprof::BT_SOLVE);
 		solveConstraints(getSolverInfo());
 	}
+	if (rscap::enabled)
+		rscap::Capture(rscap::AFTER_SOLVE, this);
 
 	///CallbackTriggers();
 
@@ -442,6 +454,8 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 		rsprof::Scope _ps(rsprof::BT_INTEGRATE);
 		integrateTransforms(timeStep);
 	}
+	if (rscap::enabled)
+		rscap::Capture(rscap::AFTER_INTEGRATE, this);
 
 	///update vehicle simulation
 	{
@@ -453,6 +467,8 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 		rsprof::Scope _ps(rsprof::BT_ACTIVATION);
 		updateActivationState(timeStep);
 	}
+	if (rscap::enabled)
+		rscap::Capture(rscap::AFTER_ACTIVATION, this);
 
 	if (0 != m_internalTickCallback)
 	{

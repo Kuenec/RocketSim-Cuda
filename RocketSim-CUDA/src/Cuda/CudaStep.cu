@@ -1,4 +1,4 @@
-// 2026-06-10: Monolithic GPU step - implementation scaffold.
+// 2026-06-10: Monolithic GPU step.
 //
 // Architecture (per project requirements): ONE __global__ kernel executes the ENTIRE
 // physics tick for all arenas in the batch, looping ticks inside the kernel so a whole
@@ -6,23 +6,24 @@
 // __device__ function called from the kernel in CPU reference order:
 //
 //   per tick:
-//     1. ball zero-vel sleep check        (Arena::Step head)
-//     2. car pre-tick (vehicle+game)      (Car::_PreTickUpdate)
-//     3. pad pre-tick                     (BoostPad::_PreTickUpdate)
-//     4. ball pre-tick                    (Ball::_PreTickUpdate)
-//     5. bullet: predict unconstrained    (btDiscreteDynamicsWorld)
-//     6. bullet: collision detection      (broadphase + narrowphase + callbacks)
-//     7. bullet: islands + solver         (btSequentialImpulseConstraintSolver)
-//     8. bullet: integrate transforms
-//     9. bullet: update activation
-//    10. car post-tick + finish + pads    (Car::_PostTickUpdate/_FinishPhysicsTick)
-//    11. pad post-tick, ball finish       (Arena::Step tail)
+//     1. ball zero-vel sleep check        (Arena::Step head)            [not ported]
+//     2. car pre-tick (vehicle+game)      (Car::_PreTickUpdate)         [not ported]
+//     3. pad pre-tick                     (BoostPad::_PreTickUpdate)    [not ported]
+//     4. ball pre-tick                    (Ball::_PreTickUpdate)        [not ported]
+//     5. bullet: predict (damping)        (predictUnconstraintMotion)   [PORTED]
+//     6. bullet: collision detection      (broadphase+narrowphase+cb)   [not ported]
+//     7. bullet: islands + solver         (btSequentialImpulse...)      [not ported]
+//     8. bullet: integrate transforms     (integrateTransforms)         [PORTED]
+//     9. bullet: update activation        (updateActivationState)       [PORTED]
+//    10. car post-tick + finish + pads    (Car::_PostTickUpdate)        [not ported]
+//    11. pad post-tick, ball finish       (Arena::Step tail)            [not ported]
 //
-// Phases are being ported one at a time; unported phases are currently absent, so the
-// kernel does NOT yet produce correct simulation output. CUDA% stays 0 until the full
-// step matches the CPU reference.
+// The kernel does NOT yet produce correct simulation output (unported phases above).
+// CUDA% stays 0 until the full step matches the CPU reference. --gpu-compare in
+// rocketsim_bench validates each PORTED phase bit-exactly against CPU capture points.
 
 #include "CudaStep.h"
+#include "CudaMath.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -42,6 +43,10 @@ bool Available() {
 	return cudaGetDeviceCount(&n) == cudaSuccess && n > 0;
 }
 
+bool LoadTrigFix(const char* path) {
+	return CuLoadTrigFix(path);
+}
+
 struct GpuBatch {
 	int numArenas;
 	int numCars;        // per arena
@@ -49,11 +54,12 @@ struct GpuBatch {
 	int bodiesPerArena; // 1 ball + numCars
 
 	GpuBodyState* dBodies;      // [numArenas * bodiesPerArena]
+	GpuBodyConsts* dConsts;     // [bodiesPerArena]
 	GpuCarGameState* dCars;     // [numArenas * numCars]
 	GpuPadState* dPads;         // [numArenas * numPads]
 	GpuCarControls* dSchedule;  // [numArenas * numCars * scheduleTicks]
 	int scheduleTicks;
-	uint64_t tickCount;         // ticks simulated so far (mirrors Arena::tickCount delta)
+	uint64_t tickCount;
 };
 
 GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
@@ -65,6 +71,7 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	b->scheduleTicks = 0;
 	b->tickCount = 0;
 	CudaCheck(cudaMalloc(&b->dBodies, sizeof(GpuBodyState) * numArenas * b->bodiesPerArena), "alloc bodies");
+	CudaCheck(cudaMalloc(&b->dConsts, sizeof(GpuBodyConsts) * b->bodiesPerArena), "alloc consts");
 	CudaCheck(cudaMalloc(&b->dCars, sizeof(GpuCarGameState) * numArenas * numCarsPerArena), "alloc cars");
 	CudaCheck(cudaMalloc(&b->dPads, sizeof(GpuPadState) * numArenas * numPads), "alloc pads");
 	b->dSchedule = nullptr;
@@ -73,6 +80,7 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 
 void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dBodies);
+	cudaFree(b->dConsts);
 	cudaFree(b->dCars);
 	cudaFree(b->dPads);
 	cudaFree(b->dSchedule);
@@ -89,6 +97,11 @@ void UploadArenaState(GpuBatch* b, int arenaIdx,
 		sizeof(GpuPadState) * b->numPads, cudaMemcpyHostToDevice), "upload pads");
 }
 
+void UploadBodyConsts(GpuBatch* b, const GpuBodyConsts* consts) {
+	CudaCheck(cudaMemcpy(b->dConsts, consts, sizeof(GpuBodyConsts) * b->bodiesPerArena,
+		cudaMemcpyHostToDevice), "upload consts");
+}
+
 void UploadControlSchedule(GpuBatch* b, const GpuCarControls* schedule, int numTicks) {
 	size_t count = (size_t)b->numArenas * b->numCars * numTicks;
 	cudaFree(b->dSchedule);
@@ -99,50 +112,161 @@ void UploadControlSchedule(GpuBatch* b, const GpuCarControls* schedule, int numT
 }
 
 // ============================== DEVICE-SIDE PHASES ==============================
-// Each phase is a __device__ function; the monolithic kernel below is the ONLY
-// call site, and the only path that produces simulation output in --gpu-step mode.
+// Bullet activation state constants (btCollisionObject.h)
+#define CU_ACTIVE_TAG 1
+#define CU_ISLAND_SLEEPING 2
+#define CU_WANTS_DEACTIVATION 3
+#define CU_DISABLE_DEACTIVATION 4
+#define CU_DISABLE_SIMULATION 5
+#define CU_DEACTIVATION_TIME 2.0f // gDeactivationTime global default
 
-// (phases land here as they are ported)
+__device__ __forceinline__ bool CuIsActive(int state) {
+	// btCollisionObject::isActive(): != FIXED_BASE_MULTI_BODY(6) && != ISLAND_SLEEPING && != DISABLE_SIMULATION
+	return state != 6 && state != CU_ISLAND_SLEEPING && state != CU_DISABLE_SIMULATION;
+}
+
+// btCollisionObject::setActivationState (respects DISABLE_* lock-in)
+__device__ __forceinline__ void CuSetActivationState(int& cur, int newState) {
+	if (cur != CU_DISABLE_DEACTIVATION && cur != CU_DISABLE_SIMULATION)
+		cur = newState;
+}
+
+// Phase 5: predictUnconstraintMotion (btDiscreteDynamicsWorld.cpp:1053).
+// All our bodies are dynamic (non-static/kinematic). The interpolation transform it
+// writes is write-only in RocketSim - skipped. Only damping has observable effect.
+__device__ __forceinline__ void PhasePredict(GpuBodyState& s, const GpuBodyConsts& c) {
+	CuVec3 lv = { s.linVel.x, s.linVel.y, s.linVel.z };
+	CuVec3 av = { s.angVel.x, s.angVel.y, s.angVel.z };
+	CuApplyDamping(lv, av, c.linDampFactor, c.angDampFactor);
+	s.linVel = { lv.x, lv.y, lv.z };
+	s.angVel = { av.x, av.y, av.z };
+}
+
+// Phase 8: integrateTransforms (btDiscreteDynamicsWorld.cpp:913). No CCD in RocketSim
+// (thresholds are 0). proceedToTransform = setCenterOfMassTransform = worldTransform
+// assignment + updateInertiaTensor.
+__device__ __forceinline__ void PhaseIntegrate(GpuBodyState& s, const GpuBodyConsts& c, float dt) {
+	if (!CuIsActive(s.activationState))
+		return;
+	CuMat3 basis = { { { s.basis.row[0].x, s.basis.row[0].y, s.basis.row[0].z },
+	                   { s.basis.row[1].x, s.basis.row[1].y, s.basis.row[1].z },
+	                   { s.basis.row[2].x, s.basis.row[2].y, s.basis.row[2].z } } };
+	CuVec3 pos = { s.pos.x, s.pos.y, s.pos.z };
+	CuVec3 lv = { s.linVel.x, s.linVel.y, s.linVel.z };
+	CuVec3 av = { s.angVel.x, s.angVel.y, s.angVel.z };
+
+	CuMat3 nb;
+	CuVec3 np;
+	CuIntegrateTransform(basis, pos, lv, av, dt, c.noRot != 0, nb, np);
+
+	CuMat3 invLocal = CuUpdateInertiaTensor(nb, { c.invInertiaLocal.x, c.invInertiaLocal.y, c.invInertiaLocal.z });
+
+	for (int i = 0; i < 3; i++) {
+		s.basis.row[i] = { nb.r[i].x, nb.r[i].y, nb.r[i].z };
+		s.invInertiaWorld.row[i] = { invLocal.r[i].x, invLocal.r[i].y, invLocal.r[i].z };
+	}
+	s.pos = { np.x, np.y, np.z };
+}
+
+// Phase 9: updateActivationState (btDiscreteDynamicsWorld.cpp:558) +
+// btRigidBody::updateDeactivation / wantsSleeping (btRigidBody.h:512/529)
+__device__ __forceinline__ void PhaseActivation(GpuBodyState& s, const GpuBodyConsts& c, float dt) {
+	// updateDeactivation
+	int st = s.activationState;
+	if (!(st == CU_ISLAND_SLEEPING || st == CU_DISABLE_DEACTIVATION)) {
+		CuVec3 lv = { s.linVel.x, s.linVel.y, s.linVel.z };
+		CuVec3 av = { s.angVel.x, s.angVel.y, s.angVel.z };
+		if (CuLength2(lv) < c.linSleepThreshSq && CuLength2(av) < c.angSleepThreshSq) {
+			s.deactivationTime += dt;
+		} else {
+			s.deactivationTime = 0.0f;
+			CuSetActivationState(s.activationState, 0);
+		}
+	}
+
+	// wantsSleeping
+	st = s.activationState;
+	bool wants;
+	if (st == CU_DISABLE_DEACTIVATION) wants = false;
+	else if (st == CU_ISLAND_SLEEPING || st == CU_WANTS_DEACTIVATION) wants = true;
+	else wants = s.deactivationTime > CU_DEACTIVATION_TIME;
+
+	if (wants) {
+		// non-static path of updateActivationState
+		if (s.activationState == CU_ACTIVE_TAG)
+			CuSetActivationState(s.activationState, CU_WANTS_DEACTIVATION);
+		if (s.activationState == CU_ISLAND_SLEEPING) {
+			s.angVel = { 0, 0, 0 };
+			s.linVel = { 0, 0, 0 };
+		}
+	} else {
+		if (s.activationState != CU_DISABLE_DEACTIVATION)
+			CuSetActivationState(s.activationState, CU_ACTIVE_TAG);
+	}
+}
 
 // ============================== MONOLITHIC KERNEL ==============================
 
 __global__ void GpuStepArenasKernel(
-	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads,
+	GpuBodyState* bodies, const GpuBodyConsts* consts,
+	GpuCarGameState* cars, GpuPadState* pads,
 	const GpuCarControls* schedule,
-	int numCars, int numPads, int numTicks, uint64_t startTickCount) {
+	int numCars, int numPads, int numTicks,
+	int startPhase, int endPhase, float dt) {
 
 	const int arenaIdx = blockIdx.x;
 	const int bodiesPerArena = 1 + numCars;
+	const int bodyIdx = threadIdx.x;
 
 	GpuBodyState* arenaBodies = bodies + (size_t)arenaIdx * bodiesPerArena;
 	GpuCarGameState* arenaCars = cars + (size_t)arenaIdx * numCars;
 	GpuPadState* arenaPads = pads + (size_t)arenaIdx * numPads;
-	(void)arenaBodies; (void)arenaPads;
+	(void)arenaCars; (void)arenaPads; (void)schedule;
 
 	for (int tick = 0; tick < numTicks; tick++) {
-		// Controls for this tick (input data, precomputed host-side once per run)
-		if (threadIdx.x < (unsigned)numCars && schedule) {
-			const GpuCarControls& c =
-				schedule[((size_t)arenaIdx * numCars + threadIdx.x) * numTicks + tick];
-			// lastControls handoff happens in car post-tick once that phase is ported;
-			// stash current controls nowhere yet - no phase consumes them.
-			(void)c; (void)arenaCars;
+		// Phases 1-4 (game pre-tick) land here.
+
+		if (startPhase <= GPU_PHASE_PREDICT && GPU_PHASE_PREDICT <= endPhase) {
+			if (bodyIdx < bodiesPerArena)
+				PhasePredict(arenaBodies[bodyIdx], consts[bodyIdx]);
 		}
 		__syncthreads();
 
-		// Phases 1-11 land here in CPU reference order as they are ported.
+		// Phase 6 collision + phase 7 islands/solver land here.
 
+		if (startPhase <= GPU_PHASE_INTEGRATE && GPU_PHASE_INTEGRATE <= endPhase) {
+			if (bodyIdx < bodiesPerArena)
+				PhaseIntegrate(arenaBodies[bodyIdx], consts[bodyIdx], dt);
+		}
 		__syncthreads();
+
+		if (startPhase <= GPU_PHASE_ACTIVATION && GPU_PHASE_ACTIVATION <= endPhase) {
+			if (bodyIdx < bodiesPerArena)
+				PhaseActivation(arenaBodies[bodyIdx], consts[bodyIdx], dt);
+		}
+		__syncthreads();
+
+		// Phases 10-11 (game post-tick) land here.
 	}
 }
 
-void StepTicks(GpuBatch* b, int numTicks) {
-	GpuStepArenasKernel<<<b->numArenas, 64>>>(
-		b->dBodies, b->dCars, b->dPads, b->dSchedule,
-		b->numCars, b->numPads, numTicks, b->tickCount);
+static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
+	constexpr float TICK_TIME = 1.0f / 120.0f;
+	int threads = b->bodiesPerArena > 32 ? 64 : 32;
+	GpuStepArenasKernel<<<b->numArenas, threads>>>(
+		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule,
+		b->numCars, b->numPads, numTicks, startPhase, endPhase, TICK_TIME);
 	CudaCheck(cudaGetLastError(), "kernel launch");
 	CudaCheck(cudaDeviceSynchronize(), "kernel run");
+}
+
+void StepTicks(GpuBatch* b, int numTicks) {
+	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1);
 	b->tickCount += numTicks;
+}
+
+void RunPhaseSegment(GpuBatch* b, int startPhase, int endPhase) {
+	Launch(b, 1, startPhase, endPhase);
 }
 
 void DownloadArenaState(GpuBatch* b, int arenaIdx,

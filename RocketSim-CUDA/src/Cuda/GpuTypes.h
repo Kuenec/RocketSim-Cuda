@@ -18,14 +18,42 @@ struct GpuMat3 {
 	GpuVec3 row[3];
 };
 
-// Rigid body dynamic state (ball and car chassis)
+// Rigid body dynamic state in BULLET UNITS (BT), mirroring btRigidBody fields that
+// persist tick-to-tick. basis/pos = worldTransform; invInertiaWorld is derived but
+// carried so phase compares can catch divergence at its source.
 struct GpuBodyState {
-	GpuMat3 basis;
-	GpuVec3 pos;
-	GpuVec3 linVel;
-	GpuVec3 angVel;
+	GpuMat3 basis;           // btTransform basis rows (row-major, btMatrix3x3 m_el)
+	GpuVec3 pos;             // btTransform origin (BT units)
+	GpuVec3 linVel;          // m_linearVelocity (BT units)
+	GpuVec3 angVel;          // m_angularVelocity (rad/s)
+	GpuVec3 totalForce;      // m_totalForce (incl. gravity, applied pre-step)
+	GpuVec3 totalTorque;     // m_totalTorque
+	GpuMat3 invInertiaWorld; // m_invInertiaTensorWorld
 	int activationState;     // bullet ACTIVE_TAG / ISLAND_SLEEPING / etc.
 	float deactivationTime;
+};
+
+// Per-body-slot constants (identical across arenas; slot 0 = ball, 1.. = cars)
+struct GpuBodyConsts {
+	float invMass;
+	GpuVec3 invInertiaLocal;
+	float linDampFactor;     // btPow(1 - linearDamping, dt), host-precomputed
+	float angDampFactor;     // btPow(1 - angularDamping, dt), host-precomputed
+	float linSleepThreshSq;  // m_linearSleepingThreshold^2 (host-precomputed product)
+	float angSleepThreshSq;
+	uint8_t noRot;           // btRigidBody::m_noRot (RocketSim extension)
+};
+
+// Phase IDs for the monolithic kernel, in CPU reference order within a tick.
+// Dev-only phase windows let --gpu-compare validate one phase at a time; production
+// runs the full range.
+enum GpuPhase : int {
+	GPU_PHASE_PREDICT = 0,    // btDiscreteDynamicsWorld::predictUnconstraintMotion
+	GPU_PHASE_COLLISION = 1,  // performDiscreteCollisionDetection (not ported yet)
+	GPU_PHASE_SOLVE = 2,      // islands + solveConstraints (not ported yet)
+	GPU_PHASE_INTEGRATE = 3,  // integrateTransforms
+	GPU_PHASE_ACTIVATION = 4, // updateActivationState
+	GPU_PHASE_COUNT
 };
 
 struct GpuCarControls {
