@@ -729,9 +729,31 @@ verified in source 2026-06-10):**
    on-device, commit 92bbed7; host thread sleeps at 0% CPU during the kernel -
    blocking-sync flag, commit 8df3f10).
    ORDER (tasks #13-#17):
-   1. HEATSEEKER (#13): no new assets/shapes; Ball pre-tick steering (Angle::
-      FromVec/RoundAngleUE3/GetForwardVec trees), _OnHit/_OnWorldCollision branches,
-      hsInfo into GpuBallGameState; --game-mode flag + heatseeker gates first.
+   1. HEATSEEKER (#13, IN PROGRESS): no new assets/shapes. READ so far:
+      - Ball::_PreTickUpdate HS branch (steer ball toward goal target: Angle::FromVec
+        [atan2f - CuAtan2f covers], deltaAngle = GetDeltaTo (READ NEXT), blend yaw/
+        pitch by speedRatio*tickTime*BLENDs, NormalizeFix [WrapNormalizeFloat =
+        DOUBLE fmod of floats - exact, port direct], clamp pitch +-MAX_TURN_PITCH,
+        RoundAngleUE3 [int quantize (val*TO_INTS)>>2 & 0x3FFF, * BACK_TO_RADIANS],
+        GetForwardVec [cosf/sinf FULL RANGE! see below], newVel = dir*speed blend,
+        m_linearVelocity = newVel*UU_TO_BT, timeSinceHit += tickTime).
+      - _OnHit HS branch + _OnWorldCollision HS wall bounce: read earlier (memory).
+      - Consts: RLConst::Heatseeker (INITIAL_TARGET_SPEED 2900, INCREMENT 85,
+        TARGET_Y 5120, TARGET_Z 320, blends 1.45/0.78/0.3, MAX_TURN_PITCH
+        7000*pi/2^15, MAX_SPEED 4600, WALL_BOUNCE_*).
+      - Arena ctor HEATSEEKER: ball start pos/vel = Heatseeker::BALL_START_* with
+        WALL-CLOCK-random y sign -> heatseeker gates must SetState the ball
+        explicitly (seed-derived sign) in SetupArena.
+      - BLOCKER-LEVEL FINDING: GetForwardVec needs glibc sinf/cosf over FULL float
+        range; the existing correction table only covers +-[0,0.7854]. Plan: port
+        glibc 2.4x s_sinf.c/s_cosf.c VERBATIM to device (like atan2f/asinf; doubles
+        only -> bit-exact), exhaustively validate all 2^32 floats on GPU vs host,
+        then RETIRE the glibc_trig_fix.bin table entirely (integrate phase switches
+        to the same exact ports - re-run all gates + compares after).
+      TODO: read Angle::GetDeltaTo + BallState ctor hsInfo defaults; bench
+      --game-mode flag + deterministic HS ball init; CPU heatseeker gates;
+      device port (hsInfo fields into GpuBallGameState; HS branches in
+      CuContactAddedCallback + new CuBallPreTickHS in CudaGameTail.cuh).
    2. DEMOLITIONS (#14): deterministic-seed hook for Math::GetRandEngine in the
       WORK copy behind a flag (upstream demo respawn is wall-clock-seeded ->
       bit-exact validation only possible work-CPU vs work-GPU with the same seed;
