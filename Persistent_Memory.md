@@ -464,12 +464,39 @@ domain |args|<=~1).
   refreshContactPoints tail, sortCachedPoints tail + gContactCalcArea3Points,
   convex-plane CreateFunc perturbation defaults, solver handoff.
 
+**CONFIRMED FINAL narrowphase inventory for soccar (config map + CreateFunc defaults
+verified in source 2026-06-10):**
+- PERTURBATION LOOPS ARE DEAD: convexConvex CreateFunc m_numPerturbationIterations=0;
+  convexPlane CreateFunc iters=1 but threshold=0 (numContacts<0 never) -> single
+  contact per algo invocation, no perturbation anywhere.
+- box-box (car-car) -> btBoxBoxCollisionAlgorithm (btBoxBoxDetector ODE SAT ~400 ln).
+- sphere-box (ball-car child) -> btSphereBoxCollisionAlgorithm (analytic ~200 ln).
+- sphere-triangle (ball-mesh tris) -> btSphereTriangleCollisionAlgorithm +
+  SphereTriangleDetector (analytic ~200 ln).
+- box-triangle (car-mesh tris) -> convexConvex PLAIN path: single
+  btGjkPairDetector::getClosestPoints (+ btGjkEpaPenetrationDepthSolver/btGjkEpa2 when
+  penetrating); box has NO convexPolyhedron (initializePolyhedralFeatures never called
+  in RS) so polyhedral SAT/clipping paths are SKIPPED. input.m_maximumDistanceSquared =
+  (marginA+marginB+manifold breaking threshold)^2.
+- convex-plane (ball/car vs 4 planes) -> READ DONE, single support contact.
+- Ball::_OnHit READ: friction/restitution overrides CARBALL_*; ballHitInfo writes;
+  extra impulse guard (tickCount > lastApplied+1 || lastApplied > tickCount); RS-Vec
+  trees: hitDir=(relPos*Vec(1,1,Z_SCALE)).Normalized(), forward adjustment, addedVel =
+  (hitDir*relSpeed)*CURVE(relSpeed)*mutator.ballHitExtraForceScale ->
+  ball._velocityImpulseCache += *UU_TO_BT. Ball world collision: SOCCAR NO-OP except
+  manifold m_isSpecial=true (check m_isSpecial consumer in solver!).
+- Still to read: btSphereTriangle/SphereBox/BoxBox detectors, GJK+EPA, concave wrapper
+  (btConvexTriangleCallback + quantized BVH AABB walk -> TRIANGLE ORDER), compound
+  wrapper, btInternalEdgeUtility, dispatcher needsCollision + manifold ordering,
+  refreshContactPoints + sortCachedPoints tails, solver (btSequentialImpulse incl
+  m_isSpecial RS changes).
+
 ### Next Steps (in order)
-1. Read+port in slices with per-slice fuzz/compare: (a) AABB update + pair gen,
-   (b) convex-plane + manifold mechanics + Arena contact callback,
-   (c) convex-concave mesh (GJK pair detector + EPA + internal edge), (d) box-box SAT,
-   (e) compound plumbing, (f) dispatch order + solver handoff. Then solver+islands,
-   ball/pads/tail, assemble monolithic kernel, flip --gpu-step.
+1. Finish narrowphase reads (above list), then implement device collision phase in
+   slices with a manifold-compare harness (capture CPU manifolds at AFTER_COLLISION:
+   per pair bodyIds + points (localA/B, worldB, normal, distance, partId/index,
+   friction/restitution/isSpecial) in dispatcher order; GPU from AFTER_PREDICT state).
+2. Solver+islands, ball/pads/tail, assemble monolithic kernel, flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
    (_UpdateWheels/jump/flip/boost/airtorque/autoflip/autoroll - Car.cpp state machines,
    RLConst curves via LinearPieceCurve) with per-sub-phase capture points in
