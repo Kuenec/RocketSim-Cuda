@@ -512,13 +512,38 @@ verified in source 2026-06-10):**
   m_doubleDispatchContactPoints[type0][type1] -> algo->processCollision(wrappers).
   needsResponse (solver-side): both haveContactResponse && not both static.
 
+- btGjkPairDetector::getClosestPointsNonVirtual FULLY READ (btGjkPairDetector.cpp:688):
+  positionOffset = (originA+originB)*0.5 subtracted from both local transforms (!);
+  margins from getMarginNonVirtual (box getMarginNV 0.04, triangle getMarginNV 0.04,
+  sphere margin=radius); init m_cachedSeparatingAxis=(0,1,0); REL_ERROR2=1e-6 (float);
+  loop: support dirs = (-axis)*basisA [vec*mat tdot] / axis*basisB; supports
+  localGetSupportVertexWithoutMarginNonVirtual (box: fsel on implicitShapeDimensions;
+  sphere: (0,0,0); triangle: read case still pending - dot-select of 3 verts);
+  pWorld=localTransA(pInA); w=p-q; delta=axis.dot(w); exits: delta>0 && delta^2 >
+  sqDist*maxDistSq (deg10); inSimplex(w) (deg1); f0=sqDist-delta <= f1=sqDist*REL_ERROR2
+  (deg2 if f0<=0 else deg11); addVertex; !closest (deg3); newAxis.len2<REL_ERROR2
+  (deg6, axis=newAxis); !improving prevSq-sq <= eps*prevSq (deg12, axis NOT updated);
+  iter>1000; fullSimplex (deg13, numVertices==4). checkSimplex path: compute_points,
+  normalInB=axis; lenSqr<0.0001 -> deg5; if lenSqr>eps^2: rlen=1/sqrt(lenSqr),
+  normalInB*=rlen, s=sqrt(sqDist), pointOnA -= axis*(marginA/s), pointOnB +=
+  axis*(marginB/s), distance=(1/rlen)-margin, isValid. Penetration: if !isValid ||
+  (catchDegeneracies(1) && pdSolver && degenerate && distance+margin<0.01): axis.setZero,
+  EPA calcPenDepth(simplexSolver, shapes, localTransA/B, axis, tmpA, tmpB); valid2:
+  tmpNormal=tmpB-tmpA (fallback axis if tiny), /=sqrt(lenSqr), distance2=-(tmpA-tmpB)
+  .length(); replace if !isValid||distance2<distance (method3); EPA-fail fallback:
+  if axis.len2>0: distance2=(tmpA-tmpB).length()-margin; replace if less: points -=/+=
+  axis*margins, normal=axis normalize() [RSQRT]. Final accept: isValid && (distance<0
+  || distance^2 < maxDistSq); m_fixContactNormalDirection(1): aabb-center diff
+  (getAabb both shapes at local transforms!) dot normal < 0 -> normal *= -1;
+  output.addContactPoint(normalInB, pointOnB+positionOffset, distance).
+
 ### Next Steps (in order)
 1. PORT-WHILE-READING (fresh window, source side-by-side, faithful trees) the remaining
    heavy narrowphase into src/Cuda/CudaCollision.cuh slices:
-   (a) btGjkPairDetector::getClosestPointsNonVirtual (959 ln, uses CuSimplexSolver
-       already ported) + btGjkEpaPenetrationDepthSolver/btGjkEpa2 (EPA polytope) -
-       box(+margin special: BOX margin counts in vertices, see convexConvex margin
-       exception) vs triangle supports;
+   (a) GJK decoded above - port directly; still read: triangle support case +
+       btGjkEpaPenetrationDepthSolver/btGjkEpa2 (EPA polytope ~1000 ln) + shape
+       getAabb trees (box btTransformAabb, sphere +-(radius+0.08+margin?)) for the
+       fix-normal branch;
    (b) btBoxBoxDetector (767 ln ODE SAT, car-car);
    (c) sphere-triangle + sphere-box (decoded above, small);
    (d) convex-plane (decoded above, small);
