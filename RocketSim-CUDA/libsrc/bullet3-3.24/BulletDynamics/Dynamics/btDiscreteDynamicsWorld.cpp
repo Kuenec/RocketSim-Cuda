@@ -15,6 +15,9 @@ subject to the following restrictions:
 
 #include "btDiscreteDynamicsWorld.h"
 
+// 2026-06-10: phase timing for the CUDA port (work copy only)
+#include "../../../../src/Profiling.h"
+
 //collision detection
 #include "../../BulletCollision/CollisionDispatch/btCollisionDispatcher.h"
 #include "../../BulletCollision/BroadphaseCollision/btCollisionAlgorithm.h"
@@ -400,7 +403,10 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 	}
 
 	///apply gravity, predict motion
-	predictUnconstraintMotion(timeStep);
+	{
+		rsprof::Scope _ps(rsprof::BT_PREDICT);
+		predictUnconstraintMotion(timeStep);
+	}
 
 	btDispatcherInfo& dispatchInfo = getDispatchInfo();
 
@@ -410,25 +416,43 @@ void btDiscreteDynamicsWorld::internalSingleStepSimulation(btScalar timeStep)
 	createPredictiveContacts(timeStep);
 
 	///perform collision detection
-	performDiscreteCollisionDetection();
+	{
+		rsprof::Scope _ps(rsprof::BT_COLLISION);
+		performDiscreteCollisionDetection();
+	}
 
-	calculateSimulationIslands();
+	{
+		rsprof::Scope _ps(rsprof::BT_ISLANDS);
+		calculateSimulationIslands();
+	}
 
 	getSolverInfo().m_timeStep = timeStep;
 
 	///solve contact and other joint constraints
-	solveConstraints(getSolverInfo());
+	{
+		rsprof::Scope _ps(rsprof::BT_SOLVE);
+		solveConstraints(getSolverInfo());
+	}
 
 	///CallbackTriggers();
 
 	///integrate transforms
 
-	integrateTransforms(timeStep);
+	{
+		rsprof::Scope _ps(rsprof::BT_INTEGRATE);
+		integrateTransforms(timeStep);
+	}
 
 	///update vehicle simulation
-	updateActions(timeStep);
+	{
+		rsprof::Scope _ps(rsprof::BT_VEHICLE);
+		updateActions(timeStep);
+	}
 
-	updateActivationState(timeStep);
+	{
+		rsprof::Scope _ps(rsprof::BT_ACTIVATION);
+		updateActivationState(timeStep);
+	}
 
 	if (0 != m_internalTickCallback)
 	{

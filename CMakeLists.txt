@@ -33,7 +33,7 @@ add_rocketsim_lib(rocketsim_work ${WORK_DIR})
 add_executable(rocketsim_reference_bench tools/bench/main.cpp)
 target_link_libraries(rocketsim_reference_bench PRIVATE rocketsim_ref)
 
-add_executable(rocketsim_bench tools/bench/main.cpp)
+add_executable(rocketsim_bench tools/bench_work/main.cpp)
 target_link_libraries(rocketsim_bench PRIVATE rocketsim_work)
 
 foreach(t rocketsim_ref rocketsim_work rocketsim_reference_bench rocketsim_bench)

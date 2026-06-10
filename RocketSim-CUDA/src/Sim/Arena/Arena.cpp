@@ -1,5 +1,6 @@
 #include "Arena.h"
 #include "../../RocketSim.h"
+#include "../../Profiling.h"
 
 #include "../../../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btAxisSweep3.h"
 #include "../../../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btDbvtBroadphase.h"
@@ -703,34 +704,46 @@ void Arena::Step(int ticksToSimulate) {
 
 		bool hasArenaStuff = (gameMode != GameMode::THE_VOID);
 		
-		for (Car* car : _cars)
-			car->_PreTickUpdate(gameMode, tickTime, _mutatorConfig);
+		{
+			rsprof::Scope _ps(rsprof::CAR_PRE_TICK);
+			for (Car* car : _cars)
+				car->_PreTickUpdate(gameMode, tickTime, _mutatorConfig);
+		}
 
 		if (hasArenaStuff && !ballOnly) {
+			rsprof::Scope _ps(rsprof::PAD_PRE_TICK);
 			for (BoostPad* pad : _boostPads)
 				pad->_PreTickUpdate(tickTime);
 		}
 
 		// Update ball
-		ball->_PreTickUpdate(gameMode, tickTime);
+		{
+			rsprof::Scope _ps(rsprof::BALL_PRE_TICK);
+			ball->_PreTickUpdate(gameMode, tickTime);
+		}
 
 		// Update world
 		_bulletWorld.stepSimulation(tickTime, 0, tickTime);
 
-		for (Car* car : _cars) {
-			car->_PostTickUpdate(gameMode, tickTime, _mutatorConfig);
-			car->_FinishPhysicsTick(_mutatorConfig);
-			if (hasArenaStuff) {
-				if (_config.useCustomBoostPads) {
-					// TODO: This is quite slow, we should use a sorting method of some sort
-					for (auto& boostPad : _boostPads) {
-						boostPad->_CheckCollide(car);
+		{
+			rsprof::Scope _ps(rsprof::CAR_POST_TICK);
+			for (Car* car : _cars) {
+				car->_PostTickUpdate(gameMode, tickTime, _mutatorConfig);
+				car->_FinishPhysicsTick(_mutatorConfig);
+				if (hasArenaStuff) {
+					if (_config.useCustomBoostPads) {
+						// TODO: This is quite slow, we should use a sorting method of some sort
+						for (auto& boostPad : _boostPads) {
+							boostPad->_CheckCollide(car);
+						}
+					} else {
+						_boostPadGrid.CheckCollision(car);
 					}
-				} else {
-					_boostPadGrid.CheckCollision(car);
 				}
 			}
 		}
+
+		rsprof::Scope _tailScope(rsprof::TICK_TAIL);
 
 		if (hasArenaStuff && !ballOnly)
 			for (BoostPad* pad : _boostPads)
