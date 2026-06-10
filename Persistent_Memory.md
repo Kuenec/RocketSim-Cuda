@@ -427,11 +427,21 @@ domain |args|<=~1).
   partId/index stored (swap-aware); gContactAddedCallback when CF_CUSTOM_MATERIAL
   (always: ball+cars have it) AFTER insert, with obj0/obj1 swap-normalized.
 
+- btPersistentManifold READ: ROCKETSIM CHANGE - getCacheEntry returns -1 ALWAYS (no
+  point replacement; every contact adds). addManifoldPoint: when cache full (4),
+  insertIndex = sortCachedPoints(new) [keeps deepest + maximizes area via cross
+  length2 of 4 candidate triangles; gContactCalcArea3Points default?], else append.
+  Manifold contactBreakingThreshold = min over both shapes of
+  shape->getContactBreakingThreshold(gContactBreakingThreshold=0.02) =
+  getAngularMotionDisc()*0.02 (PER-SHAPE; compute host-side per pair type).
+  refreshContactPoints: still to read tail (prunes pts beyond threshold by recomputed
+  distance; called post-processCollision by compound/concave paths?).
+
 ### Next Steps (in order)
 1. Read+port in slices with per-slice fuzz/compare: (a) AABB update + pair gen,
-   (b) convex-plane + manifold mechanics (btPersistentManifold getCacheEntry/
-   sortCachedPoints/refreshContactPoints NEXT READ) + Arena contact callback,
-   (c) convex-concave mesh (GJK pair detector + EPA + internal edge), (d) box-box SAT,
+   (b) convex-plane + manifold mechanics + Arena contact callback
+   (Arena::_BulletContactAddedCallback NEXT READ), (c) convex-concave mesh
+   (GJK pair detector + EPA + internal edge), (d) box-box SAT,
    (e) compound plumbing, (f) dispatch order + solver handoff. Then solver+islands,
    ball/pads/tail, assemble monolithic kernel, flip --gpu-step.
 2. Port btVehicleRL updateVehicleFirst/Second + resolveSingle* + Car game logic
