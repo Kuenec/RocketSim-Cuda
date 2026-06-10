@@ -614,13 +614,38 @@ verified in source 2026-06-10):**
    btClampNormal(edge, swapFactor*triNormal, localN, angle, clamped) (READ) ->
    if clamped.dot(triNormal) > 0: cp.m_normalWorldOnB = basis*clamped,
    positionWorldOnB REPROJECTED = posA - normal*distance1, localPointB = invXform].
-   V1V2 block declares LOCAL localContactNormalOnB shadowing (recomputed, NOT
-   normalized!) - verbatim quirk. STILL TO READ: function tail after 3 edge blocks
-   (isNearEdge/numConcaveEdgeHits final handling), btNearestPointInLineSegment,
-   btClampNormal, quatRotate tree, tri_shape->calcNormal, btGetHash,
-   btTriangleInfoMap defaults (m_maxEdgeAngleThreshold etc.), triangleInfoMap host
-   extraction (hash map -> flat per-tri array), compound algo file; then:
-   manifold-compare harness + device collision orchestrator.
+   INTERNAL EDGE FULLY PORTED (CuAdjustInternalEdgeContacts + CuClampNormal +
+   CuNearestPointInLineSegment + CuQuatRotate [quat*vec SSE tree decoded:
+   x=(w*vx+y*vz)-z*vy etc.] + CuGetAngleIE [atan2 double-rounded stand-in]); CPU
+   quirks preserved (stale nearest in V0V1 block, shadowed un-normalized localN in
+   V1V2/V2V0 blocks); tail: isNearEdge && numConcaveEdgeHits>0 -> normal := triNormal
+   (skip if dot<0), reproject posB + localPointB. Thresholds: convexEps 0,
+   edgeDist 0.1, maxEdgeAngle 2pi. btGetHash = (partId<<21)|triIdx (partId 0 here).
+   ALL COLLISION NARROWPHASE NOW IN DEVICE CODE (CudaCollision.cuh ~2400 ln).
+   NEXT IMPLEMENTATION STEPS for collision phase completion:
+   1. Host extraction+upload: per-mesh BVH (getQuantizedNodeArray/getSubtreeInfoArray/
+      getBvhAabbMin/Max/getBvhQuantization - accessors added), mesh margin, per-tri
+      GpuTriInfo from trimesh->getTriangleInfoMap() (btHashMap iterate: int key =
+      (0<<21)|triIdx -> btTriangleInfo{m_flags,m_edgeV0V1Angle,V1V2,V2V0}).
+   2. Device collision orchestrator: updateAabbs (per ACTIVE body: shape getAabb at
+      worldTransform UNION getAabb at interp transform [recompute via
+      CuIntegrateTransform on post-damping state] +-0.02; setAabb semantics: proxy
+      aabb + dyn cell move only if aabbMin cellIdx changed && numDyn>1); pair gen
+      (per dyn proxy in [ball,car...] order: statics of cellIdx cell + dyns of same
+      cell, aabbOverlap TestAabbAgainstAabb2, dedup, ADD ORDER); dispatch loop per
+      pair in order: needsCollision (activity) -> by shape kinds: car=compound->box
+      child (compose transform) vs mesh/plane/box/sphere; manifold per pair;
+      contact callbacks INSIDE CuAddContactPoint flow per CPU order: car-ball ->
+      Ball::_OnHit effects (ballHitInfo writes + extra impulse w/ guards + friction/
+      restitution OVERRIDES on the point), car-car -> bump logic (uses CuVecNormalizedRS
+      Vec trees + curves), car-world -> worldContact set + friction/restitution
+      override, ball-world -> isSpecial=true; then btAdjustInternalEdgeContacts for
+      mesh contacts (CuAdjustInternalEdgeContacts).
+   3. rscap manifold capture at AFTER_COLLISION (dispatcher manifold order: pair-cache
+      array order) + bench manifold-compare mode (GPU from AFTER_PREDICT-uploaded
+      state + carSnaps-style world inputs).
+   Then solver (btSequentialImpulse - READ NEXT after collision validated), ball
+   pre/finish + pads + arena tail, monolithic assembly, flip --gpu-step.
    (f) compound wrapper (single box child: childWorldTrans compose, LocalInfoAdder
        partId/index semantics);
    (g) manifold assembly: per-pair btPersistentManifold (4-pt cache, sortCachedPoints
