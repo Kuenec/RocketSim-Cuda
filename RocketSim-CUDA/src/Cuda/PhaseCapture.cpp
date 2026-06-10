@@ -5,6 +5,7 @@
 #include "../../libsrc/bullet3-3.24/BulletCollision/CollisionDispatch/btCollisionDispatcher.h"
 #include "../../libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
 #include "../../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btRSBroadphase.h"
+#include "../../libsrc/bullet3-3.24/BulletDynamics/ConstraintSolver/btSequentialImpulseConstraintSolver.h"
 #include "../Sim/Car/Car.h"
 
 namespace rscap {
@@ -14,6 +15,8 @@ std::vector<BodySnap> points[POINT_COUNT];
 std::vector<CarPreTickSnap> carSnaps;
 std::vector<ManifoldSnap> manifolds;
 std::vector<ProxySnap> proxies;
+std::vector<SolverRowSnap> solverContactRows, solverFrictionRows;
+std::vector<SolverBodySnap> solverBodies;
 
 const char* const POINT_NAMES[POINT_COUNT] = {
 	"pre_bullet", "after_predict", "after_collision", "after_islands",
@@ -91,6 +94,45 @@ void Capture(Point p, btDiscreteDynamicsWorld* world) {
 			ps.jIdx = proxy->jIdx;
 			ps.kIdx = proxy->kIdx;
 		}
+	}
+}
+
+void CaptureSolver(::btSequentialImpulseConstraintSolver* solver) {
+	auto snapRows = [](const btConstraintArray& pool, std::vector<SolverRowSnap>& out) {
+		out.clear();
+		for (int i = 0; i < pool.size(); i++) {
+			const btSolverConstraint& c = pool[i];
+			SolverRowSnap r = {};
+			r.bodyA = c.m_solverBodyIdA;
+			r.bodyB = c.m_solverBodyIdB;
+			CopyVec(r.normal1, c.m_contactNormal1);
+			CopyVec(r.relpos1CrossNormal, c.m_relpos1CrossNormal);
+			CopyVec(r.angularComponentA, c.m_angularComponentA);
+			r.jacDiagABInv = c.m_jacDiagABInv;
+			r.rhs = c.m_rhs;
+			r.rhsPenetration = c.m_rhsPenetration;
+			r.lowerLimit = c.m_lowerLimit;
+			r.upperLimit = c.m_upperLimit;
+			r.appliedImpulse = c.m_appliedImpulse;
+			r.appliedPushImpulse = c.m_appliedPushImpulse;
+			r.friction = c.m_friction;
+			r.frictionIndex = c.m_frictionIndex;
+			r.isSpecial = c.m_isSpecial;
+			out.push_back(r);
+		}
+	};
+	snapRows(solver->m_tmpSolverContactConstraintPool, solverContactRows);
+	snapRows(solver->m_tmpSolverContactFrictionConstraintPool, solverFrictionRows);
+	solverBodies.clear();
+	for (int i = 0; i < solver->m_tmpSolverBodyPool.size(); i++) {
+		const btSolverBody& b = solver->m_tmpSolverBodyPool[i];
+		SolverBodySnap s = {};
+		s.rb = b.m_originalBody;
+		CopyVec(s.deltaLin, b.m_deltaLinearVelocity);
+		CopyVec(s.deltaAng, b.m_deltaAngularVelocity);
+		CopyVec(s.pushVel, b.m_pushVelocity);
+		CopyVec(s.turnVel, b.m_turnVelocity);
+		solverBodies.push_back(s);
 	}
 }
 

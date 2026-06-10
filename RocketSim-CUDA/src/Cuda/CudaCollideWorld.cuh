@@ -36,6 +36,12 @@ __device__ __forceinline__ bool CuIsActive(int state) {
 	return state != 6 && state != CU_ISLAND_SLEEPING && state != CU_DISABLE_SIMULATION;
 }
 
+// btCollisionObject::setActivationState (respects DISABLE_* lock-in)
+__device__ __forceinline__ void CuSetActivationState(int& cur, int newState) {
+	if (cur != CU_DISABLE_DEACTIVATION && cur != CU_DISABLE_SIMULATION)
+		cur = newState;
+}
+
 #define CU_BT_LARGE_FLOAT 1e18f
 #define CU_CONTACT_BREAKING 0.02f  // gContactBreakingThreshold
 #define CU_UU_TO_BT (1.f / 50.f)
@@ -73,6 +79,8 @@ struct CuCollideIn {
 	// outputs (per arena)
 	CuManifold* manifolds;           // capacity GPU_MAX_MANIFOLDS
 	int* numManifolds;
+	int2* pairsOut;                  // capacity CU_MAX_PAIRS (solver islands input)
+	int* numPairsOut;
 	// diagnostic channel: [0]=numPairs, then (h0,h1) per pair (h < numStatics: static)
 	int* debug;                      // capacity 2*CU_MAX_PAIRS+1
 };
@@ -477,6 +485,12 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 
 	int2 pairs[CU_MAX_PAIRS];
 	int numPairs = CuCollideGenPairs(in, pairs);
+
+	if (in.pairsOut) {
+		for (int i = 0; i < numPairs; i++)
+			in.pairsOut[i] = pairs[i];
+		*in.numPairsOut = numPairs;
+	}
 
 	if (in.debug) {
 		in.debug[0] = numPairs;

@@ -78,6 +78,20 @@ void DownloadCollideResults(GpuBatch* batch, int arenaIdx,
 // per pair; handle < numStatics is a static). Buffer must hold 2*96+1 ints.
 void DownloadCollideDebug(GpuBatch* batch, int arenaIdx, int* debugOut);
 
+// Diagnostic: the solve phase's constraint rows (post-iterations scratch state).
+// Buffers must hold >= 404 entries each.
+struct GpuSolverRowDl {
+	int bodyA, bodyB;            // solver body pool ids
+	GpuVec3 normal1, relpos1CrossNormal, angularComponentA;
+	float jacDiagABInv, rhs, rhsPenetration, lowerLimit, upperLimit;
+	float appliedImpulse, appliedPushImpulse, friction;
+	int frictionIndex;
+	uint8_t isSpecial;
+};
+void DownloadSolveDebug(GpuBatch* batch, int arenaIdx,
+	GpuSolverRowDl* contactRows, int* numContact,
+	GpuSolverRowDl* frictionRows, int* numFriction);
+
 // Diagnostic: closest-hit static-world raycast for ray-fuzz validation vs CPU rayTest.
 struct GpuRayFuzzResult {
 	int hitKind;       // -1 = none, 0 = static

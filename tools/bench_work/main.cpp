@@ -1492,6 +1492,72 @@ static int RunGpuCompare(const Args& args) {
 			if (bad)
 				return 1;
 
+			// ---- solve segment: chained collision+solve from AFTER_PREDICT,
+			// compared against CPU AFTER_SOLVE body snaps (velocities, transforms
+			// [split impulse], activation [island wake/sleep]) ----
+			{
+				mapSnaps(rscap::points[rscap::AFTER_PREDICT], preState);
+				mapSnaps(rscap::points[rscap::AFTER_SOLVE], refState);
+				rscuda::UploadArenaState(batch, 0, preState.data(), carsDummy.data(), padsDummy.data());
+				rscuda::UploadDynProxies(batch, 0, hostProxies.data(), hostRegCounter);
+				rscuda::RunPhaseSegment(batch, rscuda::GPU_PHASE_COLLISION, rscuda::GPU_PHASE_SOLVE);
+				rscuda::DownloadArenaState(batch, 0, gotState.data(), carsDummy.data(), padsDummy.data());
+				for (int bIdx = 0; bIdx < numBodies; bIdx++) {
+					int df = BodyStateDiff(refState[bIdx], gotState[bIdx]);
+					if (df >= 0) {
+						const uint32_t* cr = (const uint32_t*)&refState[bIdx];
+						const uint32_t* gr = (const uint32_t*)&gotState[bIdx];
+						printf("GPU_COMPARE: FAIL tick %d phase solve body %d (%s) float[%d]: cpu 0x%08X gpu 0x%08X\n",
+							tick, bIdx, bIdx == 0 ? "ball" : "car", df, cr[df], gr[df]);
+						for (size_t mi = 0; mi < rscap::manifolds.size(); mi++) {
+							const rscap::ManifoldSnap& cm = rscap::manifolds[mi];
+							printf("  manifold %zu: %d vs %d, %d pts", mi,
+								collideBodyId(cm.body0), collideBodyId(cm.body1), cm.numContacts);
+							for (int c = 0; c < cm.numContacts && c < 4; c++)
+								printf(" [d=%.6g sp%d]", cm.pts[c].distance, cm.pts[c].isSpecial);
+							printf("\n");
+						}
+						for (int b2 = 0; b2 < numBodies; b2++)
+							printf("  body %d act(predict)=%d act(cpu solve)=%d act(gpu)=%d\n", b2,
+								preState[b2].activationState, refState[b2].activationState,
+								gotState[b2].activationState);
+						// row-level diff: CPU capture vs GPU scratch
+						{
+							std::vector<rscuda::GpuSolverRowDl> gc(404), gf(404);
+							int nc = 0, nf = 0;
+							rscuda::DownloadSolveDebug(batch, 0, gc.data(), &nc, gf.data(), &nf);
+							printf("  rows: cpu %zu contact / %zu friction; gpu %d / %d\n",
+								rscap::solverContactRows.size(), rscap::solverFrictionRows.size(), nc, nf);
+							auto dumpRows = [&](const char* kind,
+								const std::vector<rscap::SolverRowSnap>& cpu,
+								const std::vector<rscuda::GpuSolverRowDl>& gpu, int ng) {
+								for (size_t r = 0; r < cpu.size() && (int)r < ng; r++) {
+									const rscap::SolverRowSnap& c = cpu[r];
+									const rscuda::GpuSolverRowDl& g = gpu[r];
+									auto neq = [](float a2, float b2) { return memcmp(&a2, &b2, 4) != 0; };
+									bool diff = c.bodyA != g.bodyA || c.bodyB != g.bodyB ||
+										neq(c.jacDiagABInv, g.jacDiagABInv) || neq(c.rhs, g.rhs) ||
+										neq(c.rhsPenetration, g.rhsPenetration) ||
+										neq(c.appliedImpulse, g.appliedImpulse) ||
+										neq(c.normal1[0], g.normal1.x) || neq(c.normal1[1], g.normal1.y) ||
+										neq(c.normal1[2], g.normal1.z) ||
+										(int)c.isSpecial != (int)g.isSpecial;
+									if (diff)
+										printf("  %s row %zu DIFF: cpu(b %d/%d jac %.9g rhs %.9g rhsP %.9g app %.9g n %.9g,%.9g,%.9g sp%d) gpu(b %d/%d jac %.9g rhs %.9g rhsP %.9g app %.9g n %.9g,%.9g,%.9g sp%d)\n",
+											kind, r, c.bodyA, c.bodyB, c.jacDiagABInv, c.rhs, c.rhsPenetration,
+											c.appliedImpulse, c.normal1[0], c.normal1[1], c.normal1[2], c.isSpecial,
+											g.bodyA, g.bodyB, g.jacDiagABInv, g.rhs, g.rhsPenetration,
+											g.appliedImpulse, g.normal1.x, g.normal1.y, g.normal1.z, g.isSpecial);
+								}
+							};
+							dumpRows("contact", rscap::solverContactRows, gc, nc);
+							dumpRows("friction", rscap::solverFrictionRows, gf, nf);
+						}
+						return 1;
+					}
+				}
+			}
+
 			// advance host proxy lockstep state from CPU truth (regSeq rule: cell
 			// change && >1 dyn proxies; handle order)
 			for (int d = 0; d < numBodies; d++) {
@@ -1511,7 +1577,7 @@ static int RunGpuCompare(const Args& args) {
 		}
 	}
 
-	printf("GPU_COMPARE: PASS (%d ticks, phases: car-pretick, predict, collision, integrate, activation; %d bodies bit-exact)\n",
+	printf("GPU_COMPARE: PASS (%d ticks, phases: car-pretick, predict, collision, solve, integrate, activation; %d bodies bit-exact)\n",
 		args.gpuCompare, numBodies);
 	rscuda::DestroyBatch(batch);
 	delete arena;

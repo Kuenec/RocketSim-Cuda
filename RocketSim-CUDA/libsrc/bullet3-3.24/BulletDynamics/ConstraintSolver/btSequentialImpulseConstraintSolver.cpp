@@ -22,6 +22,7 @@ subject to the following restrictions:
 
 #include "btSequentialImpulseConstraintSolver.h"
 #include "../../BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
+#include "../../../../src/Cuda/PhaseCapture.h" // GPU-port diagnostic capture (work copy only)
 
 #include "../../LinearMath/btCpuFeatureUtility.h"
 
@@ -1933,6 +1934,9 @@ btScalar btSequentialImpulseConstraintSolver::solveGroup(btCollisionObject** bod
 	solveGroupCacheFriendlySetup(bodies, numBodies, manifoldPtr, numManifolds, constraints, numConstraints, infoGlobal);
 
 	solveGroupCacheFriendlyIterations(bodies, numBodies, manifoldPtr, numManifolds, constraints, numConstraints, infoGlobal);
+
+	if (rscap::enabled)
+		rscap::CaptureSolver(this); // GPU-port diagnostic capture (work copy only)
 
 	solveGroupCacheFriendlyFinish(bodies, numBodies, infoGlobal);
 

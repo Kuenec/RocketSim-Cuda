@@ -28,6 +28,7 @@
 #include "CudaVehicle.cuh"
 #include "CudaCollision.cuh"
 #include "CudaCollideWorld.cuh"
+#include "CudaSolver.cuh"
 #include "RsqrtHost.h"
 
 #include <cuda_runtime.h>
@@ -95,6 +96,9 @@ struct GpuBatch {
 	int* dNumManifolds;           // [numArenas]
 	GpuManifoldOut* dManifoldsOut;// [numArenas * GPU_MAX_MANIFOLDS] (download mirror)
 	int* dCollideDebug;           // [numArenas * (2*96+1)] pair-list diagnostic
+	int2* dPairs;                 // [numArenas * 96] (collide -> solver islands)
+	int* dNumPairs;               // [numArenas]
+	CuSolveCtx* dSolveScratch;    // [numArenas] (too large for device stack)
 	bool hasCollideData;
 };
 #define COLLIDE_DEBUG_INTS (2 * 96 + 1)
@@ -146,6 +150,10 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	CudaCheck(cudaMemset(b->dNumManifolds, 0, sizeof(int) * numArenas), "zero nummanifolds");
 	CudaCheck(cudaMalloc(&b->dManifoldsOut, sizeof(GpuManifoldOut) * numArenas * GPU_MAX_MANIFOLDS), "alloc manifoldsout");
 	CudaCheck(cudaMalloc(&b->dCollideDebug, sizeof(int) * numArenas * COLLIDE_DEBUG_INTS), "alloc collidedbg");
+	CudaCheck(cudaMalloc(&b->dPairs, sizeof(int2) * numArenas * 96), "alloc pairs");
+	CudaCheck(cudaMalloc(&b->dNumPairs, sizeof(int) * numArenas), "alloc numpairs");
+	CudaCheck(cudaMemset(b->dNumPairs, 0, sizeof(int) * numArenas), "zero numpairs");
+	CudaCheck(cudaMalloc(&b->dSolveScratch, sizeof(CuSolveCtx) * numArenas), "alloc solve scratch");
 	return b;
 }
 
@@ -175,6 +183,9 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dNumManifolds);
 	cudaFree(b->dManifoldsOut);
 	cudaFree(b->dCollideDebug);
+	cudaFree(b->dPairs);
+	cudaFree(b->dNumPairs);
+	cudaFree(b->dSolveScratch);
 	delete b;
 }
 
@@ -246,6 +257,37 @@ void DownloadCollideResults(GpuBatch* b, int arenaIdx,
 void DownloadCollideDebug(GpuBatch* b, int arenaIdx, int* debugOut) {
 	CudaCheck(cudaMemcpy(debugOut, b->dCollideDebug + (size_t)arenaIdx * COLLIDE_DEBUG_INTS,
 		sizeof(int) * COLLIDE_DEBUG_INTS, cudaMemcpyDeviceToHost), "down collide dbg");
+}
+
+void DownloadSolveDebug(GpuBatch* b, int arenaIdx,
+	GpuSolverRowDl* contactRows, int* numContact,
+	GpuSolverRowDl* frictionRows, int* numFriction) {
+	static CuSolveCtx s; // host mirror (large)
+	CudaCheck(cudaMemcpy(&s, b->dSolveScratch + arenaIdx, sizeof(CuSolveCtx),
+		cudaMemcpyDeviceToHost), "down solve scratch");
+	auto conv = [](const CuSolverRow& r, GpuSolverRowDl& o) {
+		o.bodyA = r.bodyIdA;
+		o.bodyB = r.bodyIdB;
+		o.normal1 = { r.contactNormal1.x, r.contactNormal1.y, r.contactNormal1.z };
+		o.relpos1CrossNormal = { r.relpos1CrossNormal.x, r.relpos1CrossNormal.y, r.relpos1CrossNormal.z };
+		o.angularComponentA = { r.angularComponentA.x, r.angularComponentA.y, r.angularComponentA.z };
+		o.jacDiagABInv = r.jacDiagABInv;
+		o.rhs = r.rhs;
+		o.rhsPenetration = r.rhsPenetration;
+		o.lowerLimit = r.lowerLimit;
+		o.upperLimit = r.upperLimit;
+		o.appliedImpulse = r.appliedImpulse;
+		o.appliedPushImpulse = r.appliedPushImpulse;
+		o.friction = r.friction;
+		o.frictionIndex = r.frictionIndex;
+		o.isSpecial = r.isSpecial;
+	};
+	*numContact = s.numContactRows;
+	for (int i = 0; i < s.numContactRows; i++)
+		conv(s.contactRows[i], contactRows[i]);
+	*numFriction = s.numFrictionRows;
+	for (int i = 0; i < s.numFrictionRows; i++)
+		conv(s.frictionRows[i], frictionRows[i]);
 }
 
 void UploadCarConsts(GpuBatch* b, const GpuCarConsts& consts) {
@@ -432,14 +474,8 @@ void UploadControlSchedule(GpuBatch* b, const GpuCarControls* schedule, int numT
 }
 
 // ============================== DEVICE-SIDE PHASES ==============================
-// (activation constants + CuIsActive live in CudaCollideWorld.cuh - the collide
-// phase needs them too)
-
-// btCollisionObject::setActivationState (respects DISABLE_* lock-in)
-__device__ __forceinline__ void CuSetActivationState(int& cur, int newState) {
-	if (cur != CU_DISABLE_DEACTIVATION && cur != CU_DISABLE_SIMULATION)
-		cur = newState;
-}
+// (activation constants + CuIsActive + CuSetActivationState live in
+// CudaCollideWorld.cuh - the collide and solve phases need them too)
 
 // Phase 5: predictUnconstraintMotion (btDiscreteDynamicsWorld.cpp:1053).
 // All our bodies are dynamic (non-static/kinematic). The interpolation transform it
@@ -538,6 +574,9 @@ struct GpuCollideKernelArgs {
 	int* numManifolds;               // [numArenas]
 	GpuManifoldOut* manifoldsOut;    // [numArenas * GPU_MAX_MANIFOLDS]
 	int* debug;                      // [numArenas * COLLIDE_DEBUG_INTS]
+	int2* pairs;                     // [numArenas * 96]
+	int* numPairs;                   // [numArenas]
+	CuSolveCtx* solveScratch;        // [numArenas]
 	uint64_t tickBase;
 };
 
@@ -625,6 +664,8 @@ __global__ void GpuStepArenasKernel(
 				cin.dt = dt;
 				cin.manifolds = ca.manifolds + (size_t)arenaIdx * GPU_MAX_MANIFOLDS;
 				cin.numManifolds = ca.numManifolds + arenaIdx;
+				cin.pairsOut = ca.pairs + (size_t)arenaIdx * 96;
+				cin.numPairsOut = ca.numPairs + arenaIdx;
 				cin.debug = ca.debug ? ca.debug + (size_t)arenaIdx * (2 * 96 + 1) : nullptr;
 				CuCollideTick(cin);
 				EmitManifoldsOut(cin.manifolds, *cin.numManifolds,
@@ -633,7 +674,16 @@ __global__ void GpuStepArenasKernel(
 		}
 		__syncthreads();
 
-		// Phase 7 islands/solver lands here.
+		if (ca.enabled && startPhase <= GPU_PHASE_SOLVE && GPU_PHASE_SOLVE <= endPhase) {
+			if (bodyIdx == 0) {
+				CuSolveTick(arenaBodies, consts, arenaCars, bodiesPerArena, ca.numStatics,
+					ca.manifolds + (size_t)arenaIdx * GPU_MAX_MANIFOLDS,
+					ca.numManifolds[arenaIdx],
+					ca.pairs + (size_t)arenaIdx * 96,
+					ca.numPairs[arenaIdx], dt, ca.solveScratch + arenaIdx);
+			}
+		}
+		__syncthreads();
 
 		if (startPhase <= GPU_PHASE_INTEGRATE && GPU_PHASE_INTEGRATE <= endPhase) {
 			if (bodyIdx < bodiesPerArena)
@@ -675,6 +725,9 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.numManifolds = b->dNumManifolds;
 		ca.manifoldsOut = b->dManifoldsOut;
 		ca.debug = b->dCollideDebug;
+		ca.pairs = b->dPairs;
+		ca.numPairs = b->dNumPairs;
+		ca.solveScratch = b->dSolveScratch;
 		ca.tickBase = b->tickCount;
 	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(

@@ -3,6 +3,7 @@
 #include <vector>
 
 class btDiscreteDynamicsWorld;
+class btSequentialImpulseConstraintSolver;
 namespace RocketSim { class Car; }
 
 // 2026-06-10: CPU-side phase-boundary state capture (work copy only, diagnostic).
@@ -62,6 +63,26 @@ struct ProxySnap {
 };
 extern std::vector<ManifoldSnap> manifolds;  // refreshed at AFTER_COLLISION
 extern std::vector<ProxySnap> proxies;       // refreshed at AFTER_COLLISION
+
+// ---- solver internals (captured between iterations and finish) ----
+// Setup-time fields are unmodified by iterations, so one capture shows both the
+// converted rows and the final applied impulses.
+struct SolverRowSnap {
+	int bodyA, bodyB;
+	float normal1[3], relpos1CrossNormal[3], angularComponentA[3];
+	float jacDiagABInv, rhs, rhsPenetration, lowerLimit, upperLimit;
+	float appliedImpulse, appliedPushImpulse, friction;
+	int frictionIndex;
+	uint8_t isSpecial;
+};
+struct SolverBodySnap {
+	const void* rb;   // original body (null = fixed)
+	float deltaLin[3], deltaAng[3], pushVel[3], turnVel[3];
+};
+extern std::vector<SolverRowSnap> solverContactRows, solverFrictionRows;
+extern std::vector<SolverBodySnap> solverBodies;
+
+void CaptureSolver(::btSequentialImpulseConstraintSolver* solver);
 
 // ---- per-car pre-tick capture (hooks in Car::_PreTickUpdate) ----
 // One entry per car per tick, in CPU execution order (unordered_set iteration), so the
