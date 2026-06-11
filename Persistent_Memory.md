@@ -792,11 +792,53 @@ verified in source 2026-06-10):**
         --game-mode heatseeker --ticks 1000 --arenas 64 --cars 4 --seed 1337
           -> 6365120802482066310
       TASK #13 HEATSEEKER: COMPLETE.
-   2. DEMOLITIONS (#14): deterministic-seed hook for Math::GetRandEngine in the
-      WORK copy behind a flag (upstream demo respawn is wall-clock-seeded ->
-      bit-exact validation only possible work-CPU vs work-GPU with the same seed;
-      soccar gates must stay untouched/passing). Device: proxy deactivation,
-      respawn flow.
+   2. DEMOLITIONS (#14, IN PROGRESS - fully decoded, implementing):
+      - Car::Demolish = isDemoed=1 + demoRespawnTimer (ALREADY on device via bump).
+      - Car::_PreTickUpdate head: if isDemoed { timer = RS_MAX(timer-dt, 0);
+        if timer==0 Respawn(); body.activationState = DISABLE_SIMULATION (RAW
+        write); collisionFlags |= NO_CONTACT_RESPONSE } else { ACTIVE_TAG (RAW -
+        cars NEVER sleep on CPU! device kernel must add this raw write for
+        non-demoed cars too); flags &= ~NO_RESPONSE }; then `if (isDemoed) return`
+        RE-EVALUATED: a just-respawned car (isDemoed now false) CONTINUES the
+        pre-tick with a DISABLE_SIMULATION body + NO_RESPONSE flags STILL SET this
+        tick (quirk - port exactly). => GpuCarGameState needs a separate
+        noContactResponse flag (collide hasResponse/callback + solver hasResponse
+        must use IT, not isDemoed).
+      - Car::Respawn(gameMode, seed=-1, boost=mc.carSpawnBoostAmount): idx =
+        Math::RandInt(0, 4, -1) = engine() % 4 where engine = thread_local
+        libstdc++ std::default_random_engine = minstd_rand0 LCG
+        (x = x*16807 % 2147483647; .seed(s): x = s % 2147483647, 0 -> 1).
+        spawn tables CAR_RESPAWN_LOCATIONS_{SOCCAR,HOOPS,DROPSHOT} (4 entries
+        {x, y, yawAng}), pos = (x, y * (blue?1:-1), CAR_RESPAWN_Z=36); rotMat =
+        Angle(yawAng + (blue?0:M_PI as DOUBLE add), 0, 0).ToRotMat() =
+        btMatrix3x3::setEulerYPR(yaw, -0.f, -0.f) = setEulerZYX(-0, -0, yaw):
+        ci=cos(-0) si=sin(-0)=-0 cj=cos(-0) sj=-0 ch=cos(yaw) sh=sin(yaw);
+        cc=ci*ch cs=ci*sh sc=si*ch ss=si*sh; rows: [cj*ch, sj*sc-cs, sj*cc+ss /
+        cj*sh, sj*ss+cc, sj*cs-sc / -sj, cj*si, cj*ci] - SIGNED ZEROS flow, port
+        verbatim w/ exact CuSinf/CuCosf. Then Car::SetState: body origin =
+        pos*UU_TO_BT, basis = rotMat, linVel = 0, angVel = 0,
+        updateInertiaTensor() (CuUpdateInertiaTensor!); _velocityImpulseCache = 0;
+        _internalState = CarState() defaults [pos.z=17 CAR_SPAWN_REST_Z(unused),
+        isOnGround=TRUE, boost=param, all timers/flags 0, ballHitInfo defaults
+        (tickCountWhenHit = UINT64_MAX per observed default), lastControls = {}],
+        tickCountSinceUpdate = 0. WHEELS (btVehicleRL persists) NOT reset (quirk).
+        carID/team keep.
+      - PLAN: (a) work copy Math::SeedRandEngine(uint64) (GetRandEngine().seed());
+        (b) bench --demo-mode {disabled,normal,on-contact} -> SetupArena
+        mc.demoMode; RunCpu seeds engine per arena BEFORE stepping
+        (SeedRandEngine(MixSeed(seed, arenaIdx) ^ 0xDE30)); RunGpu uploads matching
+        per-arena rng state (same seed%2147483647-or-1 transform);
+        (c) GpuBatch dRngStates (uint32/arena) + UploadRngState; GpuTailConsts +=
+        respawn table (x[4],y[4],yaw[4]) + carRespawnZ + carSpawnBoostAmount;
+        (d) device CuMinstdNext + CuCarRespawn (CudaGameTail) + demo block in the
+        kernel GAME_PRE car loop (incl. RAW ACTIVE_TAG write for non-demoed);
+        (e) switch hasResponse checks (CuCollideWorld callback head + hasResponse
+        in CuSolveTick + dyn template hasContactResponse for RAYS? rays use the
+        TEMPLATE hasContactResponse - DEMOED cars: CPU ray sees NO_RESPONSE ->
+        castRay no-hit rule! dyn[] construction in kernel must set
+        hasContactResponse = !noContactResponse per car per tick);
+        (f) demo gates: soccar --demo-mode normal/on-contact CPU vs GPU multi-cfg.
+      - NOTE soccar gates unaffected (no demos -> flags stay 0) but RE-RUN all.
    3. SNOWDAY (#15): puck cylinder shape (new GJK support + getAabb + narrowphase
       paths), ground-stick, snowday callback branches.
    4. HOOPS (#16): hoops meshes (verify obtainable first!), arena setup, launch
