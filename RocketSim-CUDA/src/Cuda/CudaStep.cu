@@ -743,6 +743,11 @@ __device__ static void EmitManifoldsOut(const CuManifold* src, int n, GpuManifol
 	}
 }
 
+// 2026-06-11: 255 regs/thread + ~25KB stack is measured-optimal here; capping
+// registers via __launch_bounds__ (tested 128 and ~170 per thread) raises
+// occupancy 2x but the extra spill traffic makes the kernel 23-32% SLOWER.
+// Do not add launch bounds without re-measuring; hashes stay identical either
+// way (register allocation does not change FP results).
 __global__ void GpuStepArenasKernel(
 	GpuBodyState* bodies, const GpuBodyConsts* consts,
 	GpuCarGameState* cars, GpuPadState* pads,
