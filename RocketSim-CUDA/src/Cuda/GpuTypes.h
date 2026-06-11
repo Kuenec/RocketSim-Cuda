@@ -116,12 +116,18 @@ struct GpuCarGameState {
 	float carContact_cooldownTimer;
 	uint8_t isDemoed;
 	float demoRespawnTimer;
+	// CarState::rotMat (UU rotation cache): written by the post-tick from the live
+	// basis, so it goes STALE while demoed (post-tick skips) - hash-visible
+	GpuMat3 rotMat;
 	GpuBallHitInfo ballHitInfo;
 	GpuCarControls lastControls;
 	GpuVec3 velocityImpulseCache;   // Car::_velocityImpulseCache
 	GpuWheelState wheels[4];
 	uint32_t carID;
 	uint8_t team;                   // 0 blue, 1 orange
+	// mirror of (m_collisionFlags & CF_NO_CONTACT_RESPONSE): set with demolition,
+	// stays set for one tick after the respawn (CPU quirk)
+	uint8_t noContactResponse;
 };
 
 struct GpuPadState {
@@ -371,6 +377,10 @@ struct GpuTailConsts {
 	int padGridCellsX, padGridCellsY;
 	int16_t padGridMap[8 * 10];             // [ix * cellsY + iy] -> pad index or -1
 	float cylHeightBT;                       // CYL_HEIGHT * UU_TO_BT
+	// demolition respawn (CAR_RESPAWN_LOCATIONS_* for the arena's game mode)
+	float respawnX[4], respawnY[4], respawnYaw[4];
+	float carRespawnZ;                       // CAR_RESPAWN_Z
+	float carSpawnBoostAmount;               // mutator
 };
 
 

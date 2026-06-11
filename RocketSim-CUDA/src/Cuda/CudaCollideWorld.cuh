@@ -11,9 +11,9 @@
 //   replicated exactly, including ctor-created empty manifolds and the compound
 //   post-loop releases) + Arena::_BulletContactAddedCallback game effects.
 // Spec: Persistent_Memory.md "COLLISION ORCHESTRATION SPEC". Statics are
-// ISLAND_SLEEPING; demolitions are not supported on device (gates: DemoMode
-// DISABLED; a demolition would remove a broadphase proxy, which this port does
-// not model).
+// ISLAND_SLEEPING. Demolitions: the demoed body STAYS in the broadphase (CPU
+// keeps the proxy); it goes DISABLE_SIMULATION + noContactResponse at the next
+// pre-tick, respawn handled in the kernel GAME_PRE demo block.
 
 #include "GpuTypes.h"
 #include "CudaMath.cuh"
@@ -342,10 +342,12 @@ struct CuManifoldList {
 __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 	CuManifoldPoint& cp, int bodyA, int bodyB) {
 
-	// hasContactResponse: demolished cars get CF_NO_CONTACT_RESPONSE
-	if (bodyA >= 1 && in.cars[bodyA - 1].isDemoed)
+	// hasContactResponse: noContactResponse mirrors CF_NO_CONTACT_RESPONSE, which is
+	// only set at the NEXT pre-tick after a demo - a car demoed earlier this tick
+	// still passes this check (CPU flag timing)
+	if (bodyA >= 1 && in.cars[bodyA - 1].noContactResponse)
 		return;
-	if (bodyB >= 1 && in.cars[bodyB - 1].isDemoed)
+	if (bodyB >= 1 && in.cars[bodyB - 1].noContactResponse)
 		return;
 
 	// shouldSwap by userIndex: car(1) < ball(2) < none(-1 world). Manifold body0 is
@@ -462,8 +464,7 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 							if (isDemo && !in.cc.enableTeamDemos)
 								isDemo = car1.team != car2.team;
 							if (isDemo) {
-								// Car::Demolish: full demolition (body removal + respawn)
-								// is not modeled on device; gates run DemoMode::DISABLED.
+								// Car::Demolish; flags/activation change at next pre-tick
 								car2.isDemoed = 1;
 								car2.demoRespawnTimer = in.cc.respawnDelay;
 							} else {

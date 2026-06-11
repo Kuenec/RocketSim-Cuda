@@ -110,6 +110,7 @@ struct GpuBatch {
 	GpuPadConfig* dPadConfigs;
 	GpuDynBody* dDynTemplates;    // [bodiesPerArena] shape/filter templates
 	int* dCarOrder;               // [numArenas * numCars] CPU _cars iteration order
+	uint32_t* dRngStates;         // [numArenas] minstd_rand0 state (demo respawns)
 	bool hasTailData;
 };
 #define COLLIDE_DEBUG_INTS (2 * 96 + 1)
@@ -165,6 +166,8 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	CudaCheck(cudaMalloc(&b->dNumPairs, sizeof(int) * numArenas), "alloc numpairs");
 	CudaCheck(cudaMemset(b->dNumPairs, 0, sizeof(int) * numArenas), "zero numpairs");
 	CudaCheck(cudaMalloc(&b->dSolveScratch, sizeof(CuSolveCtx) * numArenas), "alloc solve scratch");
+	CudaCheck(cudaMalloc(&b->dRngStates, sizeof(uint32_t) * numArenas), "alloc rng states");
+	CudaCheck(cudaMemset(b->dRngStates, 1, sizeof(uint32_t) * numArenas), "init rng states");
 	return b;
 }
 
@@ -201,6 +204,7 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dPadConfigs);
 	cudaFree(b->dDynTemplates);
 	cudaFree(b->dCarOrder);
+	cudaFree(b->dRngStates);
 	delete b;
 }
 
@@ -280,6 +284,11 @@ void UploadTailData(GpuBatch* b, const GpuTailConsts& consts,
 void UploadCarOrder(GpuBatch* b, int arenaIdx, const int* order) {
 	CudaCheck(cudaMemcpy(b->dCarOrder + (size_t)arenaIdx * b->numCars, order,
 		sizeof(int) * b->numCars, cudaMemcpyHostToDevice), "up car order");
+}
+
+void UploadRngState(GpuBatch* b, int arenaIdx, uint32_t state) {
+	CudaCheck(cudaMemcpy(b->dRngStates + arenaIdx, &state, sizeof(uint32_t),
+		cudaMemcpyHostToDevice), "up rng state");
 }
 
 void DownloadCollideResults(GpuBatch* b, int arenaIdx,
@@ -626,6 +635,7 @@ struct GpuCollideKernelArgs {
 	const GpuDynBody* dynTemplates;  // [bodiesPerArena]
 	const int* carOrder;             // [numArenas * numCars]
 	const GpuCarConsts* carConsts;
+	uint32_t* rngStates;             // [numArenas]
 };
 
 __device__ static void StoreVec(GpuVec3& dst, CuVec3 v) { dst = { v.x, v.y, v.z }; }
@@ -690,6 +700,28 @@ __global__ void GpuStepArenasKernel(
 					// bench sets car->controls from the schedule before each tick
 					GpuCarControls ctrl = schedule[
 						((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
+
+					// Car::_PreTickUpdate head: demolition handling. RAW activation
+					// writes (the CPU assigns m_activationState1 directly, so
+					// non-demoed cars are forced awake every tick).
+					if (cst.isDemoed) {
+						float t = cst.demoRespawnTimer - dt;
+						cst.demoRespawnTimer = t > 0.0f ? t : 0.0f; // RS_MAX
+						if (cst.demoRespawnTimer == 0.0f)
+							CuCarRespawn(arenaBodies[1 + ci], cst,
+								ca.rngStates[arenaIdx], consts[1 + ci], *ca.tail);
+						arenaBodies[1 + ci].activationState = CU_DISABLE_SIMULATION;
+						cst.noContactResponse = 1;
+						// CPU re-evaluates isDemoed: a just-respawned car continues
+						// the pre-tick (with the disabled body + response flag still
+						// set for this tick - quirk preserved)
+						if (cst.isDemoed)
+							continue;
+					} else {
+						arenaBodies[1 + ci].activationState = CU_ACTIVE_TAG;
+						cst.noContactResponse = 0;
+					}
+
 					CuCarTickIO io;
 					{
 						const GpuBodyState& s = arenaBodies[1 + ci];
@@ -723,6 +755,10 @@ __global__ void GpuStepArenasKernel(
 						dyn[d].angVel = s.angVel;
 						dyn[d].invInertiaWorld = s.invInertiaWorld;
 						dyn[d].aabbMin = ca.proxies[(size_t)arenaIdx * bodiesPerArena + d].aabbMin;
+						// live CF_NO_CONTACT_RESPONSE: cars demoed earlier in this
+						// tick's iteration order are no-response for our wheel rays
+						if (d >= 1)
+							dyn[d].hasContactResponse = arenaCars[d - 1].noContactResponse ? 0 : 1;
 						dynBodies[d] = DynToBody(dyn[d]);
 					}
 					CuWheelScratch W[4];
@@ -892,6 +928,7 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.dynTemplates = b->dDynTemplates;
 		ca.carOrder = b->dCarOrder;
 		ca.carConsts = b->dCarConsts;
+		ca.rngStates = b->dRngStates;
 	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(
 		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule, b->scheduleTicks,

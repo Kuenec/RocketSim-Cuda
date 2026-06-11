@@ -36,13 +36,14 @@ __device__ __forceinline__ void CuClearForces(GpuBodyState& b) {
 	b.totalTorque = { 0, 0, 0 };
 }
 
-// Car::_PostTickUpdate (rotMat cache equals the live basis - the callbacks read
-// columns of the live basis already; demoed cars would keep a stale rotMat, but
-// demolitions are not modeled)
+// Car::_PostTickUpdate. The rotMat cache is refreshed from the live basis here,
+// which means it goes STALE while demoed (the early return skips it) - that stale
+// value is the CPU's hash-visible CarState::rotMat, so it is carried in st.
 __device__ __forceinline__ void CuCarPostTick(const GpuBodyState& b, GpuCarGameState& st,
 	const GpuTailConsts& tc, const GpuCarControls& controls, float tickTime) {
 	if (st.isDemoed)
 		return;
+	st.rotMat = b.basis;
 	{ // supersonic
 		CuVec3 velUU = GV(b.linVel) * 50.0f; // * BT_TO_UU
 		float speedSquared = CuLength2(velUU);
@@ -107,6 +108,64 @@ __device__ __forceinline__ void CuBallFinish(GpuBodyState& b, GpuBallGameState& 
 	}
 	CuClampVelocities(b, tc.ballMaxSpeedBT, tc.ballMaxAngSpeed);
 	st.tickCountSinceUpdate++;
+}
+
+// ---- demolition respawn (Car::Respawn + Car::SetState) -----------------------------
+
+// libstdc++ std::default_random_engine = minstd_rand0: x = x * 16807 % 2147483647
+__device__ __forceinline__ uint32_t CuMinstdNext(uint32_t& s) {
+	s = (uint32_t)(((uint64_t)s * 16807ull) % 2147483647ull);
+	return s;
+}
+
+// Car::Respawn(gameMode, seed=-1, boost) followed by Car::SetState(CarState reset).
+// Wheels (btVehicleRL persists) are NOT reset - CPU quirk.
+__device__ inline void CuCarRespawn(GpuBodyState& body, GpuCarGameState& st,
+	uint32_t& rngState, const GpuBodyConsts& bc, const GpuTailConsts& tc) {
+	// Math::RandInt(0, 4, -1) = engine() % 4
+	int spawnPosIndex = (int)(CuMinstdNext(rngState) % 4u);
+	float ySign = st.team == 0 /*BLUE*/ ? 1.0f : -1.0f;
+	CuVec3 posUU = { tc.respawnX[spawnPosIndex],
+		tc.respawnY[spawnPosIndex] * ySign, tc.carRespawnZ };
+	// Angle(yawAng + (blue ? 0 : M_PI), 0, 0): the M_PI add promotes to double
+	float yaw = st.team == 0 ? tc.respawnYaw[spawnPosIndex]
+		: (float)((double)tc.respawnYaw[spawnPosIndex] + 0x1.921fb54442d18p+1);
+	// ToRotMat = setEulerYPR(yaw, -0.f, -0.f) = setEulerZYX(eulerX=-0, eulerY=-0,
+	// eulerZ=yaw); signed zeros flow through the products
+	float ci = CuCosf(-0.0f), cj = CuCosf(-0.0f), ch = CuCosf(yaw);
+	float si = CuSinf(-0.0f), sj = CuSinf(-0.0f), sh = CuSinf(yaw);
+	float cc = ci * ch, cs = ci * sh, sc = si * ch, ss = si * sh;
+	CuMat3 basis = { { { cj * ch, sj * sc - cs, sj * cc + ss },
+	                   { cj * sh, sj * ss + cc, sj * cs - sc },
+	                   { -sj, cj * si, cj * ci } } };
+	// Car::SetState
+	CuVec3 posBT = posUU * (1.0f / 50.0f); // * UU_TO_BT
+	body.pos = { posBT.x, posBT.y, posBT.z };
+	for (int r = 0; r < 3; r++)
+		body.basis.row[r] = { basis.r[r].x, basis.r[r].y, basis.r[r].z };
+	GpuMat3 rotMat = body.basis; // _internalState.rotMat = state.rotMat
+	body.linVel = { 0, 0, 0 };
+	body.angVel = { 0, 0, 0 };
+	CuMat3 invIW = CuUpdateInertiaTensor(basis, GV(bc.invInertiaLocal));
+	for (int r = 0; r < 3; r++)
+		body.invInertiaWorld.row[r] = { invIW.r[r].x, invIW.r[r].y, invIW.r[r].z };
+	// _internalState = CarState() defaults (keep carID/team/wheels)
+	uint32_t carID = st.carID;
+	uint8_t team = st.team;
+	GpuWheelState wheels[4];
+	for (int w = 0; w < 4; w++)
+		wheels[w] = st.wheels[w];
+	st = {};
+	st.carID = carID;
+	st.team = team;
+	for (int w = 0; w < 4; w++)
+		st.wheels[w] = wheels[w];
+	st.rotMat = rotMat;
+	st.isOnGround = 1;
+	st.boost = tc.carSpawnBoostAmount;
+	st.ballHitInfo.tickCountWhenHit = ~0ull;                  // BallHitInfo defaults
+	st.ballHitInfo.tickCountWhenExtraImpulseApplied = ~0ull;
+	// (velocityImpulseCache / timers / flags all zero from the {} init)
 }
 
 // ---- RocketSim Angle math (heatseeker ball steering) -------------------------------

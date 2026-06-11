@@ -10,8 +10,9 @@
 //    runs under ASLR. This bench therefore keeps its own insertion-ordered car list for input
 //    assignment and state hashing, and never relies on arena container order.
 //  - Car demolition respawn calls Math::RandInt(.., seed=-1) which uses a wall-clock-seeded
-//    engine (Math.cpp GetRandEngine). Gates run with DemoMode::DISABLED so no time-seeded
-//    randomness can enter the simulation.
+//    engine upstream (Math.cpp GetRandEngine). The work copy adds Math::SeedRandEngine; both
+//    paths pin the engine to a per-arena seed (DemoRngSeed) right before stepping, so
+//    --demo-mode normal/on-contact runs are deterministic. The default stays DISABLED.
 //  - ResetToRandomKickoff uses std::shuffle + std::default_random_engine (both
 //    implementation-defined) and arena container order; not used. Spawns are set explicitly.
 //  - All bench-side randomness comes from splitmix64 (fully defined here), and generated
@@ -100,12 +101,20 @@ struct Args {
 	int arenaOffset = 0;            // diagnostic: arena index offset (reproduce arena K standalone)
 	bool noBallMotion = false;      // diagnostic: skip the gpu-compare ball-motion injection
 	GameMode gameMode = GameMode::SOCCAR;
+	DemoMode demoMode = DemoMode::DISABLED;
 };
+
+// Demo respawns draw Math::RandInt(0, 4, -1) from the engine; both paths pin it to this
+// per-arena seed before stepping (CPU: Math::SeedRandEngine, GPU: UploadRngState)
+static uint64_t DemoRngSeed(const Args& args, int arenaIdx) {
+	return MixSeed(args.seed, (uint64_t)(arenaIdx + args.arenaOffset)) ^ 0xDE30ull;
+}
 
 static void PrintUsage(const char* argv0) {
 	fprintf(stderr,
 		"Usage: %s --mesh-dir <collision_meshes dir> --ticks N [--arenas N] [--cars N] "
-		"[--seed N] [--expected-state-hash H] [--profile] [--gpu-step]\n", argv0);
+		"[--seed N] [--expected-state-hash H] [--profile] [--gpu-step] "
+		"[--game-mode M] [--demo-mode disabled|normal|on-contact]\n", argv0);
 }
 
 static bool ParseArgs(int argc, char** argv, Args& out) {
@@ -162,6 +171,12 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 			else if (!strcmp(v, "snowday")) out.gameMode = GameMode::SNOWDAY;
 			else if (!strcmp(v, "dropshot")) out.gameMode = GameMode::DROPSHOT;
 			else { fprintf(stderr, "Unknown game mode: %s\n", v); return false; }
+		} else if (!strcmp(argv[i], "--demo-mode")) {
+			const char* v = need("--demo-mode"); if (!v) return false;
+			if (!strcmp(v, "disabled")) out.demoMode = DemoMode::DISABLED;
+			else if (!strcmp(v, "normal")) out.demoMode = DemoMode::NORMAL;
+			else if (!strcmp(v, "on-contact")) out.demoMode = DemoMode::ON_CONTACT;
+			else { fprintf(stderr, "Unknown demo mode: %s\n", v); return false; }
 		} else if (!strcmp(argv[i], "--dump-arena-hashes")) {
 			out.dumpArenaHashes = true;
 		} else if (!strcmp(argv[i], "--dump-state-dir")) {
@@ -247,9 +262,9 @@ static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>&
 	int arenaIdx = arenaIdxIn + args.arenaOffset;
 	Arena* arena = Arena::Create(args.gameMode);
 
-	// Demos disabled: upstream demo respawn is wall-clock-seeded (see header comment)
+	// Demo respawn randomness is pinned per arena via DemoRngSeed (see header comment)
 	MutatorConfig mc = arena->GetMutatorConfig();
-	mc.demoMode = DemoMode::DISABLED;
+	mc.demoMode = args.demoMode;
 	arena->SetMutatorConfig(mc);
 
 	Rng spawnRng(MixSeed(args.seed, (uint64_t)arenaIdx));
@@ -342,6 +357,9 @@ static uint64_t RunCpu(const Args& args, double& elapsedS) {
 	for (int arenaIdx = 0; arenaIdx < args.arenas; arenaIdx++) {
 		std::vector<CarSlot> slots;
 		Arena* arena = SetupArena(args, arenaIdx, slots);
+
+		// Pin the demo-respawn engine AFTER setup (the Arena ctor may draw from it)
+		Math::SeedRandEngine(DemoRngSeed(args, arenaIdx));
 
 		auto t0 = std::chrono::steady_clock::now();
 		for (int tick = 0; tick < args.ticks; tick++) {
@@ -463,6 +481,8 @@ static void SnapshotCar(Car* car, rscuda::GpuBodyState& body, rscuda::GpuCarGame
 	g.carContact_otherCarID = cs.carContact.otherCarID;
 	g.carContact_cooldownTimer = cs.carContact.cooldownTimer;
 	g.isDemoed = cs.isDemoed; g.demoRespawnTimer = cs.demoRespawnTimer;
+	g.rotMat = ToGpuB((btMatrix3x3)cs.rotMat);
+	g.noContactResponse = car->_rigidBody.hasContactResponse() ? 0 : 1;
 	g.ballHitInfo.isValid = cs.ballHitInfo.isValid;
 	g.ballHitInfo.relativePosOnBall = ToGpu(cs.ballHitInfo.relativePosOnBall);
 	g.ballHitInfo.ballPos = ToGpu(cs.ballHitInfo.ballPos);
@@ -488,9 +508,17 @@ static void SnapshotCar(Car* car, rscuda::GpuBodyState& body, rscuda::GpuCarGame
 static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscuda::GpuCarGameState& g) {
 	WritebackBody(car->_rigidBody, body);
 	CarState& cs = car->_internalState;
-	// Car::GetState refreshes pos/vel/angVel from the body but NOT rotMat (that happens
-	// in _PostTickUpdate, which doesn't run in GPU mode) - sync it here
-	cs.rotMat = (RotMat)car->_rigidBody.getWorldTransform().getBasis();
+	// CarState::rotMat is the device-carried post-tick cache, NOT the live basis -
+	// they differ for a car that is demoed right now (post-tick skips the refresh)
+	cs.rotMat = (RotMat)FromGpuB(g.rotMat);
+	{ // mirror noContactResponse back into the body's collision flags
+		int flags = car->_rigidBody.getCollisionFlags();
+		if (g.noContactResponse)
+			flags |= btCollisionObject::CF_NO_CONTACT_RESPONSE;
+		else
+			flags &= ~btCollisionObject::CF_NO_CONTACT_RESPONSE;
+		car->_rigidBody.setCollisionFlags(flags);
+	}
 	cs.isOnGround = g.isOnGround;
 	for (int w = 0; w < 4; w++) cs.wheelsWithContact[w] = g.wheelsWithContact[w];
 	cs.hasJumped = g.hasJumped; cs.hasDoubleJumped = g.hasDoubleJumped; cs.hasFlipped = g.hasFlipped;
@@ -1687,6 +1715,22 @@ static void ExtractTailData(Arena* arena, std::vector<CarSlot>& slots,
 	tc.padGridCellsY = BoostPadGrid::CELLS_Y;
 	tc.cylHeightBT = BoostPads::CYL_HEIGHT * UU_TO_BT;
 
+	{ // Car::Respawn spawn table (mode-appropriate) + spawn constants
+		const CarSpawnPos* respawns;
+		switch (arena->gameMode) {
+		case GameMode::HOOPS: respawns = CAR_RESPAWN_LOCATIONS_HOOPS; break;
+		case GameMode::DROPSHOT: respawns = CAR_RESPAWN_LOCATIONS_DROPSHOT; break;
+		default: respawns = CAR_RESPAWN_LOCATIONS_SOCCAR;
+		}
+		for (int i = 0; i < CAR_RESPAWN_LOCATION_AMOUNT; i++) {
+			tc.respawnX[i] = respawns[i].x;
+			tc.respawnY[i] = respawns[i].y;
+			tc.respawnYaw[i] = respawns[i].yawAng;
+		}
+		tc.carRespawnZ = CAR_RESPAWN_Z;
+		tc.carSpawnBoostAmount = mc.carSpawnBoostAmount;
+	}
+
 	const auto& padList = arena->GetBoostPads();
 	for (BoostPad* pad : padList) {
 		rscuda::GpuPadConfig pc = {};
@@ -1825,6 +1869,10 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 				if (slotsPerArena[a][c].car == car)
 					order.push_back(c);
 		rscuda::UploadCarOrder(batch, a, order.data());
+		// minstd_rand0 post-seed state: libstdc++ takes seed % 2147483647, 0 -> 1
+		// (RunCpu pins the same engine via Math::SeedRandEngine with this seed)
+		uint32_t rngState = (uint32_t)(DemoRngSeed(args, a) % 2147483647ull);
+		rscuda::UploadRngState(batch, a, rngState == 0 ? 1u : rngState);
 	}
 	rscuda::SetTickCount(batch, 0);
 

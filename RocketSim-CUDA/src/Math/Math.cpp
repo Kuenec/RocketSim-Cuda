@@ -63,6 +63,10 @@ std::default_random_engine& Math::GetRandEngine() {
 	return randEngine;
 }
 
+void Math::SeedRandEngine(uint64_t seed) {
+	GetRandEngine().seed((std::default_random_engine::result_type)seed);
+}
+
 float Math::WrapNormalizeFloat(float val, float minmax) {
 	float result = fmod(val, minmax * 2);
 	if (result > minmax)

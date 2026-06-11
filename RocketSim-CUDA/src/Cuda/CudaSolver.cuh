@@ -133,7 +133,7 @@ __device__ inline float CuResolveSplitPenetration(CuSolverBody& a, CuSolverBody&
 struct CuSolveCtx {
 	GpuBodyState* bodies;
 	const GpuBodyConsts* bodyConsts;
-	GpuCarGameState* cars;     // hasContactResponse: demoed cars say no
+	GpuCarGameState* cars;     // hasContactResponse: noContactResponse mirrors CF_NO_CONTACT_RESPONSE
 	int numBodies;
 	float dt;
 	// solver pools
@@ -532,10 +532,18 @@ __device__ inline void CuSolveTick(GpuBodyState* bodies, const GpuBodyConsts* bo
 	// --- calculateSimulationIslands: tags + unions over the PAIR array ---
 	CuUnionFind uf;
 	uf.reset(numBodies); // island tag i for dyn slot i (statics: -1, skipped)
+	// mergesSimulationIslands(): non-static AND no CF_NO_CONTACT_RESPONSE - a demoed
+	// car's pairs must NOT pull it into an active island (its external forces would
+	// get integrated by the solver; the CPU leaves it in a skipped singleton island)
+	auto mergesIslands = [&](int slot) -> bool {
+		return slot == 0 || !cars[slot - 1].noContactResponse;
+	};
 	for (int p = 0; p < numPairs; p++) {
-		// mergesSimulationIslands: both non-static
-		if (pairs[p].x >= numStatics && pairs[p].y >= numStatics)
-			uf.unite(pairs[p].x - numStatics, pairs[p].y - numStatics);
+		if (pairs[p].x >= numStatics && pairs[p].y >= numStatics) {
+			int slotA = pairs[p].x - numStatics, slotB = pairs[p].y - numStatics;
+			if (mergesIslands(slotA) && mergesIslands(slotB))
+				uf.unite(slotA, slotB);
+		}
 	}
 	// storeIslandActivationState: tag = find(i) (sets path compression state)
 	int tag[20];
@@ -586,7 +594,9 @@ __device__ inline void CuSolveTick(GpuBodyState* bodies, const GpuBodyConsts* bo
 	// m_islandmanifold: dispatcher order, either body awake, needsResponse
 	auto hasResponse = [&](int bodyRef) -> bool {
 		if (bodyRef < 0) return true;               // statics
-		if (bodyRef >= 1 && cars[bodyRef - 1].isDemoed) return false;
+		// CF_NO_CONTACT_RESPONSE mirror: set/cleared in the pre-tick demo block, so a
+		// car demoed mid-tick still responds until next tick (CPU flag timing)
+		if (bodyRef >= 1 && cars[bodyRef - 1].noContactResponse) return false;
 		return true;
 	};
 	auto bodyActivation = [&](int bodyRef) -> int {

@@ -78,6 +78,9 @@ void UploadTailData(GpuBatch* batch, const GpuTailConsts& consts,
 // Per-arena car pre/post-tick iteration order (the CPU's _cars unordered_set order)
 void UploadCarOrder(GpuBatch* batch, int arenaIdx, const int* order);
 
+// Per-arena minstd_rand0 state for demo respawn draws (post-.seed() engine state)
+void UploadRngState(GpuBatch* batch, int arenaIdx, uint32_t state);
+
 // Download the collide-phase results of one arena: manifolds in dispatcher order,
 // proxy state, and the ball game state (callback side effects).
 void DownloadCollideResults(GpuBatch* batch, int arenaIdx,

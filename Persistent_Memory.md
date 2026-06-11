@@ -174,7 +174,7 @@ CPU gates still PASS (reference untouched).
 SPS varies a few percent run to run; the hash is the gate, SPS is informational.
 
 ### Key decisions (with evidence)
-1. **Gates run with `DemoMode::DISABLED`.** Upstream demolition respawn calls `Math::RandInt(.., seed=-1)` -> `Math::GetRandEngine()`, which is seeded from wall-clock + thread id (`src/Math/Math.cpp`). Any demo would inject non-reproducible randomness. Demo LOGIC must still be ported to GPU; the gates just cannot cover the respawn path. Bump/demo checks still execute every tick.
+1. **Soccar/heatseeker gates run with `DemoMode::DISABLED` (the bench default); demo gates pin the respawn RNG.** Upstream demolition respawn calls `Math::RandInt(.., seed=-1)` -> `Math::GetRandEngine()` (wall-clock + thread-id seeded). The work copy adds `Math::SeedRandEngine(uint64)`; the bench seeds it per arena (`DemoRngSeed = MixSeed(seed, arenaIdx + arenaOffset) ^ 0xDE30`) right after SetupArena, and the GPU path uploads the matching minstd_rand0 state (`s % 2147483647`, 0 -> 1) via `UploadRngState`. `--demo-mode {disabled,normal,on-contact}` selects the mutator; demos are now fully deterministic and gate-covered.
 2. **Bench masks `BallState.dsInfo.lastDamageTick` when `!hasDamaged`.** That field has NO initializer upstream and is only written in dropshot, but `BallState::Serialize` writes it regardless. Unmasked, the state hash ingests uninitialized heap bytes — diagnosed as the root cause of a nondeterministic stable gate (per-arena hash dump + 4-byte blob diff at exactly that field's offset; only soccar-mode read of the field is inside a `gameMode == DROPSHOT` guard, so physics is unaffected).
 3. **No `ResetToRandomKickoff`, explicit spawns instead.** It iterates `_cars` (a pointer-keyed `unordered_set`, ASLR-order) and uses `std::shuffle`/`std::default_random_engine` (implementation-defined). Bench sets car states explicitly.
 4. **Bench randomness is splitmix64 with power-of-two float quantization** — input schedule is bit-identical on any platform/compiler. Never use std distributions for gate-relevant randomness.
@@ -792,7 +792,7 @@ verified in source 2026-06-10):**
         --game-mode heatseeker --ticks 1000 --arenas 64 --cars 4 --seed 1337
           -> 6365120802482066310
       TASK #13 HEATSEEKER: COMPLETE.
-   2. DEMOLITIONS (#14, IN PROGRESS - fully decoded, implementing):
+   2. DEMOLITIONS (#14, COMPLETE):
       - Car::Demolish = isDemoed=1 + demoRespawnTimer (ALREADY on device via bump).
       - Car::_PreTickUpdate head: if isDemoed { timer = RS_MAX(timer-dt, 0);
         if timer==0 Respawn(); body.activationState = DISABLE_SIMULATION (RAW
@@ -823,22 +823,74 @@ verified in source 2026-06-10):**
         (tickCountWhenHit = UINT64_MAX per observed default), lastControls = {}],
         tickCountSinceUpdate = 0. WHEELS (btVehicleRL persists) NOT reset (quirk).
         carID/team keep.
-      - PLAN: (a) work copy Math::SeedRandEngine(uint64) (GetRandEngine().seed());
-        (b) bench --demo-mode {disabled,normal,on-contact} -> SetupArena
-        mc.demoMode; RunCpu seeds engine per arena BEFORE stepping
-        (SeedRandEngine(MixSeed(seed, arenaIdx) ^ 0xDE30)); RunGpu uploads matching
-        per-arena rng state (same seed%2147483647-or-1 transform);
-        (c) GpuBatch dRngStates (uint32/arena) + UploadRngState; GpuTailConsts +=
-        respawn table (x[4],y[4],yaw[4]) + carRespawnZ + carSpawnBoostAmount;
-        (d) device CuMinstdNext + CuCarRespawn (CudaGameTail) + demo block in the
-        kernel GAME_PRE car loop (incl. RAW ACTIVE_TAG write for non-demoed);
-        (e) switch hasResponse checks (CuCollideWorld callback head + hasResponse
-        in CuSolveTick + dyn template hasContactResponse for RAYS? rays use the
-        TEMPLATE hasContactResponse - DEMOED cars: CPU ray sees NO_RESPONSE ->
-        castRay no-hit rule! dyn[] construction in kernel must set
-        hasContactResponse = !noContactResponse per car per tick);
-        (f) demo gates: soccar --demo-mode normal/on-contact CPU vs GPU multi-cfg.
-      - NOTE soccar gates unaffected (no demos -> flags stay 0) but RE-RUN all.
+      TASK #14 DEMOLITIONS: COMPLETE (all gates PASS bit-exact).
+      IMPLEMENTED: Math::SeedRandEngine work-copy hook; bench --demo-mode
+      {disabled,normal,on-contact} + DemoRngSeed helper (RunCpu seeds the engine
+      per arena after SetupArena; RunGpu uploads the post-.seed() minstd state via
+      new UploadRngState / GpuBatch::dRngStates); GpuTailConsts += respawnX/Y/Yaw[4]
+      + carRespawnZ + carSpawnBoostAmount (ExtractTailData fills mode-appropriate
+      CAR_RESPAWN_LOCATIONS_*); device CuMinstdNext + CuCarRespawn (CudaGameTail -
+      setEulerZYX signed-zero trees, SetState semantics: NO activate(), NO
+      deactivationTime reset, wheels persist); kernel GAME_PRE demo block (timer
+      RS_MAX countdown, respawn, RAW DISABLE_SIMULATION + noContactResponse=1 for
+      demoed / RAW ACTIVE_TAG + 0 for non-demoed, re-evaluated isDemoed skip so a
+      just-respawned car continues pre-tick with the disabled body - CPU quirk);
+      hasResponse switched isDemoed -> noContactResponse in CuContactAddedCallback
+      head + CuSolveTick hasResponse; per-car live dyn[] override
+      hasContactResponse = !noContactResponse (wheel-ray acceptance rule);
+      SnapshotCar/WritebackCar carry noContactResponse (mirrors body collision
+      flags both ways).
+      ROOT CAUSES FIXED while validating (8x6x3000 seed4242 on-contact diverged):
+      (1) **CarState::rotMat staleness**: rotMat is refreshed from the live basis
+      only in the post-tick, which demoed cars SKIP - so a car demoed at hash time
+      carries a STALE rotMat while its body basis moved during the demo tick.
+      WritebackCar used the live basis -> mismatch. Fix: GpuCarGameState grew
+      rotMat; CuCarPostTick writes st.rotMat = b.basis after the demo guard;
+      CuCarRespawn sets it to the spawn basis; WritebackCar uses g.rotMat.
+      (2) **mergesSimulationIslands**: btSimulationIslandManager::findUnions only
+      unites pairs where BOTH bodies have mergesSimulationIslands() = non-static
+      AND no CF_NO_CONTACT_RESPONSE. The device union-find united every dyn-dyn
+      pair, so a freshly-respawned (still no-response, DISABLE_SIMULATION) car
+      with a stale overlap pair got pulled into an ACTIVE island -> the solver
+      integrated its pre-tick external forces (air torque/boost) into vel/angVel;
+      the CPU leaves it in a skipped singleton island (buildAndProcessIslands
+      skips islands with no isActive() body). Fix: CuSolveTick union step now
+      requires !noContactResponse on both car slots (ball always merges).
+      Diagnosis evidence: state-blob bisection -> first diverging tick 1126;
+      blob decode (WriteMultiple writes a uint32 count; Vec=16B, RotMat=48B)
+      -> vel/angVel of the respawned car; device printf bracket: vel=0 after
+      CuCarRespawn AND after pre-tick, NONZERO after CuSolveTick, pair list
+      showed the demoed car's pair {21,25} -> island merge confirmed.
+      Bullet semantics verified for DISABLE_SIMULATION (no device change needed):
+      predictUnconstraintMotion damps unconditionally; applyGravity/integrate/
+      island-processing use isActive(); setActivationState guarded writes;
+      updateDeactivation/wantsSleeping do NOT special-case state 5 (timer keeps
+      accumulating - replicated); forceUpdateAllAabbs=true so the teleported
+      proxy updates the same tick; CPU vehicle raycaster rejects hits on
+      no-response bodies (live dyn override covers); BoostPadGrid isDemoed guard
+      + post-tick/finish isDemoed guards were already ported.
+      DEMO GATES (work-bench CPU = reference, all PASS on GPU):
+        --ticks 1000 --arenas 64 --cars 4 --seed 1337 --demo-mode on-contact
+          -> 16798083503057895723
+        --ticks 3000 --arenas 8 --cars 6 --seed 4242 --demo-mode on-contact
+          -> 2807978879122602574
+        --ticks 1000 --arenas 8 --cars 6 --seed 4242 --demo-mode on-contact
+          -> 9086356441874091534   (hashes cars MID-DEMOLITION: stale rotMat,
+                                    frozen body, DISABLE_SIMULATION covered)
+        --ticks 2000 --arenas 32 --cars 4 --seed 909090 --demo-mode on-contact
+          -> 11661070273966666902
+        --ticks 2000 --arenas 16 --cars 6 --seed 777 --demo-mode normal
+          -> 1608027089116060330
+      All soccar + heatseeker gates re-PASS (CPU and GPU).
+      RESIDUAL COVERAGE NOTE: no random-controls run produced a SUPERSONIC bumper
+      contact, so DemoMode::NORMAL's supersonic branch always fell through to the
+      bump path (normal hash == disabled hash for the tested cfgs). The branch is
+      a 1:1 port (isDemo = car1.isSupersonic) and both downstream paths are
+      gate-covered; a supersonic-demo gate would need a crafted control schedule.
+      KNOWN LIMITATION: --gpu-compare lockstep harness mispairs rscap captures for
+      demoed cars (phase-1/2 captures missing during demo, phase-0 entry state is
+      pre-respawn) - prints garbage diffs; fix only if needed for future demo
+      debugging (state-blob bisection + device printf worked better anyway).
    3. SNOWDAY (#15): puck cylinder shape (new GJK support + getAabb + narrowphase
       paths), ground-stick, snowday callback branches.
    4. HOOPS (#16): hoops meshes (verify obtainable first!), arena setup, launch

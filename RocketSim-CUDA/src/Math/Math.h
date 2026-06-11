@@ -20,6 +20,10 @@ namespace Math {
 
 	std::default_random_engine& GetRandEngine();
 
+	// 2026-06-10: deterministic reseed hook for the GPU-port benches (demo respawn
+	// gates need reproducible draws; the default seed is wall-clock). Test-only.
+	void SeedRandEngine(uint64_t seed);
+
 	float WrapNormalizeFloat(float val, float minmax);
 
 	// Simulates aggressive UE3 rotator rounding when converting from a UE3 rotator to vector
