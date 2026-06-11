@@ -148,8 +148,11 @@ static void InitRsqrtEmulation() {
 GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	InitRsqrtEmulation();
 	// EPA penetration (collision phase GJK fallback) recurses deeply; the default
-	// 1KB device stack overflows (proven in cuda_math_test).
-	CudaCheck(cudaDeviceSetLimit(cudaLimitStackSize, 64 * 1024), "set stack size");
+	// 1KB device stack overflows (proven in cuda_math_test). 2026-06-11: the
+	// reserve is allocated for every resident thread (~74k on a 5070 = GBs of
+	// VRAM), capping trainer arena counts. 16KB fails ALL gates; 32KB passes
+	// the full suite and halves the reserve vs the old 64KB.
+	CudaCheck(cudaDeviceSetLimit(cudaLimitStackSize, 32 * 1024), "set stack size");
 	GpuBatch* b = new GpuBatch{};
 	b->numArenas = numArenas;
 	b->numCars = numCarsPerArena;
