@@ -6,6 +6,7 @@
 // equal-vertex threshold 0.0001f, MAX_CONVEX_CAST_ITERATIONS 32, epsilon 1e-4.
 
 #include "CudaMath.cuh"
+#include "GpuTypes.h"
 
 #ifdef __CUDACC__
 
@@ -370,11 +371,16 @@ struct CuSimplexSolver {
 #define CU_SHAPE_POINT 0   // btSphereShape(0) cast shape, margin 0
 #define CU_SHAPE_SPHERE 1  // ball
 #define CU_SHAPE_BOX 2     // car hitbox child
+// (CU_SHAPE_TRIANGLE 3 defined in CudaCollision.cuh)
+#define CU_SHAPE_HULL 4    // snowday puck (btConvexHullShape, 40 points)
 
 struct CuConvexShape {
 	int kind;
-	float sphereRadius;          // margin == radius for spheres (and 0 for point)
+	float sphereRadius;          // margin == radius for spheres (0 for point; hull:
+	                             // m_collisionMargin = CONVEX_DISTANCE_MARGIN)
 	CuVec3 boxHalfExtWithMargin; // getHalfExtentsWithoutMargin() + margin, host-extracted
+	const GpuVec3* hullPts;      // hull: m_unscaledPoints (host-extracted, BT units)
+	int hullN;
 };
 
 // btSphereShape::localGetSupportingVertex (btSphereShape.cpp:37): margin*normalize(dir),
@@ -397,9 +403,44 @@ __device__ __forceinline__ CuVec3 CuSupportBox(CuVec3 he, CuVec3 vec) {
 	};
 }
 
+// btConvexHullShape::localGetSupportingVertexWithoutMargin = btVector3::maxDot over
+// m_unscaledPoints. With 40 points the CPU takes the SSE _maxdot_large path; for finite
+// inputs it reduces to FIRST index of the maximum with dot = (x*dx + y*dy) + z*dz per
+// point (each op one float op) - scalar-equivalent, ported as such.
+__device__ __forceinline__ CuVec3 CuSupportHullNoMargin(
+	const GpuVec3* pts, int n, CuVec3 dir) {
+	float maxDot = -__int_as_float(0x7f800000); // -BT_INFINITY
+	int best = 0;
+	for (int i = 0; i < n; i++) {
+		float d = (pts[i].x * dir.x + pts[i].y * dir.y) + pts[i].z * dir.z;
+		if (d > maxDot) {
+			maxDot = d;
+			best = i;
+		}
+	}
+	return { pts[best].x, pts[best].y, pts[best].z };
+}
+
+// btConvexHullShape::localGetSupportingVertex: noMargin support + margin * normalized
+// dir ((-1,-1,-1) fallback for degenerate dir), guarded on margin != 0
+__device__ __forceinline__ CuVec3 CuSupportHull(
+	const GpuVec3* pts, int n, float margin, CuVec3 vec) {
+	CuVec3 supVertex = CuSupportHullNoMargin(pts, n, vec);
+	if (margin != 0.0f) {
+		CuVec3 vecnorm = vec;
+		if (CuLength2(vecnorm) < CU_SIMD_EPSILON * CU_SIMD_EPSILON)
+			vecnorm = { -1.0f, -1.0f, -1.0f };
+		vecnorm = CuNormalize3(vecnorm);
+		supVertex = supVertex + vecnorm * margin;
+	}
+	return supVertex;
+}
+
 __device__ __forceinline__ CuVec3 CuSupport(const CuConvexShape& s, CuVec3 dir) {
 	if (s.kind == CU_SHAPE_BOX)
 		return CuSupportBox(s.boxHalfExtWithMargin, dir);
+	if (s.kind == CU_SHAPE_HULL)
+		return CuSupportHull(s.hullPts, s.hullN, s.sphereRadius /*margin*/, dir);
 	return CuSupportSphere(s.sphereRadius, dir);
 }
 

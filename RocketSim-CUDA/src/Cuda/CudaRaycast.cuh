@@ -34,6 +34,9 @@ struct GpuWorldGeo {
 	// proven by a wheel ray crossing a triangle edge, heatseeker seed 42 tick 1402)
 	const GpuMeshBvh* bvhs;
 	const GpuBvhNode* bvhNodes;
+	// snowday puck hull points (null/0 in sphere-ball modes)
+	const GpuVec3* hullPoints;
+	int numHullPoints;
 };
 
 struct GpuRayHit {
@@ -368,6 +371,12 @@ __device__ __forceinline__ void CuRayTestWorld(
 			CuMat3 childBasis = CuIdentity3();
 			CuTransformCompose(GM(d.basis), GV(d.origin), childBasis, GV(d.childOffset),
 				shapeBasis, shapeOrigin);
+		} else if (d.kind == CU_SHAPE_HULL) {
+			// snowday puck: sphereRadius slot carries the hull collision margin
+			shape = { CU_SHAPE_HULL, d.sphereRadius, { 0, 0, 0 },
+				geo.hullPoints, geo.numHullPoints };
+			shapeBasis = GM(d.basis);
+			shapeOrigin = GV(d.origin);
 		} else {
 			shape = { CU_SHAPE_SPHERE, d.sphereRadius, { 0, 0, 0 } };
 			shapeBasis = GM(d.basis);

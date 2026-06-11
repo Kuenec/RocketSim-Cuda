@@ -82,6 +82,7 @@ struct GpuBatch {
 	// mesh BVHs + internal-edge data (uploaded once)
 	GpuMeshBvh* dMeshBvhs;
 	GpuBvhNode* dBvhNodes;
+	GpuVec3* dHullPoints;  // snowday puck (null otherwise)
 	GpuBvhSubtree* dBvhSubtrees;
 	GpuTriInfo* dTriInfos;
 	float* dMeshMargins;
@@ -183,6 +184,7 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dCarConsts);
 	cudaFree(b->dMeshBvhs);
 	cudaFree(b->dBvhNodes);
+	cudaFree(b->dHullPoints);
 	cudaFree(b->dBvhSubtrees);
 	cudaFree(b->dTriInfos);
 	cudaFree(b->dMeshMargins);
@@ -227,6 +229,16 @@ void UploadMeshBvhs(GpuBatch* b,
 	// the ray tests reach the BVHs through the world-geo descriptor
 	b->geo.bvhs = b->dMeshBvhs;
 	b->geo.bvhNodes = b->dBvhNodes;
+}
+
+// snowday puck hull points (uploaded once; geo carries the device pointer)
+void UploadBallHull(GpuBatch* b, const GpuVec3* points, int numPoints) {
+	cudaFree(b->dHullPoints);
+	CudaCheck(cudaMalloc(&b->dHullPoints, sizeof(GpuVec3) * numPoints), "alloc hull pts");
+	CudaCheck(cudaMemcpy(b->dHullPoints, points, sizeof(GpuVec3) * numPoints,
+		cudaMemcpyHostToDevice), "up hull pts");
+	b->geo.hullPoints = b->dHullPoints;
+	b->geo.numHullPoints = numPoints;
 }
 
 void UploadCollideData(GpuBatch* b, const GpuCollideConsts& consts,
@@ -791,9 +803,12 @@ __global__ void GpuStepArenasKernel(
 				// pad pre-ticks
 				for (int p = 0; p < numPads; p++)
 					CuPadPreTick(arenaPads[p], dt);
-				// Ball::_PreTickUpdate (heatseeker steering; no-op in soccar)
+				// Ball::_PreTickUpdate (heatseeker steering / snowday ground-stick
+				// reset; no-op in soccar)
 				if (ca.consts->gameMode == CU_GAMEMODE_HEATSEEKER)
 					CuBallPreTickHS(arenaBodies[0], ca.ballStates[arenaIdx], *ca.consts, dt);
+				else if (ca.consts->gameMode == CU_GAMEMODE_SNOWDAY)
+					ca.ballStates[arenaIdx].groundStickApplied = 0;
 				// stepSimulation head: applyGravity (active bodies)
 				for (int d = 0; d < bodiesPerArena; d++)
 					CuApplyGravity(arenaBodies[d], consts[d]);

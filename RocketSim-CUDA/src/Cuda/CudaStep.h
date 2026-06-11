@@ -41,6 +41,9 @@ void RunCarPreTickOnce(GpuBatch* batch, const GpuCarTickState& in,
 	const GpuGridParams& grid, float tickTime,
 	GpuCarTickState& out, GpuWheelScratchOut wheelsOut[4]);
 
+// Snowday puck hull points (m_unscaledPoints, BT units), uploaded once
+void UploadBallHull(GpuBatch* batch, const GpuVec3* points, int numPoints);
+
 // Mesh BVHs + triangle infos (internal-edge data), uploaded once. Arrays are shared
 // across meshes; per-mesh views via GpuMeshBvh (nodeStart/subtreeStart) and triInfo
 // indexed by (meshIdx triStart + triangleIndex).

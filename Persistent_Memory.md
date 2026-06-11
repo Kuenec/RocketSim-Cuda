@@ -891,8 +891,50 @@ verified in source 2026-06-10):**
       demoed cars (phase-1/2 captures missing during demo, phase-0 entry state is
       pre-respawn) - prints garbage diffs; fix only if needed for future demo
       debugging (state-blob bisection + device printf worked better anyway).
-   3. SNOWDAY (#15): puck cylinder shape (new GJK support + getAabb + narrowphase
-      paths), ground-stick, snowday callback branches.
+   3. SNOWDAY (#15, COMPLETE - all gates PASS bit-exact):
+      The puck is a btConvexHullShape (40 points: 20-pt circles at z = +-PUCK_HEIGHT/2,
+      radius = mutator ballRadius = PUCK_RADIUS 114.25; mass 50, friction 0.1,
+      restitution 0.3 via MutatorConfig). Device CU_SHAPE_HULL (=4) added everywhere:
+      - Support: btVector3::maxDot takes the SSE _maxdot_large path for 40 points;
+        for finite inputs it reduces to FIRST-index-of-max with
+        dot = (x*dx + y*dy) + z*dz - ported scalar (CuSupportHullNoMargin); with-margin
+        variant adds margin*normalize(dir) ((-1,-1,-1) degenerate fallback)
+        (CudaConvexCast.cuh CuSupportHull). Plugged into CuSupport (subsimplex ray
+        cast), CuSupportNoMargin (GJK/EPA), CuConvexPlaneCollide, and the
+        CuConvexVsMesh early-out (virtual localGetSupportingVertex semantics).
+      - AABB: btPolyhedralConvexAabbCachingShape::getAabb = btTransformAabb over the
+        cached local aabb (which ALREADY contains one margin from recalcLocalAabb -
+        margin counted twice, bullet quirk, replicated). m_localAabb is protected;
+        the bench recomputes it exactly via the public
+        batchedUnitVectorGetSupportingVertexWithoutMargin 6-direction form.
+        CuHullAabbAt (broadphase/car-ball gates) + CuShapeAabb hull branch (mesh-walk
+        bounds + GJK fix-normal).
+      - Narrowphase dispatch: ball-vs-mesh takes the convexConvex-GJK-per-triangle
+        path (same as the car box, NOT sphere-triangle); ball-vs-plane via
+        CuConvexPlaneCollide with hull support; car-vs-ball GJK box-vs-hull with
+        maximumDistanceSquared margin = hull collision margin (0.04), NOT radius.
+      - Game logic: Ball::_PreTickUpdate snowday resets _groundStickApplied (GAME_PRE
+        hook); _OnWorldCollision applies ONE applyCentralForce(-normal *
+        PUCK_GROUND_STICK_FORCE=70) per tick (callback ball-world branch);
+        groundStickApplied carried in GpuBallGameState (not hashed, not serialized);
+        isSpecial already gated on != SNOWDAY.
+      - Hull points uploaded once via new UploadBallHull (GpuWorldGeo.hullPoints);
+        GpuDynBody kind 4 reuses the sphereRadius slot as the margin.
+      - BENCH QUIRK FOUND: the Arena CTOR leaves the ball at BallState defaults
+        (z=93.15, vel=0) -> in snowday it sleeps instantly and never falls; the
+        vel.z=FLT_EPSILON "don't freeze" init lives in ResetToRandomKickoff (never
+        called by the bench). SetupArena now applies that init for snowday -
+        without it the first "PASS" was vacuous (puck frozen all run; caught by
+        decoding the state blob: ball pos never left 93.15).
+      SNOWDAY GATES (work-bench CPU = reference, GPU PASS):
+        --game-mode snowday --ticks 20000 --arenas 1 --cars 2 --seed 1337
+          -> 6720894011815016031
+        --game-mode snowday --ticks 1500 --arenas 32 --cars 4 --seed 4242
+          -> 16993491767979963113
+        --game-mode snowday --ticks 2000 --arenas 8 --cars 6 --seed 99
+          --demo-mode on-contact -> 3415898148067774285  (puck + demolitions)
+      Ray-fuzz 200k PASS with the hull ball (--game-mode snowday) AND soccar 200k
+      re-PASS. All 12 prior gates (soccar/heatseeker/demo, CPU+GPU) re-PASS.
    4. HOOPS (#16): hoops meshes (verify obtainable first!), arena setup, launch
       delay, hoops _OnHit zScale branch.
    5. DROPSHOT (#17): tile system (per-tile damage state changes collision ->

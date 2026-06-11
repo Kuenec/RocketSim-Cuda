@@ -28,6 +28,7 @@
 #include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btTriangleInfoMap.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/BroadphaseCollision/btRSBroadphase.h"
 #include "../libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
+#include "../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btConvexHullShape.h"
 
 #ifdef RS_CUDA
 #include "Cuda/CudaStep.h"
@@ -296,6 +297,13 @@ static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>&
 		bs.pos = RLConst::Heatseeker::BALL_START_POS * scale;
 		bs.vel = RLConst::Heatseeker::BALL_START_VEL * scale;
 		bs.hsInfo.yTargetDir = ySign;
+		arena->ball->SetState(bs);
+	} else if (args.gameMode == GameMode::SNOWDAY) {
+		// ResetToRandomKickoff's "don't freeze" puck init: the ctor leaves the ball
+		// asleep at the soccar rest height with zero velocity, where it never falls
+		// to puck rest height; the epsilon z-vel keeps it awake (deterministic)
+		BallState bs = BallState();
+		bs.vel.z = FLT_EPSILON;
 		arena->ball->SetState(bs);
 	}
 	// Soccar: ball stays at its deterministic default rest state (center, BALL_REST_Z)
@@ -760,8 +768,31 @@ static void ExtractCollideData(Arena* arena, const std::vector<CarSlot>& slots,
 	cc.carLocalAabbMin = ToGpuB(comp.getLocalAabbMin());
 	cc.carLocalAabbMax = ToGpuB(comp.getLocalAabbMax());
 	cc.carCompoundMargin = comp.getMargin();
-	auto* ballShape = (btSphereShape*)arena->ball->_rigidBody.getCollisionShape();
-	cc.ballRadius = ballShape->getRadius();
+	btCollisionShape* ballShape = arena->ball->_rigidBody.getCollisionShape();
+	if (arena->ball->IsSphere()) {
+		cc.ballRadius = ((btSphereShape*)ballShape)->getRadius();
+	} else {
+		// snowday puck: btConvexHullShape (points uploaded via UploadBallHull).
+		// m_localAabb is protected; recompute it exactly as recalcLocalAabb does
+		// (6-direction batched support extrema +- margin, margin included ONCE here
+		// and added AGAIN by getAabb - bullet quirk, replicated on device)
+		auto* hull = (btConvexHullShape*)ballShape;
+		cc.ballIsHull = 1;
+		cc.ballHullMargin = hull->getMargin();
+		static const btVector3 dirs[6] = {
+			btVector3(1, 0, 0), btVector3(0, 1, 0), btVector3(0, 0, 1),
+			btVector3(-1, 0, 0), btVector3(0, -1, 0), btVector3(0, 0, -1) };
+		btVector3 sup[6] = {};
+		hull->batchedUnitVectorGetSupportingVertexWithoutMargin(dirs, sup, 6);
+		btVector3 lmn, lmx;
+		for (int i = 0; i < 3; i++) {
+			lmx[i] = sup[i][i] + hull->getMargin();
+			lmn[i] = sup[i + 3][i] - hull->getMargin();
+		}
+		cc.ballHullLocalAabbMin = ToGpuB(lmn);
+		cc.ballHullLocalAabbMax = ToGpuB(lmx);
+	}
+	cc.puckGroundStickForce = Snowday::PUCK_GROUND_STICK_FORCE;
 	const btBoxShape& box = car->_childHitboxShape;
 	cc.carBoxHalfExtNoMargin = ToGpuB(box.getHalfExtentsWithoutMargin());
 	cc.carBoxMargin = box.getMargin();
@@ -851,8 +882,18 @@ static int RunRayFuzz(const Args& args, int numRays) {
 	{
 		rscuda::GpuDynBody d = {};
 		btRigidBody& rb = arena->ball->_rigidBody;
-		d.kind = 1; // sphere
-		d.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		if (arena->ball->IsSphere()) {
+			d.kind = 1; // sphere
+			d.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		} else {
+			d.kind = 4; // hull (snowday puck); sphereRadius slot = margin
+			d.sphereRadius = rb.getCollisionShape()->getMargin();
+			auto* hull = (btConvexHullShape*)arena->ball->_collisionShape;
+			std::vector<rscuda::GpuVec3> pts(hull->getNumPoints());
+			for (int i = 0; i < hull->getNumPoints(); i++)
+				pts[i] = ToGpuB(hull->getUnscaledPoints()[i]);
+			rscuda::UploadBallHull(batch, pts.data(), (int)pts.size());
+		}
 		d.basis = ToGpuB(rb.getWorldTransform().getBasis());
 		d.origin = ToGpuB(rb.getWorldTransform().getOrigin());
 		d.aabbMin = ToGpuB(rb.getBroadphaseProxy()->m_aabbMin);
@@ -1755,8 +1796,13 @@ static void ExtractTailData(Arena* arena, std::vector<CarSlot>& slots,
 	{ // dyn shape/filter templates (transforms filled per tick on device)
 		rscuda::GpuDynBody t = {};
 		btRigidBody& rb = arena->ball->_rigidBody;
-		t.kind = 1;
-		t.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		if (arena->ball->IsSphere()) {
+			t.kind = 1;
+			t.sphereRadius = ((btSphereShape*)rb.getCollisionShape())->getRadius();
+		} else {
+			t.kind = 4; // CU_SHAPE_HULL; sphereRadius slot = collision margin
+			t.sphereRadius = rb.getCollisionShape()->getMargin();
+		}
 		t.group = rb.getBroadphaseProxy()->m_collisionFilterGroup;
 		t.mask = rb.getBroadphaseProxy()->m_collisionFilterMask;
 		t.invMass = rb.getInvMass();
@@ -1845,6 +1891,14 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		std::vector<rscuda::GpuDynBody> dynTemplates;
 		ExtractTailData(arenas[0], slotsPerArena[0], tc, padConfigs, dynTemplates);
 		rscuda::UploadTailData(batch, tc, padConfigs.data(), numPads, dynTemplates.data());
+
+		if (!arenas[0]->ball->IsSphere()) { // snowday puck hull points
+			auto* hull = (btConvexHullShape*)arenas[0]->ball->_collisionShape;
+			std::vector<rscuda::GpuVec3> pts(hull->getNumPoints());
+			for (int i = 0; i < hull->getNumPoints(); i++)
+				pts[i] = ToGpuB(hull->getUnscaledPoints()[i]);
+			rscuda::UploadBallHull(batch, pts.data(), (int)pts.size());
+		}
 	}
 	// per-arena: dyn proxies, ball game state, car iteration order (_cars set order)
 	for (int a = 0; a < args.arenas; a++) {
@@ -1862,6 +1916,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		bs.hsYTargetDir = arenas[a]->ball->_internalState.hsInfo.yTargetDir;
 		bs.hsCurTargetSpeed = arenas[a]->ball->_internalState.hsInfo.curTargetSpeed;
 		bs.hsTimeSinceHit = arenas[a]->ball->_internalState.hsInfo.timeSinceHit;
+		bs.groundStickApplied = arenas[a]->ball->_groundStickApplied;
 		rscuda::UploadBallState(batch, a, bs);
 		std::vector<int> order;
 		for (Car* car : arenas[a]->_cars)
@@ -1946,6 +2001,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		arenas[a]->ball->_internalState.hsInfo.yTargetDir = bs.hsYTargetDir;
 		arenas[a]->ball->_internalState.hsInfo.curTargetSpeed = bs.hsCurTargetSpeed;
 		arenas[a]->ball->_internalState.hsInfo.timeSinceHit = bs.hsTimeSinceHit;
+		arenas[a]->ball->_groundStickApplied = bs.groundStickApplied;
 		arenas[a]->tickCount += args.ticks;
 	}
 

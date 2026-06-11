@@ -442,6 +442,8 @@ __device__ __forceinline__ bool CuConvexPlaneCollide(
 		// localGetSupportingVertex = fsel on (halfExtentsWithoutMargin + margin);
 		// boxHalfExtWithMargin already carries the sum
 		vtx = CuSupportBox(convex.boxHalfExtWithMargin, supportDir);
+	} else if (convex.kind == CU_SHAPE_HULL) {
+		vtx = CuSupportHull(convex.hullPts, convex.hullN, convex.sphereRadius, supportDir);
 	} else {
 		vtx = CuSupportSphere(convex.sphereRadius, supportDir);
 	}
@@ -466,10 +468,13 @@ __device__ __forceinline__ bool CuConvexPlaneCollide(
 #define CU_REL_ERROR2 1.0e-6f
 
 struct CuGjkShape {
-	int kind;                 // CU_SHAPE_SPHERE / CU_SHAPE_BOX / 3 = triangle
+	int kind;                 // CU_SHAPE_SPHERE / CU_SHAPE_BOX / 3 = triangle / 4 = hull
 	CuVec3 boxHalfExtNoMargin; // implicitShapeDimensions
 	CuVec3 triV[3];
 	float margin;             // getMarginNonVirtual
+	const GpuVec3* hullPts;   // hull: m_unscaledPoints
+	int hullN;
+	CuVec3 hullLocalAabbMin, hullLocalAabbMax; // cached local aabb (recalcLocalAabb)
 };
 #define CU_SHAPE_TRIANGLE 3
 
@@ -487,6 +492,8 @@ __device__ __forceinline__ CuVec3 CuSupportNoMargin(const CuGjkShape& s, CuVec3 
 		float d2 = CuDot3(dir, s.triV[2]);
 		return s.triV[CuMaxAxis3(d0, d1, d2)];
 	}
+	if (s.kind == CU_SHAPE_HULL) // convexHullSupport (maxDot, first index wins)
+		return CuSupportHullNoMargin(s.hullPts, s.hullN, dir);
 	return { 0, 0, 0 }; // sphere
 }
 
@@ -515,6 +522,19 @@ __device__ __forceinline__ void CuShapeAabb(const CuGjkShape& s,
 		CuVec3 extent = { m, m, m };
 		aabbMin = origin - extent;
 		aabbMax = origin + extent;
+	} else if (s.kind == CU_SHAPE_HULL) {
+		// btPolyhedralConvexAabbCachingShape::getAabb = btTransformAabb(cached local
+		// aabb, margin, t): halfExt = 0.5*(max-min) + margin, center = 0.5*(max+min)
+		CuVec3 halfExt = (s.hullLocalAabbMax - s.hullLocalAabbMin) * 0.5f;
+		halfExt = { halfExt.x + s.margin, halfExt.y + s.margin, halfExt.z + s.margin };
+		CuVec3 localCenter = (s.hullLocalAabbMax + s.hullLocalAabbMin) * 0.5f;
+		CuVec3 center = CuTransformPoint(basis, origin, localCenter);
+		CuVec3 r0 = { fabsf(basis.r[0].x), fabsf(basis.r[0].y), fabsf(basis.r[0].z) };
+		CuVec3 r1 = { fabsf(basis.r[1].x), fabsf(basis.r[1].y), fabsf(basis.r[1].z) };
+		CuVec3 r2 = { fabsf(basis.r[2].x), fabsf(basis.r[2].y), fabsf(basis.r[2].z) };
+		CuVec3 extent = { CuDot3(halfExt, r0), CuDot3(halfExt, r1), CuDot3(halfExt, r2) };
+		aabbMin = center - extent;
+		aabbMax = center + extent;
 	} else {
 		// triangle: support in +-axis dirs WITH margin (getAabbSlow form)
 		CuVec3 mn, mx;
@@ -2139,6 +2159,8 @@ __device__ inline void CuConvexVsMesh(
 						convex.boxHalfExtNoMargin.y + convex.margin,
 						convex.boxHalfExtNoMargin.z + convex.margin };
 					localPt = CuSupportBox(heWithMargin, dirLocal);
+				} else if (convex.kind == CU_SHAPE_HULL) {
+					localPt = CuSupportHull(convex.hullPts, convex.hullN, convex.margin, dirLocal);
 				} else {
 					localPt = CuSupportSphere(convex.margin, dirLocal);
 				}

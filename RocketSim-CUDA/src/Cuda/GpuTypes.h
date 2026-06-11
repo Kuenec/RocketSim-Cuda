@@ -214,8 +214,8 @@ struct GpuCarConsts {
 // its current world transform and filters; production kernels build these from
 // GpuBodyState + shape consts, the ray-fuzz tool fills them host-side.
 struct GpuDynBody {
-	int kind;                 // 1 = sphere, 2 = box-compound (CU_SHAPE_* values)
-	float sphereRadius;
+	int kind;                 // 1 = sphere, 2 = box-compound, 4 = hull (CU_SHAPE_*)
+	float sphereRadius;       // sphere radius; hull: collision margin
 	GpuVec3 boxHalfExtWithMargin;
 	GpuVec3 childOffset;      // compound child transform origin (identity rotation)
 	GpuMat3 basis;
@@ -354,6 +354,8 @@ struct GpuBallGameState {
 	float hsYTargetDir;            // 0 = no net
 	float hsCurTargetSpeed;        // UU
 	float hsTimeSinceHit;
+	// snowday: Ball::_groundStickApplied (reset each pre-tick, set on first world hit)
+	uint8_t groundStickApplied;
 };
 
 // Boost pad constants (pad order = arena _boostPads order, identical all arenas)
@@ -390,6 +392,11 @@ struct GpuCollideConsts {
 	GpuVec3 carLocalAabbMin, carLocalAabbMax;
 	float carCompoundMargin;
 	float ballRadius;
+	// snowday puck (btConvexHullShape ball); points live in GpuWorldGeo
+	int ballIsHull;
+	float ballHullMargin;              // m_collisionMargin (CONVEX_DISTANCE_MARGIN)
+	GpuVec3 ballHullLocalAabbMin, ballHullLocalAabbMax; // cached local aabb
+	float puckGroundStickForce;        // Snowday::PUCK_GROUND_STICK_FORCE
 	GpuVec3 carBoxHalfExtNoMargin;
 	float carBoxMargin;
 	GpuVec3 carChildOffset;            // compound child transform origin (basis = I)

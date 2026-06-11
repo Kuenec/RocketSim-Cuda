@@ -138,13 +138,35 @@ __device__ __forceinline__ void CuCompoundAabbAt(const GpuCollideConsts& cc,
 	mx = c + extent;
 }
 
-// Body shape aabb at an arbitrary transform (slot 0 = ball sphere, others = compound)
+// btPolyhedralConvexAabbCachingShape::getAabb (snowday puck hull): btTransformAabb
+// over the cached local aabb + collision margin
+__device__ __forceinline__ void CuHullAabbAt(const GpuCollideConsts& cc,
+	const CuMat3& basis, CuVec3 origin, CuVec3& mn, CuVec3& mx) {
+	CuVec3 lmin = GV(cc.ballHullLocalAabbMin), lmax = GV(cc.ballHullLocalAabbMax);
+	CuVec3 halfExt = (lmax - lmin) * 0.5f;
+	halfExt = { halfExt.x + cc.ballHullMargin, halfExt.y + cc.ballHullMargin,
+		halfExt.z + cc.ballHullMargin };
+	CuVec3 center = (lmax + lmin) * 0.5f;
+	CuVec3 c = CuTransformPoint(basis, origin, center);
+	CuVec3 r0 = { fabsf(basis.r[0].x), fabsf(basis.r[0].y), fabsf(basis.r[0].z) };
+	CuVec3 r1 = { fabsf(basis.r[1].x), fabsf(basis.r[1].y), fabsf(basis.r[1].z) };
+	CuVec3 r2 = { fabsf(basis.r[2].x), fabsf(basis.r[2].y), fabsf(basis.r[2].z) };
+	CuVec3 extent = { CuDot3(halfExt, r0), CuDot3(halfExt, r1), CuDot3(halfExt, r2) };
+	mn = c - extent;
+	mx = c + extent;
+}
+
+// Body shape aabb at an arbitrary transform (slot 0 = ball, others = compound)
 __device__ __forceinline__ void CuBodyAabbAt(const CuCollideIn& in, int slot,
 	const CuMat3& basis, CuVec3 origin, CuVec3& mn, CuVec3& mx) {
-	if (slot == 0)
-		CuSphereAabbAt(origin, in.cc.ballRadius, mn, mx);
-	else
+	if (slot == 0) {
+		if (in.cc.ballIsHull)
+			CuHullAabbAt(in.cc, basis, origin, mn, mx);
+		else
+			CuSphereAabbAt(origin, in.cc.ballRadius, mn, mx);
+	} else {
 		CuCompoundAabbAt(in.cc, basis, origin, mn, mx);
+	}
 }
 
 // btBoxShape::getAabb = btTransformAabb(halfExtentsWithoutMargin, margin, t)
@@ -520,8 +542,17 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 					bs.velocityImpulseCache = { cache.x, cache.y, cache.z };
 				}
 			}
+		} else if (in.cc.gameMode == CU_GAMEMODE_SNOWDAY) {
+			// Ball::_OnWorldCollision snowday: one ground-stick force per tick
+			// (applyCentralForce(-normal * PUCK_GROUND_STICK_FORCE) on the puck body)
+			if (!in.ball->groundStickApplied) {
+				GpuBodyState& ballB = in.bodies[0];
+				CuVec3 f = GV(ballB.totalForce) +
+					CuNeg(cp.normalWorldOnB) * in.cc.puckGroundStickForce;
+				ballB.totalForce = { f.x, f.y, f.z };
+				in.ball->groundStickApplied = 1;
+			}
 		}
-		// (snowday ground-stick handled with the puck port)
 		if (in.cc.gameMode != CU_GAMEMODE_SNOWDAY)
 			cp.isSpecial = 1;
 	}
@@ -584,15 +615,25 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 					continue;
 				CuManifold& m = ml.arr[mIdx];
 				if (so.kind == 0) {
-					// sphere vs mesh (refresh happens inside CuConvexVsMesh)
-					CuGjkShape sphere;
-					sphere.kind = CU_SHAPE_SPHERE;
-					sphere.margin = in.cc.ballRadius;
+					// ball vs mesh (refresh happens inside CuConvexVsMesh): sphere ->
+					// SphereTriangleDetector path; snowday hull -> convexConvex GJK path
+					CuGjkShape ballShape = {};
+					if (in.cc.ballIsHull) {
+						ballShape.kind = CU_SHAPE_HULL;
+						ballShape.margin = in.cc.ballHullMargin;
+						ballShape.hullPts = in.geo.hullPoints;
+						ballShape.hullN = in.geo.numHullPoints;
+						ballShape.hullLocalAabbMin = GV(in.cc.ballHullLocalAabbMin);
+						ballShape.hullLocalAabbMax = GV(in.cc.ballHullLocalAabbMax);
+					} else {
+						ballShape.kind = CU_SHAPE_SPHERE;
+						ballShape.margin = in.cc.ballRadius;
+					}
 					const GpuMeshBvh& mb = in.bvhs[so.shapeIdx];
 					CuBvhView bvh = { in.bvhNodes + mb.nodeStart, in.bvhSubtrees + mb.subtreeStart,
 						mb.numSubtrees, GV(mb.bvhAabbMin), GV(mb.bvhAabbMax), GV(mb.bvhQuantization) };
 					int triStart = in.geo.meshes[so.shapeIdx].triStart;
-					CuConvexVsMesh(sphere, dynBasis, dynPos, in.geo, so.shapeIdx, bvh,
+					CuConvexVsMesh(ballShape, dynBasis, dynPos, in.geo, so.shapeIdx, bvh,
 						in.meshMargins[so.shapeIdx], ballInfo, staticInfo, m, breaking,
 						-1, -1,
 						[&](int idx, int triIdx) {
@@ -603,12 +644,15 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 								in.triInfos[triStart + triIdx]);
 						});
 				} else {
-					// sphere vs plane (result order: (plane, ball) -> manifold swapped)
+					// ball vs plane (result order: (plane, ball) -> manifold swapped)
 					const GpuPlane& pl = in.geo.planes[so.shapeIdx];
-					CuConvexShape sphere = { CU_SHAPE_SPHERE, in.cc.ballRadius, { 0, 0, 0 } };
+					CuConvexShape ballCvx = in.cc.ballIsHull
+						? CuConvexShape{ CU_SHAPE_HULL, in.cc.ballHullMargin, { 0, 0, 0 },
+							in.geo.hullPoints, in.geo.numHullPoints }
+						: CuConvexShape{ CU_SHAPE_SPHERE, in.cc.ballRadius, { 0, 0, 0 } };
 					CuVec3 nrm, pt;
 					float dist;
-					if (CuConvexPlaneCollide(sphere, dynBasis, dynPos, GV(pl.normal),
+					if (CuConvexPlaneCollide(ballCvx, dynBasis, dynPos, GV(pl.normal),
 							pl.planeConst, ident, GV(pl.origin), breaking, nrm, pt, dist)) {
 						int idx = CuAddContactPoint(m, staticInfo, ballInfo, true,
 							nrm, pt, dist, -1, -1, -1, -1);
@@ -712,7 +756,10 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 			CuVec3 cmn, cmx, bmn, bmx;
 			CuBoxAabbAt(GV(in.cc.carBoxHalfExtNoMargin), in.cc.carBoxMargin,
 				childBasis, childOrigin, cmn, cmx);
-			CuSphereAabbAt(ballPos, in.cc.ballRadius, bmn, bmx);
+			if (in.cc.ballIsHull)
+				CuHullAabbAt(in.cc, ballBasis, ballPos, bmn, bmx);
+			else
+				CuSphereAabbAt(ballPos, in.cc.ballRadius, bmn, bmx);
 			if (!CuTestAabb2(cmn, cmx, bmn, bmx))
 				continue; // no manifold was ever created (lazy)
 
@@ -723,16 +770,27 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 				continue;
 			CuManifold& m = ml.arr[mIdx];
 
-			CuGjkShape box;
+			CuGjkShape box = {};
 			box.kind = CU_SHAPE_BOX;
 			box.boxHalfExtNoMargin = GV(in.cc.carBoxHalfExtNoMargin);
 			box.margin = in.cc.carBoxMargin;
-			CuGjkShape sphere;
-			sphere.kind = CU_SHAPE_SPHERE;
-			sphere.margin = in.cc.ballRadius;
-			float maxd = in.cc.carBoxMargin + in.cc.ballRadius + breaking;
+			CuGjkShape ballShape = {};
+			if (in.cc.ballIsHull) {
+				ballShape.kind = CU_SHAPE_HULL;
+				ballShape.margin = in.cc.ballHullMargin;
+				ballShape.hullPts = in.geo.hullPoints;
+				ballShape.hullN = in.geo.numHullPoints;
+				ballShape.hullLocalAabbMin = GV(in.cc.ballHullLocalAabbMin);
+				ballShape.hullLocalAabbMax = GV(in.cc.ballHullLocalAabbMax);
+			} else {
+				ballShape.kind = CU_SHAPE_SPHERE;
+				ballShape.margin = in.cc.ballRadius;
+			}
+			// maximumDistanceSquared = marginA + marginB + breaking (margins via
+			// getMarginNonVirtual: sphere = radius, hull = collision margin)
+			float maxd = in.cc.carBoxMargin + ballShape.margin + breaking;
 			CuGjkResult r;
-			CuGjkClosestPoints(box, childBasis, childOrigin, sphere, ballBasis, ballPos,
+			CuGjkClosestPoints(box, childBasis, childOrigin, ballShape, ballBasis, ballPos,
 				maxd * maxd, true, r);
 			CuContactBodyInfo ballInfo = { ballBasis, ballPos,
 				in.cc.ballFriction, in.cc.ballRestitution, false, CU_USERIDX_BALL };
