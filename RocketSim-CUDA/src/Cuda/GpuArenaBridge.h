@@ -34,8 +34,26 @@ public:
 	void Step(int numTicks);
 
 	// Batched download + write results back into the CPU arenas (bodies, car
-	// states incl. wheels and rotMat, ball, pads, tickCount advance)
+	// states incl. wheels and rotMat, ball, pads, tickCount advance).
+	// Equivalent to Download() + WritebackArena(all) + FinishWriteback().
 	void Writeback();
+
+	// Split form, so callers can scatter arenas across worker threads:
+	// Download() once (single-threaded), then WritebackArena(a) for each arena
+	// (distinct arenas safe from different threads), then FinishWriteback().
+	void Download();
+	void WritebackArena(int a);
+	void FinishWriteback();
+
+	// 2026-06-11 GPU-direct GameState path: compose public states straight from
+	// the download scratch (no Arena round-trip; mirrors WritebackCar/Ball +
+	// GetState exactly), plus a minimal Arena sync for the consumers that still
+	// read the Arena each step (ball body/state, car ballHitInfo, tickCount).
+	void FillCarState(int a, int slot, RocketSim::CarState& out) const;
+	void FillBallState(int a, RocketSim::BallState& out) const;
+	void WritebackArenaLite(int a);
+	const GpuPadState* PadsScratch() const { return padsScratch.data(); }
+	int NumPads() const { return numPads; }
 
 	// Car game-state snapshots from the last two Writebacks, for deriving bump/
 	// demo events: index = arenaIdx * NumCars() + slot

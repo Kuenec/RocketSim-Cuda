@@ -142,20 +142,12 @@ static void SnapshotCar(Car* car, rscuda::GpuBodyState& body, rscuda::GpuCarGame
 	}
 }
 
-static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscuda::GpuCarGameState& g) {
-	WritebackBody(car->_rigidBody, body);
-	CarState& cs = car->_internalState;
+// CarState game fields from the device car state (shared by the full Arena
+// writeback and the GPU-direct GameState fill - one copy, zero drift)
+static void FillCarStateFields(CarState& cs, const rscuda::GpuCarGameState& g) {
 	// CarState::rotMat is the device-carried post-tick cache, NOT the live basis -
 	// they differ for a car that is demoed right now (post-tick skips the refresh)
 	cs.rotMat = (RotMat)FromGpuB(g.rotMat);
-	{ // mirror noContactResponse back into the body's collision flags
-		int flags = car->_rigidBody.getCollisionFlags();
-		if (g.noContactResponse)
-			flags |= btCollisionObject::CF_NO_CONTACT_RESPONSE;
-		else
-			flags &= ~btCollisionObject::CF_NO_CONTACT_RESPONSE;
-		car->_rigidBody.setCollisionFlags(flags);
-	}
 	cs.isOnGround = g.isOnGround;
 	for (int w = 0; w < 4; w++) cs.wheelsWithContact[w] = g.wheelsWithContact[w];
 	cs.hasJumped = g.hasJumped; cs.hasDoubleJumped = g.hasDoubleJumped; cs.hasFlipped = g.hasFlipped;
@@ -182,6 +174,20 @@ static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscud
 	cs.ballHitInfo.tickCountWhenExtraImpulseApplied = g.ballHitInfo.tickCountWhenExtraImpulseApplied;
 	cs.lastControls = FromGpu(g.lastControls);
 	cs.tickCountSinceUpdate = g.tickCountSinceUpdate;
+}
+
+static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscuda::GpuCarGameState& g) {
+	WritebackBody(car->_rigidBody, body);
+	CarState& cs = car->_internalState;
+	FillCarStateFields(cs, g);
+	{ // mirror noContactResponse back into the body's collision flags
+		int flags = car->_rigidBody.getCollisionFlags();
+		if (g.noContactResponse)
+			flags |= btCollisionObject::CF_NO_CONTACT_RESPONSE;
+		else
+			flags &= ~btCollisionObject::CF_NO_CONTACT_RESPONSE;
+		car->_rigidBody.setCollisionFlags(flags);
+	}
 	car->_velocityImpulseCache = FromGpu(g.velocityImpulseCache);
 	for (int w = 0; w < 4; w++) {
 		btWheelInfoRL& wi = car->_bulletVehicle.m_wheelInfo[w];
@@ -928,12 +934,84 @@ void GpuArenaBatch::Step(int numTicks) {
 	pendingTicks += numTicks;
 }
 
-void GpuArenaBatch::Writeback() {
+// BallState game fields from the device ball state (shared by the full Arena
+// writeback and the GPU-direct GameState fill)
+static void FillBallStateFields(BallState& st, const rscuda::GpuBallGameState& bs) {
+	st.tickCountSinceUpdate = bs.tickCountSinceUpdate;
+	st.hsInfo.yTargetDir = bs.hsYTargetDir;
+	st.hsInfo.curTargetSpeed = bs.hsCurTargetSpeed;
+	st.hsInfo.timeSinceHit = bs.hsTimeSinceHit;
+	auto& dsi = st.dsInfo;
+	dsi.chargeLevel = bs.dsChargeLevel;
+	dsi.accumulatedHitForce = bs.dsAccumulatedHitForce;
+	dsi.yTargetDir = bs.dsYTargetDir;
+	dsi.hasDamaged = bs.dsHasDamaged;
+	if (bs.dsHasDamaged)
+		dsi.lastDamageTick = bs.dsLastDamageTick;
+}
+
+// 2026-06-11 GPU-direct GameState path: compose the public states straight from
+// the download scratch, mirroring WritebackCar/WritebackArena + Car/Ball
+// GetState exactly (same shared fillers, same FromGpuB * BT_TO_UU derivations).
+void GpuArenaBatch::FillCarState(int a, int slot, RocketSim::CarState& out) const {
+	const GpuBodyState& b = bodiesScratch[(size_t)a * (1 + numCars) + 1 + slot];
+	const GpuCarGameState& g = curCars[(size_t)a * numCars + slot];
+	FillCarStateFields(out, g);
+	out.pos = FromGpuB(b.pos) * BT_TO_UU;
+	out.vel = FromGpuB(b.linVel) * BT_TO_UU;
+	out.angVel = FromGpuB(b.angVel);
+}
+
+void GpuArenaBatch::FillBallState(int a, RocketSim::BallState& out) const {
+	const GpuBodyState& b = bodiesScratch[(size_t)a * (1 + numCars)];
+	FillBallStateFields(out, ballsScratch[a]);
+	out.pos = FromGpuB(b.pos) * BT_TO_UU;
+	out.rotMat = (RotMat)FromGpuB(b.basis);
+	out.vel = FromGpuB(b.linVel) * BT_TO_UU;
+	out.angVel = FromGpuB(b.angVel);
+}
+
+// Minimal per-step Arena sync for consumers that still read the Arena in the
+// GPU-direct GameState mode: the ball rigid body + ball internal state (for
+// IsBallScored / IsBallProbablyGoingIn / event tracker), each car's ballHitInfo
+// (GetShooterPasser), and the tick counter. Everything else stays on the GPU.
+void GpuArenaBatch::WritebackArenaLite(int a) {
+	Arena* arena = arenas[a];
+	const GpuBodyState* bodies = bodiesScratch.data() + (size_t)a * (1 + numCars);
+	const GpuCarGameState* cars = curCars.data() + (size_t)a * numCars;
+
+	WritebackBody(arena->ball->_rigidBody, bodies[0]);
+	Ball* ball = arena->ball;
+	const GpuBallGameState& bs = ballsScratch[a];
+	ball->_velocityImpulseCache = FromGpu(bs.velocityImpulseCache);
+	ball->_groundStickApplied = bs.groundStickApplied;
+	FillBallStateFields(ball->_internalState, bs);
+
+	for (int c = 0; c < numCars; c++) {
+		CarState& cs = carLists[a][c]->_internalState;
+		const auto& g = cars[c];
+		cs.ballHitInfo.isValid = g.ballHitInfo.isValid;
+		cs.ballHitInfo.relativePosOnBall = FromGpu(g.ballHitInfo.relativePosOnBall);
+		cs.ballHitInfo.ballPos = FromGpu(g.ballHitInfo.ballPos);
+		cs.ballHitInfo.extraHitVel = FromGpu(g.ballHitInfo.extraHitVel);
+		cs.ballHitInfo.tickCountWhenHit = g.ballHitInfo.tickCountWhenHit;
+		cs.ballHitInfo.tickCountWhenExtraImpulseApplied = g.ballHitInfo.tickCountWhenExtraImpulseApplied;
+	}
+
+	arena->tickCount += pendingTicks;
+}
+
+void GpuArenaBatch::Download() {
 	std::swap(prevCars, curCars);
 	DownloadAllArenaStates(batch, bodiesScratch.data(), curCars.data(), padsScratch.data());
 	DownloadAllBallStates(batch, ballsScratch.data());
+}
 
-	for (int a = 0; a < (int)arenas.size(); a++) {
+// Scatters one arena's downloaded state into its CPU objects. Touches only
+// arena `a`'s data, so distinct arenas may be written back from different
+// threads between Download() and FinishWriteback().
+void GpuArenaBatch::WritebackArena(int a) {
+	{
 		Arena* arena = arenas[a];
 		const GpuBodyState* bodies = bodiesScratch.data() + (size_t)a * (1 + numCars);
 		const GpuCarGameState* cars = curCars.data() + (size_t)a * numCars;
@@ -956,18 +1034,8 @@ void GpuArenaBatch::Writeback() {
 		Ball* ball = arena->ball;
 		const GpuBallGameState& bs = ballsScratch[a];
 		ball->_velocityImpulseCache = FromGpu(bs.velocityImpulseCache);
-		ball->_internalState.tickCountSinceUpdate = bs.tickCountSinceUpdate;
-		ball->_internalState.hsInfo.yTargetDir = bs.hsYTargetDir;
-		ball->_internalState.hsInfo.curTargetSpeed = bs.hsCurTargetSpeed;
-		ball->_internalState.hsInfo.timeSinceHit = bs.hsTimeSinceHit;
 		ball->_groundStickApplied = bs.groundStickApplied;
-		auto& dsi = ball->_internalState.dsInfo;
-		dsi.chargeLevel = bs.dsChargeLevel;
-		dsi.accumulatedHitForce = bs.dsAccumulatedHitForce;
-		dsi.yTargetDir = bs.dsYTargetDir;
-		dsi.hasDamaged = bs.dsHasDamaged;
-		if (bs.dsHasDamaged)
-			dsi.lastDamageTick = bs.dsLastDamageTick;
+		FillBallStateFields(ball->_internalState, bs);
 
 		if (arena->gameMode == GameMode::DROPSHOT) {
 			constexpr int NT = RLConst::Dropshot::TEAM_AMOUNT * RLConst::Dropshot::NUM_TILES_PER_TEAM;
@@ -988,7 +1056,17 @@ void GpuArenaBatch::Writeback() {
 
 		arena->tickCount += pendingTicks;
 	}
+}
+
+void GpuArenaBatch::FinishWriteback() {
 	pendingTicks = 0;
+}
+
+void GpuArenaBatch::Writeback() {
+	Download();
+	for (int a = 0; a < (int)arenas.size(); a++)
+		WritebackArena(a);
+	FinishWriteback();
 }
 
 } // namespace rscuda
