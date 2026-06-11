@@ -527,7 +527,8 @@ __device__ inline void CuQuickSortPairs(int* keys, int* vals, int lo, int hi) {
 __device__ inline void CuSolveTick(GpuBodyState* bodies, const GpuBodyConsts* bodyConsts,
 	GpuCarGameState* cars, int numBodies, int numStatics,
 	CuManifold* manifolds, int numManifolds, const int2* pairs, int numPairs,
-	float dt, CuSolveCtx* scratch) {
+	float dt, CuSolveCtx* scratch,
+	const GpuStaticObj* statics, const uint8_t* tileNoResponse) {
 
 	// --- calculateSimulationIslands: tags + unions over the PAIR array ---
 	CuUnionFind uf;
@@ -593,7 +594,14 @@ __device__ inline void CuSolveTick(GpuBodyState* bodies, const GpuBodyConsts* bo
 
 	// m_islandmanifold: dispatcher order, either body awake, needsResponse
 	auto hasResponse = [&](int bodyRef) -> bool {
-		if (bodyRef < 0) return true;               // statics
+		if (bodyRef < 0) {
+			// statics respond, except BROKEN dropshot tiles (flags re-synced at the
+			// post-tick, so a tile broken THIS tick still responds this tick)
+			const GpuStaticObj& so = statics[-1 - bodyRef];
+			if (so.kind == 2 && tileNoResponse)
+				return !tileNoResponse[so.shapeIdx];
+			return true;
+		}
 		// CF_NO_CONTACT_RESPONSE mirror: set/cleared in the pre-tick demo block, so a
 		// car demoed mid-tick still responds until next tick (CPU flag timing)
 		if (bodyRef >= 1 && cars[bodyRef - 1].noContactResponse) return false;

@@ -83,6 +83,11 @@ struct GpuBatch {
 	GpuMeshBvh* dMeshBvhs;
 	GpuBvhNode* dBvhNodes;
 	GpuVec3* dHullPoints;  // snowday puck (null otherwise)
+	GpuTileShape* dTiles;          // dropshot tiles (null otherwise)
+	GpuTileTables* dTileTables;
+	uint8_t* dTileDamage;          // [numArenas * numTiles]
+	uint8_t* dTileNoResponse;      // [numArenas * numTiles]
+	int numTiles;
 	GpuBvhSubtree* dBvhSubtrees;
 	GpuTriInfo* dTriInfos;
 	float* dMeshMargins;
@@ -185,6 +190,10 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dMeshBvhs);
 	cudaFree(b->dBvhNodes);
 	cudaFree(b->dHullPoints);
+	cudaFree(b->dTiles);
+	cudaFree(b->dTileTables);
+	cudaFree(b->dTileDamage);
+	cudaFree(b->dTileNoResponse);
 	cudaFree(b->dBvhSubtrees);
 	cudaFree(b->dTriInfos);
 	cudaFree(b->dMeshMargins);
@@ -229,6 +238,38 @@ void UploadMeshBvhs(GpuBatch* b,
 	// the ray tests reach the BVHs through the world-geo descriptor
 	b->geo.bvhs = b->dMeshBvhs;
 	b->geo.bvhNodes = b->dBvhNodes;
+}
+
+// dropshot tile shapes + neighbor tables (uploaded once) and per-arena tile state
+void UploadTiles(GpuBatch* b, const GpuTileShape* tiles, int numTiles,
+	const GpuTileTables& tables) {
+	cudaFree(b->dTiles);
+	cudaFree(b->dTileTables);
+	cudaFree(b->dTileDamage);
+	cudaFree(b->dTileNoResponse);
+	CudaCheck(cudaMalloc(&b->dTiles, sizeof(GpuTileShape) * numTiles), "alloc tiles");
+	CudaCheck(cudaMemcpy(b->dTiles, tiles, sizeof(GpuTileShape) * numTiles,
+		cudaMemcpyHostToDevice), "up tiles");
+	CudaCheck(cudaMalloc(&b->dTileTables, sizeof(GpuTileTables)), "alloc tile tables");
+	CudaCheck(cudaMemcpy(b->dTileTables, &tables, sizeof(GpuTileTables),
+		cudaMemcpyHostToDevice), "up tile tables");
+	size_t stateLen = (size_t)b->numArenas * numTiles;
+	CudaCheck(cudaMalloc(&b->dTileDamage, stateLen), "alloc tile damage");
+	CudaCheck(cudaMemset(b->dTileDamage, 0, stateLen), "init tile damage");
+	CudaCheck(cudaMalloc(&b->dTileNoResponse, stateLen), "alloc tile resp");
+	CudaCheck(cudaMemset(b->dTileNoResponse, 0, stateLen), "init tile resp");
+	b->numTiles = numTiles;
+	b->geo.tiles = b->dTiles;
+	b->geo.tileTables = b->dTileTables;
+	b->geo.numTiles = numTiles;
+}
+
+void DownloadTileState(GpuBatch* b, int arenaIdx, uint8_t* damageOut, uint8_t* noResponseOut) {
+	CudaCheck(cudaMemcpy(damageOut, b->dTileDamage + (size_t)arenaIdx * b->numTiles,
+		b->numTiles, cudaMemcpyDeviceToHost), "down tile damage");
+	if (noResponseOut)
+		CudaCheck(cudaMemcpy(noResponseOut, b->dTileNoResponse + (size_t)arenaIdx * b->numTiles,
+			b->numTiles, cudaMemcpyDeviceToHost), "down tile resp");
 }
 
 // snowday puck hull points (uploaded once; geo carries the device pointer)
@@ -648,6 +689,9 @@ struct GpuCollideKernelArgs {
 	const int* carOrder;             // [numArenas * numCars]
 	const GpuCarConsts* carConsts;
 	uint32_t* rngStates;             // [numArenas]
+	uint8_t* tileDamage;             // [numArenas * numTiles] (dropshot)
+	uint8_t* tileNoResponse;         // [numArenas * numTiles]
+	int numTiles;
 };
 
 __device__ static void StoreVec(GpuVec3& dst, CuVec3 v) { dst = { v.x, v.y, v.z }; }
@@ -855,6 +899,10 @@ __global__ void GpuStepArenasKernel(
 				cin.pairsOut = ca.pairs + (size_t)arenaIdx * 96;
 				cin.numPairsOut = ca.numPairs + arenaIdx;
 				cin.debug = ca.debug ? ca.debug + (size_t)arenaIdx * (2 * 96 + 1) : nullptr;
+				cin.tileDamage = ca.tileDamage
+					? ca.tileDamage + (size_t)arenaIdx * ca.numTiles : nullptr;
+				cin.tileNoResponse = ca.tileNoResponse
+					? ca.tileNoResponse + (size_t)arenaIdx * ca.numTiles : nullptr;
 				CuCollideTick(cin);
 				EmitManifoldsOut(cin.manifolds, *cin.numManifolds,
 					ca.manifoldsOut + (size_t)arenaIdx * GPU_MAX_MANIFOLDS);
@@ -868,7 +916,10 @@ __global__ void GpuStepArenasKernel(
 					ca.manifolds + (size_t)arenaIdx * GPU_MAX_MANIFOLDS,
 					ca.numManifolds[arenaIdx],
 					ca.pairs + (size_t)arenaIdx * 96,
-					ca.numPairs[arenaIdx], dt, ca.solveScratch + arenaIdx);
+					ca.numPairs[arenaIdx], dt, ca.solveScratch + arenaIdx,
+					ca.statics,
+					ca.tileNoResponse
+						? ca.tileNoResponse + (size_t)arenaIdx * ca.numTiles : nullptr);
 			}
 		}
 		__syncthreads();
@@ -906,6 +957,16 @@ __global__ void GpuStepArenasKernel(
 					CuPadPostTick(arenaPads[p], ca.padConfigs[p], arenaCars, *ca.tail);
 				// ball finish (goal-score callback is null in the bench)
 				CuBallFinish(arenaBodies[0], ca.ballStates[arenaIdx], *ca.tail);
+				// dropshot: SetDropshotTilesState after a damage tick (deferred so the
+				// ball doesn't fall through a tile broken THIS tick)
+				if (ca.consts->gameMode == CU_GAMEMODE_DROPSHOT &&
+					ca.ballStates[arenaIdx].dsHasDamaged &&
+					ca.ballStates[arenaIdx].dsLastDamageTick == tickCount) {
+					uint8_t* dmg = ca.tileDamage + (size_t)arenaIdx * ca.numTiles;
+					uint8_t* nr = ca.tileNoResponse + (size_t)arenaIdx * ca.numTiles;
+					for (int t = 0; t < ca.numTiles; t++)
+						nr[t] = dmg[t] == GPU_DS_TILE_BROKEN ? 1 : 0;
+				}
 				// tickCount++ handled by the tick loop / host counter
 			}
 		}
@@ -948,6 +1009,9 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.carOrder = b->dCarOrder;
 		ca.carConsts = b->dCarConsts;
 		ca.rngStates = b->dRngStates;
+		ca.tileDamage = b->dTileDamage;
+		ca.tileNoResponse = b->dTileNoResponse;
+		ca.numTiles = b->numTiles;
 	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(
 		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule, b->scheduleTicks,

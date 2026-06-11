@@ -44,6 +44,16 @@ void RunCarPreTickOnce(GpuBatch* batch, const GpuCarTickState& in,
 // Snowday puck hull points (m_unscaledPoints, BT units), uploaded once
 void UploadBallHull(GpuBatch* batch, const GpuVec3* points, int numPoints);
 
+// Dropshot tile shapes + neighbor tables, uploaded once (also allocates and zeroes
+// the per-arena tile damage/response state)
+void UploadTiles(GpuBatch* batch, const GpuTileShape* tiles, int numTiles,
+	const GpuTileTables& tables);
+
+// Per-arena tile damage states (one byte per tile, DropshotTileState values) and,
+// optionally, the per-tile no-contact-response flags (post-tick sync mirror)
+void DownloadTileState(GpuBatch* batch, int arenaIdx, uint8_t* damageOut,
+	uint8_t* noResponseOut = nullptr);
+
 // Mesh BVHs + triangle infos (internal-edge data), uploaded once. Arrays are shared
 // across meshes; per-mesh views via GpuMeshBvh (nodeStart/subtreeStart) and triInfo
 // indexed by (meshIdx triStart + triangleIndex).

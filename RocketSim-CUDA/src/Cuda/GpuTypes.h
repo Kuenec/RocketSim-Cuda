@@ -318,8 +318,9 @@ struct GpuDynProxy {
 
 // Static collision object, broadphase handle order (constants; statics never move)
 struct GpuStaticObj {
-	int kind;                  // 0 = triangle mesh, 1 = static plane
-	int shapeIdx;              // into the uploaded mesh / plane arrays
+	int kind;                  // 0 = triangle mesh, 1 = static plane, 2 = dropshot tile
+	int shapeIdx;              // into the uploaded mesh / plane / tile arrays
+	                           // (tiles: userIndex2 = total tile index 0..139)
 	// proxy aabb (pair-gen): shape aabb +-0.02 after the first updateAabbs
 	GpuVec3 aabbMin, aabbMax;
 	// raw shape->getAabb (compound ProcessChildShape tests; NO expansion)
@@ -328,6 +329,28 @@ struct GpuStaticObj {
 	float friction, restitution;  // rigid body material (combine inputs)
 	float breakingThreshold;      // shape->getContactBreakingThreshold(0.02)
 };
+
+// Dropshot tile static shape: 6-point btConvexHullShape (world-space x/y baked into
+// the points; rb origin = (0,0,-margin)). Margin shared via GpuCollideConsts.
+struct GpuTileShape {
+	GpuVec3 pts[6];
+	GpuVec3 localAabbMin, localAabbMax; // cached local aabb (recalcLocalAabb, w/ margin)
+	GpuVec3 origin;                     // rb world origin
+};
+
+// DropshotTiles neighbor tables (radius 2 = self+ring1 <= 7, radius 3 <= 20 incl. self)
+#define GPU_DS_TILES_PER_TEAM 70
+struct GpuTileTables {
+	int8_t n1[GPU_DS_TILES_PER_TEAM][7];
+	int8_t n1Cnt[GPU_DS_TILES_PER_TEAM];
+	int8_t n2[GPU_DS_TILES_PER_TEAM][20];
+	int8_t n2Cnt[GPU_DS_TILES_PER_TEAM];
+};
+
+// DropshotTileState damage values
+#define GPU_DS_TILE_FULL 0
+#define GPU_DS_TILE_DAMAGED 1
+#define GPU_DS_TILE_BROKEN 2
 
 // Manifold download mirror (device CuManifold/CuManifoldPoint)
 struct GpuContactOut {
@@ -356,6 +379,12 @@ struct GpuBallGameState {
 	float hsTimeSinceHit;
 	// snowday: Ball::_groundStickApplied (reset each pre-tick, set on first world hit)
 	uint8_t groundStickApplied;
+	// BallState::DropshotInfo
+	int dsChargeLevel;             // 1..3 (damage radius)
+	float dsAccumulatedHitForce;
+	float dsYTargetDir;            // 0 none, -1 blue side, 1 orange side
+	uint8_t dsHasDamaged;
+	uint64_t dsLastDamageTick;     // only valid if dsHasDamaged
 };
 
 // Boost pad constants (pad order = arena _boostPads order, identical all arenas)
@@ -404,6 +433,14 @@ struct GpuCollideConsts {
 	// hoops _OnHit extra-impulse zScale branch
 	float hoopsZScaleGround;           // BALL_CAR_EXTRA_IMPULSE_Z_SCALE_HOOPS_GROUND
 	float hoopsZScaleThresh;           // ..._HOOPS_NORMAL_Z_THRESH
+	// dropshot (RLConst::Dropshot + tile shape margin)
+	float dsMinDownwardSpeedToDamage;
+	float dsMinChargeHitSpeed;
+	float dsMinAbsorbedForCharge;
+	float dsMinAbsorbedForSupercharge;
+	float dsMinDamageInterval;
+	float tileMargin;                  // tile hull collision margin
+	int numTiles;                      // 140 in dropshot, 0 otherwise
 	GpuVec3 carBoxHalfExtNoMargin;
 	float carBoxMargin;
 	GpuVec3 carChildOffset;            // compound child transform origin (basis = I)

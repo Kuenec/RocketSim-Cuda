@@ -152,7 +152,7 @@ The project is complete ONLY when ALL THREE are true:
 
 ## Current State (2026-06-10)
 
-**Status: Exactness 100% | CUDA 100% (soccar + heatseeker + demolitions + snowday all pass CPU-identical hash gates) | Throughput GOAL MET: GPU 668k SPS @128 arenas, 1.12M @256, 1.19M @1024 vs CPU 58.3k single-thread (11-20x); 1024-arena cross-check bit-exact (seed 777, hash 10331564264090978240). HOOPS + DROPSHOT BLOCKED on game-dumped mesh assets (see ORDER items 4/5).**
+**Status: ALL FIVE GAME MODES (soccar, heatseeker, snowday, hoops, dropshot) + demolitions run 100% ON GPU, every mode gated bit-exact vs the work-CPU reference (15 gates + 4x ray-fuzz). Throughput GOAL MET: GPU 668k SPS @128 arenas, 1.19M @1024 vs CPU 58.3k single-thread (11-20x); 1024-arena cross-check bit-exact. Assets for hoops/dropshot recovered from user-provided maps.zip (hash-verified). Remaining: nothing blocked; optional further throughput work.**
 
 2026-06-10: THE GPU KERNEL OWNS THE ENTIRE SIMULATION STEP. `--gpu-step` runs every
 phase of every tick on-device (one launch per run) and reproduces the CPU reference
@@ -971,11 +971,68 @@ verified in source 2026-06-10):**
         --game-mode hoops --ticks 3000 --arenas 8 --cars 6 --seed 99
           --demo-mode on-contact -> 6767940556749896631
       Hoops ray-fuzz 200k PASS (new meshes + net BVHs). All 18 prior gates re-PASS.
-   5. DROPSHOT (#17, UNBLOCKED - meshes converted, NOT yet ported): tile system
-      (per-tile damage state changes collision -> device static world becomes
-      stateful), ball charge mechanics, launch delay (CuBallPreTickLaunch already
-      handles the dropshot consts), dropshot floor/tile collision masks
-      (DROPSHOT_FLOOR/DROPSHOT_TILE), BALL_COLLISION_RADIUS_DROPSHOT. Largest.
+   5. DROPSHOT (#17, COMPLETE - all gates PASS bit-exact). ALL FIVE GAME MODES
+      NOW RUN 100% ON GPU.
+      ARENA: 2 meshes + floor plane z=1.5 (DROPSHOT_FLOOR - collides with CARS
+      only; car group = DefaultFilter|DROPSHOT_FLOOR) + ceiling, NO side walls,
+      NO boost pads (numPads=0 flows through generically), 140 static tiles
+      (6-pt btConvexHullShapes, world x/y baked into points, rb origin
+      (0,0,-margin), group=mask=DROPSHOT_TILE - ball-only via filters).
+      DEVICE: GpuStaticObj kind 2 = tile (shapeIdx = userIndex2 total index);
+      GpuTileShape (pts[6] + cached local aabb + origin) + GpuTileTables
+      (neighbor radius-2 <=7 / radius-3 <=20 lists) in GpuWorldGeo via
+      UploadTiles (also allocs per-arena dTileDamage/dTileNoResponse);
+      ball-vs-tile = plain convexConvex: pair (tile, ball) -> manifold
+      (tile, ball) = ml.create(-1-h0, 0), GJK tile-hull-vs-sphere (reuses the
+      snowday CU_SHAPE_HULL machinery), result order matches manifold
+      (swap=false), callback gets userIndex-swapped (ball, tile), NO isSpecial;
+      CuBodyHasResponse (callback head) + solver hasResponse treat BROKEN tiles
+      as no-response (flags state separate from damage: re-synced only in
+      GAME_POST when dsLastDamageTick == tickCount - SetDropshotTilesState's
+      deferred timing so the ball never falls through a tile broken this tick);
+      _OnDropshotTileCollision ported in the callback (broken-skip,
+      MIN_DAMAGE_INTERVAL via (tickCount-lastDamageTick)*dt, downward-speed
+      gate, charge side gate [team0 tiles all y<0 -> sign by teamIdx], neighbor
+      break radius = chargeLevel, dsInfo reset); _OnHit dropshot charge branch
+      (velIntoBall accumulation -> chargeLevel 2/3 + yTargetDir);
+      dsInfo carried in GpuBallGameState (serialized+hashed via BallState);
+      launch delay shared with hoops (CuBallPreTickLaunch). Bench: tile
+      extraction (points + recalcLocalAabb replication + neighbor tables via
+      DropshotTiles::GetNeighborIndices), tile damage ADDED TO THE GATE HASH
+      (DropshotTilesState has no upstream serialization), tile damage + response
+      flags downloaded and mirrored onto the arena at writeback, wheels now
+      written back in WritebackCar, dropshot 3-way per-arena ball init (frozen
+      kickoff / live ball / vertical slam - the slam re-damages the same tile on
+      rebound, BREAKING it: covers response removal + fall-through; natural play
+      produced damage but ZERO broken tiles).
+      *** ROOT CAUSE FOUND while validating (32x6x2500 arena 0 diverged @ tick
+      591): Arena::Step's car pre-tick iteration follows _cars (POINTER-keyed
+      unordered_set) - the order is ALLOCATION-LAYOUT-DEPENDENT and becomes
+      PHYSICS-RELEVANT when a car rides on another car (wheel rays hit the other
+      chassis; the ground car's mid-tick state depends on whether it pre-ticked
+      first). RunCpu created arenas one-at-a-time interleaved with
+      stepping/deletion while RunGpu created them all upfront after CUDA init ->
+      different heap layouts -> different _cars orders -> the GPU's uploaded
+      carOrder replicated the GPU-PROCESS order, not the CPU-gate-run order.
+      FIX: RunCpu now creates ALL arenas upfront and RunGpu creates arenas
+      BEFORE any CUDA call - identical allocation histories give identical
+      _cars orders in both processes (empirically reproducible; same-binary CPU
+      runs always reproduce). All 12 prior gate hashes were UNCHANGED by the
+      restructure (those configs were order-insensitive). Diagnosis chain:
+      state-blob bisect -> hidden-state-extended blob (wheels/vic/tile flags -
+      still matched) -> lockstep phase compare passed (all phases correct from
+      CPU inputs) -> pair caches matched -> input fingerprint of the diverging
+      car's pre-tick: own state identical, GROUND CAR's velocity was pre- vs
+      post-its-own-pre-tick -> ORDER. (Also fixed: the gpu-compare harness now
+      uploads hull/tile data - it crashed on kind-2 statics with null tiles.)
+      DROPSHOT GATES (work-bench CPU = reference, GPU PASS; tile damage hashed):
+        --game-mode dropshot --ticks 20000 --arenas 1 --cars 2 --seed 1337
+          -> 16797750564250741040
+        --game-mode dropshot --ticks 2500 --arenas 32 --cars 6 --seed 4242
+          -> 18379725107633245205  (5 arenas end with BROKEN tiles + fall-through)
+        --game-mode dropshot --ticks 3000 --arenas 8 --cars 6 --seed 99
+          --demo-mode on-contact -> 16801832455181733896
+      All 12 prior gates re-PASS (CPU + GPU) + ray-fuzz 200k x4 modes PASS.
    THROUGHPUT: GOAL MET (2026-06-10 re-measure): GPU 668k SPS @128 arenas / 1.12M
    @256 / 1.08M @512 / 1.19M @1024 (1000 ticks, 2 cars, soccar) vs CPU 58.3k
    single-thread = 11-20x. The old "10.6k SPS" figure was stale. 1024-arena

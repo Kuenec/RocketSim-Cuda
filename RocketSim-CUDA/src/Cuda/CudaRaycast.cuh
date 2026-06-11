@@ -37,6 +37,10 @@ struct GpuWorldGeo {
 	// snowday puck hull points (null/0 in sphere-ball modes)
 	const GpuVec3* hullPoints;
 	int numHullPoints;
+	// dropshot tiles (null/0 outside dropshot)
+	const GpuTileShape* tiles;
+	const GpuTileTables* tileTables;
+	int numTiles;
 };
 
 struct GpuRayHit {

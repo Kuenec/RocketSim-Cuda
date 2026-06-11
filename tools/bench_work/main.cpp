@@ -317,6 +317,27 @@ static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>&
 			bs.vel = Vec(cosf(ang) * 1300.0f, sinf(ang) * 1300.0f, 600.0f);
 			arena->ball->SetState(bs);
 		}
+	} else if (args.gameMode == GameMode::DROPSHOT) {
+		// Per-arena 3-way: frozen kickoff (launch + center-tile damage), live ball
+		// (car hits / charge), or a vertical slam onto a seed-derived tile spot -
+		// the slam re-damages the same tile on the rebound (> MIN_DAMAGE_INTERVAL
+		// apart), BREAKING it: covers response removal, the deferred post-tick
+		// sync, and the ball falling through the hole
+		uint64_t variant = spawnRng.Next() % 3;
+		if (variant == 1) {
+			BallState bs = BallState();
+			float ang = spawnRng.NextSigned() * (float)M_PI;
+			bs.pos.z = 400.0f;
+			bs.vel = Vec(cosf(ang) * 1300.0f, sinf(ang) * 1300.0f, 600.0f);
+			arena->ball->SetState(bs);
+		} else if (variant == 2) {
+			BallState bs = BallState();
+			float ySign = (spawnRng.Next() & 1) ? 1.0f : -1.0f;
+			bs.pos = Vec(spawnRng.NextSigned() * 2000.0f,
+				ySign * (1500.0f + spawnRng.NextSigned() * 1000.0f), 600.0f);
+			bs.vel = Vec(0, 0, -1200.0f);
+			arena->ball->SetState(bs);
+		}
 	}
 	// Soccar: ball stays at its deterministic default rest state (center, BALL_REST_Z)
 	return arena;
@@ -344,6 +365,12 @@ static uint64_t HashArena(Arena* arena, std::vector<CarSlot>& slots, DataStreamO
 		BoostPadState ps = pad->GetState();
 		ps.Serialize(out);
 	}
+	// Dropshot tile damage states (DropshotTilesState has no upstream serialization,
+	// but tile state IS simulation state - include it in the gate hash)
+	if (arena->gameMode == GameMode::DROPSHOT)
+		for (int t = 0; t < RLConst::Dropshot::TEAM_AMOUNT; t++)
+			for (int i = 0; i < RLConst::Dropshot::NUM_TILES_PER_TEAM; i++)
+				out.Write<uint8_t>(arena->_dropshotTilesState.states[t][i].damageState);
 	return Fnv1a64(out.data.data(), out.data.size(), FNV_BASIS);
 }
 
@@ -373,12 +400,23 @@ static void EmitArenaDiagnostics(const Args& args, int arenaIdx, uint64_t arenaH
 // ============================== CPU PATH ==============================
 
 static uint64_t RunCpu(const Args& args, double& elapsedS) {
+	// Create ALL arenas up front, mirroring RunGpu's allocation sequence exactly.
+	// Arena::Step's car pre-tick iteration follows _cars (a pointer-keyed
+	// unordered_set), so the heap layout at car creation is PHYSICS-RELEVANT when
+	// cars interact during pre-ticks (e.g. one car riding on another). Identical
+	// allocation histories give both processes identical _cars orders, which the
+	// GPU then replicates via the uploaded carOrder.
+	std::vector<Arena*> arenas(args.arenas);
+	std::vector<std::vector<CarSlot>> slotsPerArena(args.arenas);
+	for (int a = 0; a < args.arenas; a++)
+		arenas[a] = SetupArena(args, a, slotsPerArena[a]);
+
 	uint64_t combinedHash = FNV_BASIS;
 	for (int arenaIdx = 0; arenaIdx < args.arenas; arenaIdx++) {
-		std::vector<CarSlot> slots;
-		Arena* arena = SetupArena(args, arenaIdx, slots);
+		Arena* arena = arenas[arenaIdx];
+		std::vector<CarSlot>& slots = slotsPerArena[arenaIdx];
 
-		// Pin the demo-respawn engine AFTER setup (the Arena ctor may draw from it)
+		// Pin the demo-respawn engine per arena (the Arena ctor may draw from it)
 		Math::SeedRandEngine(DemoRngSeed(args, arenaIdx));
 
 		auto t0 = std::chrono::steady_clock::now();
@@ -396,9 +434,9 @@ static uint64_t RunCpu(const Args& args, double& elapsedS) {
 		EmitArenaDiagnostics(args, arenaIdx, arenaHash, out);
 		if (args.dumpArenaHashes)
 			EmitCarDiag("cpu", slots);
-
-		delete arena;
 	}
+	for (Arena* arena : arenas)
+		delete arena;
 	return combinedHash;
 }
 
@@ -566,6 +604,16 @@ static void WritebackCar(Car* car, const rscuda::GpuBodyState& body, const rscud
 	cs.lastControls = FromGpu(g.lastControls);
 	cs.tickCountSinceUpdate = g.tickCountSinceUpdate;
 	car->_velocityImpulseCache = FromGpu(g.velocityImpulseCache);
+	for (int w = 0; w < 4; w++) {
+		btWheelInfoRL& wi = car->_bulletVehicle.m_wheelInfo[w];
+		wi.m_steerAngle = g.wheels[w].steerAngle;
+		wi.m_engineForce = g.wheels[w].engineForce;
+		wi.m_brake = g.wheels[w].brake;
+		wi.m_latFriction = g.wheels[w].latFriction;
+		wi.m_longFriction = g.wheels[w].longFriction;
+		wi.m_raycastInfo.m_suspensionLength = g.wheels[w].suspensionLength;
+		wi.m_extraPushback = g.wheels[w].extraPushback;
+	}
 }
 
 static constexpr float TICK_TIME = 1.0f / 120.0f;
@@ -721,6 +769,9 @@ static void ExtractCollideData(Arena* arena, const std::vector<CarSlot>& slots,
 		if (p->shapeType == TRIANGLE_MESH_SHAPE_PROXYTYPE) {
 			so.kind = 0;
 			so.shapeIdx = meshCount++;
+		} else if (p->shapeType == CONVEX_HULL_SHAPE_PROXYTYPE) {
+			so.kind = 2; // dropshot tile
+			so.shapeIdx = obj->getUserIndex2(); // total tile index 0..139
 		} else {
 			so.kind = 1;
 			so.shapeIdx = planeCount++;
@@ -812,6 +863,15 @@ static void ExtractCollideData(Arena* arena, const std::vector<CarSlot>& slots,
 	cc.ballMassBT = arena->ball->GetMass();
 	cc.hoopsZScaleGround = BALL_CAR_EXTRA_IMPULSE_Z_SCALE_HOOPS_GROUND;
 	cc.hoopsZScaleThresh = BALL_CAR_EXTRA_IMPULSE_Z_SCALE_HOOPS_NORMAL_Z_THRESH;
+	cc.dsMinDownwardSpeedToDamage = Dropshot::MIN_DOWNWARD_SPEED_TO_DAMAGE;
+	cc.dsMinChargeHitSpeed = Dropshot::MIN_CHARGE_HIT_SPEED;
+	cc.dsMinAbsorbedForCharge = Dropshot::MIN_ABSORBED_FORCE_FOR_CHARGE;
+	cc.dsMinAbsorbedForSupercharge = Dropshot::MIN_ABSORBED_FORCE_FOR_SUPERCHARGE;
+	cc.dsMinDamageInterval = Dropshot::MIN_DAMAGE_INTERVAL;
+	if (arena->gameMode == GameMode::DROPSHOT) {
+		cc.numTiles = (int)arena->_worldDropshotTileRBs.size();
+		cc.tileMargin = arena->_worldDropshotTileRBs[0]->getCollisionShape()->getMargin();
+	}
 	const btBoxShape& box = car->_childHitboxShape;
 	cc.carBoxHalfExtNoMargin = ToGpuB(box.getHalfExtentsWithoutMargin());
 	cc.carBoxMargin = box.getMargin();
@@ -1158,6 +1218,9 @@ static int BodyStateDiff(const rscuda::GpuBodyState& a, const rscuda::GpuBodySta
 	return -1;
 }
 
+static void ExtractTiles(Arena* arena,
+	std::vector<rscuda::GpuTileShape>& tiles, rscuda::GpuTileTables& tables);
+
 static int RunGpuCompare(const Args& args) {
 	if (!rscuda::Available()) {
 		fprintf(stderr, "GPU_COMPARE: FAIL (no usable CUDA device)\n");
@@ -1282,6 +1345,19 @@ static int RunGpuCompare(const Args& args) {
 		rscuda::UploadCollideData(batch, ccons, statics.data(), (int)statics.size(),
 			cellStart.data(), (int)cellStart.size() - 1,
 			cellList.data(), (int)cellList.size(), grid);
+		if (!arena->ball->IsSphere()) { // snowday puck hull
+			auto* hull = (btConvexHullShape*)arena->ball->_collisionShape;
+			std::vector<rscuda::GpuVec3> pts(hull->getNumPoints());
+			for (int i = 0; i < hull->getNumPoints(); i++)
+				pts[i] = ToGpuB(hull->getUnscaledPoints()[i]);
+			rscuda::UploadBallHull(batch, pts.data(), (int)pts.size());
+		}
+		if (args.gameMode == GameMode::DROPSHOT) { // tile shapes + per-arena state
+			std::vector<rscuda::GpuTileShape> tiles;
+			rscuda::GpuTileTables tables;
+			ExtractTiles(arena, tiles, tables);
+			rscuda::UploadTiles(batch, tiles.data(), (int)tiles.size(), tables);
+		}
 	}
 	// CPU manifold body -> device id (>=0 dyn slot, <0 static handle -1-h)
 	auto collideBodyId = [&](const void* obj) -> int {
@@ -1847,17 +1923,56 @@ static void ExtractTailData(Arena* arena, std::vector<CarSlot>& slots,
 	}
 }
 
-static uint64_t RunGpu(const Args& args, double& elapsedS) {
-	if (!rscuda::Available()) {
-		fprintf(stderr, "GPU_STEP: FAIL (no usable CUDA device)\n");
-		exit(2);
+// Dropshot tile shapes (6-pt hulls, world-space points; rb origin (0,0,-margin)) +
+// neighbor tables. Local aabbs recomputed exactly as recalcLocalAabb (see hull note).
+static void ExtractTiles(Arena* arena,
+	std::vector<rscuda::GpuTileShape>& tiles, rscuda::GpuTileTables& tables) {
+	for (btRigidBody* rb : arena->_worldDropshotTileRBs) {
+		auto* hull = (btConvexHullShape*)rb->getCollisionShape();
+		rscuda::GpuTileShape ts = {};
+		for (int i = 0; i < 6; i++)
+			ts.pts[i] = ToGpuB(hull->getUnscaledPoints()[i]);
+		static const btVector3 dirs[6] = {
+			btVector3(1, 0, 0), btVector3(0, 1, 0), btVector3(0, 0, 1),
+			btVector3(-1, 0, 0), btVector3(0, -1, 0), btVector3(0, 0, -1) };
+		btVector3 sup[6] = {};
+		hull->batchedUnitVectorGetSupportingVertexWithoutMargin(dirs, sup, 6);
+		btVector3 lmn, lmx;
+		for (int i = 0; i < 3; i++) {
+			lmx[i] = sup[i][i] + hull->getMargin();
+			lmn[i] = sup[i + 3][i] - hull->getMargin();
+		}
+		ts.localAabbMin = ToGpuB(lmn);
+		ts.localAabbMax = ToGpuB(lmx);
+		ts.origin = ToGpuB(rb->getWorldTransform().getOrigin());
+		tiles.push_back(ts);
 	}
+	tables = {};
+	for (int i = 0; i < RLConst::Dropshot::NUM_TILES_PER_TEAM; i++) {
+		auto n1 = DropshotTiles::GetNeighborIndices(i, 2);
+		auto n2 = DropshotTiles::GetNeighborIndices(i, 3);
+		tables.n1Cnt[i] = (int8_t)n1.size();
+		for (size_t k = 0; k < n1.size(); k++)
+			tables.n1[i][k] = (int8_t)n1[k];
+		tables.n2Cnt[i] = (int8_t)n2.size();
+		for (size_t k = 0; k < n2.size(); k++)
+			tables.n2[i][k] = (int8_t)n2[k];
+	}
+}
 
-	// Set up all arenas (CPU-side state init only - no physics is stepped on CPU)
+static uint64_t RunGpu(const Args& args, double& elapsedS) {
+	// Set up all arenas FIRST (state init only - no physics is stepped on CPU).
+	// This must happen before ANY CUDA call so the allocation history (and with it
+	// the physics-relevant _cars iteration order) matches RunCpu exactly.
 	std::vector<Arena*> arenas(args.arenas);
 	std::vector<std::vector<CarSlot>> slotsPerArena(args.arenas);
 	for (int a = 0; a < args.arenas; a++)
 		arenas[a] = SetupArena(args, a, slotsPerArena[a]);
+
+	if (!rscuda::Available()) {
+		fprintf(stderr, "GPU_STEP: FAIL (no usable CUDA device)\n");
+		exit(2);
+	}
 
 	const int numPads = (int)arenas[0]->GetBoostPads().size();
 	rscuda::GpuBatch* batch = rscuda::CreateBatch(args.arenas, args.cars, numPads);
@@ -1918,6 +2033,12 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 				pts[i] = ToGpuB(hull->getUnscaledPoints()[i]);
 			rscuda::UploadBallHull(batch, pts.data(), (int)pts.size());
 		}
+		if (args.gameMode == GameMode::DROPSHOT) {
+			std::vector<rscuda::GpuTileShape> tiles;
+			rscuda::GpuTileTables tables;
+			ExtractTiles(arenas[0], tiles, tables);
+			rscuda::UploadTiles(batch, tiles.data(), (int)tiles.size(), tables);
+		}
 	}
 	// per-arena: dyn proxies, ball game state, car iteration order (_cars set order)
 	for (int a = 0; a < args.arenas; a++) {
@@ -1936,6 +2057,12 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		bs.hsCurTargetSpeed = arenas[a]->ball->_internalState.hsInfo.curTargetSpeed;
 		bs.hsTimeSinceHit = arenas[a]->ball->_internalState.hsInfo.timeSinceHit;
 		bs.groundStickApplied = arenas[a]->ball->_groundStickApplied;
+		const auto& dsi = arenas[a]->ball->_internalState.dsInfo;
+		bs.dsChargeLevel = dsi.chargeLevel;
+		bs.dsAccumulatedHitForce = dsi.accumulatedHitForce;
+		bs.dsYTargetDir = dsi.yTargetDir;
+		bs.dsHasDamaged = dsi.hasDamaged;
+		bs.dsLastDamageTick = dsi.hasDamaged ? dsi.lastDamageTick : 0;
 		rscuda::UploadBallState(batch, a, bs);
 		std::vector<int> order;
 		for (Car* car : arenas[a]->_cars)
@@ -2021,6 +2148,30 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		arenas[a]->ball->_internalState.hsInfo.curTargetSpeed = bs.hsCurTargetSpeed;
 		arenas[a]->ball->_internalState.hsInfo.timeSinceHit = bs.hsTimeSinceHit;
 		arenas[a]->ball->_groundStickApplied = bs.groundStickApplied;
+		auto& dsi = arenas[a]->ball->_internalState.dsInfo;
+		dsi.chargeLevel = bs.dsChargeLevel;
+		dsi.accumulatedHitForce = bs.dsAccumulatedHitForce;
+		dsi.yTargetDir = bs.dsYTargetDir;
+		dsi.hasDamaged = bs.dsHasDamaged;
+		if (bs.dsHasDamaged)
+			dsi.lastDamageTick = bs.dsLastDamageTick;
+		if (args.gameMode == GameMode::DROPSHOT) {
+			constexpr int NT = RLConst::Dropshot::TEAM_AMOUNT * RLConst::Dropshot::NUM_TILES_PER_TEAM;
+			uint8_t dmg[NT], nr[NT];
+			rscuda::DownloadTileState(batch, a, dmg, nr);
+			for (int t = 0; t < RLConst::Dropshot::TEAM_AMOUNT; t++)
+				for (int i = 0; i < RLConst::Dropshot::NUM_TILES_PER_TEAM; i++)
+					arenas[a]->_dropshotTilesState.states[t][i].damageState =
+						dmg[t * RLConst::Dropshot::NUM_TILES_PER_TEAM + i];
+			// mirror the device response flags onto the tile bodies (writeback fidelity)
+			for (int i = 0; i < NT; i++) {
+				auto* rb = arenas[a]->_worldDropshotTileRBs[i];
+				if (nr[i])
+					rb->m_collisionFlags |= btCollisionObject::CF_NO_CONTACT_RESPONSE;
+				else
+					rb->m_collisionFlags &= ~btCollisionObject::CF_NO_CONTACT_RESPONSE;
+			}
+		}
 		arenas[a]->tickCount += args.ticks;
 	}
 

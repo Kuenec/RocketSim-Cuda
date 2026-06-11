@@ -48,6 +48,7 @@ __device__ __forceinline__ void CuSetActivationState(int& cur, int newState) {
 #define CU_BT_TO_UU 50.f
 #define CU_USERIDX_CAR 1
 #define CU_USERIDX_BALL 2
+#define CU_USERIDX_DROPSHOT_TILE 3
 // GameMode enum (src/Sim/GameMode.h)
 #define CU_GAMEMODE_SOCCAR 0
 #define CU_GAMEMODE_HOOPS 1
@@ -81,6 +82,10 @@ struct CuCollideIn {
 	GpuCollideConsts cc;
 	uint64_t tickCount;
 	float dt;
+	// dropshot per-arena tile state (null outside dropshot). Damage mutates during
+	// the tick (neighbor breaks); response flags only re-sync at GAME_POST.
+	uint8_t* tileDamage;
+	const uint8_t* tileNoResponse;
 	// outputs (per arena)
 	CuManifold* manifolds;           // capacity GPU_MAX_MANIFOLDS
 	int* numManifolds;
@@ -358,18 +363,28 @@ struct CuManifoldList {
 	}
 };
 
+// Body contact response for a callback/solver body ref (>= 0 dyn slot, < 0 static).
+// Cars mirror CF_NO_CONTACT_RESPONSE (set/cleared at pre-tick - demo flag timing);
+// broken dropshot tiles get the flag at the post-tick sync.
+__device__ __forceinline__ bool CuBodyHasResponse(const CuCollideIn& in, int bodyRef) {
+	if (bodyRef >= 1)
+		return !in.cars[bodyRef - 1].noContactResponse;
+	if (bodyRef < 0) {
+		const GpuStaticObj& so = in.statics[-1 - bodyRef];
+		if (so.kind == 2 && in.tileNoResponse)
+			return !in.tileNoResponse[so.shapeIdx];
+	}
+	return true;
+}
+
 // ---- Arena::_BulletContactAddedCallback (game effects; manifold-order bodies) ----
-// objA/objB = manifold body0/body1. Implements the soccar-relevant paths; the
-// trailing btAdjustInternalEdgeContacts is applied by the caller (mesh pairs only).
+// objA/objB = manifold body0/body1, except tile pairs which arrive userIndex-swapped
+// as (ball, tile) like the CPU's shouldSwap. The trailing
+// btAdjustInternalEdgeContacts is applied by the caller (mesh pairs only).
 __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 	CuManifoldPoint& cp, int bodyA, int bodyB) {
 
-	// hasContactResponse: noContactResponse mirrors CF_NO_CONTACT_RESPONSE, which is
-	// only set at the NEXT pre-tick after a demo - a car demoed earlier this tick
-	// still passes this check (CPU flag timing)
-	if (bodyA >= 1 && in.cars[bodyA - 1].noContactResponse)
-		return;
-	if (bodyB >= 1 && in.cars[bodyB - 1].noContactResponse)
+	if (!CuBodyHasResponse(in, bodyA) || !CuBodyHasResponse(in, bodyB))
 		return;
 
 	// shouldSwap by userIndex: car(1) < ball(2) < none(-1 world). Manifold body0 is
@@ -449,8 +464,25 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 					bs.hsCurTargetSpeed = ns < in.cc.hsMaxSpeed ? ns : in.cc.hsMaxSpeed; // RS_MIN
 				}
 				bs.hsYTargetDir = newTargetDir;
+			} else if (in.cc.gameMode == CU_GAMEMODE_DROPSHOT) {
+				// Ball::_OnHit dropshot charge accumulation
+				GpuBallGameState& bs = *in.ball;
+				CuVec3 dirFromCar = CuVecNormalizedRS(ballPos - carPos);
+				CuVec3 relVelFromCar = carVel - ballVel;
+				float velIntoBall = dirFromCar.x * relVelFromCar.x +
+					dirFromCar.y * relVelFromCar.y + dirFromCar.z * relVelFromCar.z;
+				if (velIntoBall >= in.cc.dsMinChargeHitSpeed) {
+					bs.dsAccumulatedHitForce += velIntoBall;
+					if (bs.dsAccumulatedHitForce >= in.cc.dsMinAbsorbedForCharge)
+						bs.dsChargeLevel = 2;
+					if (bs.dsAccumulatedHitForce >= in.cc.dsMinAbsorbedForSupercharge)
+						bs.dsChargeLevel = 3;
+				}
+				if (bs.dsChargeLevel > 1) {
+					float newTargetDir = (car.team == 0 /*BLUE*/) ? 1.0f : -1.0f;
+					bs.dsYTargetDir = newTargetDir;
+				}
 			}
-			// (dropshot charge path lands with the dropshot port)
 		} else if (bodyB >= 1) {
 			// Car + Car: overrides + bump logic both ways
 			cp.combinedFriction = in.cc.carCarFriction;
@@ -521,6 +553,58 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 			cp.combinedFriction = in.cc.carWorldFriction;
 			cp.combinedRestitution = in.cc.carWorldRestitution;
 		}
+	} else if (bodyA == 0 && bodyB < 0 && in.statics[-1 - bodyB].kind == 2) {
+		// Ball + dropshot tile: Ball::_OnDropshotTileCollision (no isSpecial, no
+		// friction/restitution overrides). Damage state mutates NOW; collision
+		// response flags only re-sync at the end of the tick.
+		int tileTotalIndex = in.statics[-1 - bodyB].shapeIdx;
+		int teamIdx = tileTotalIndex / GPU_DS_TILES_PER_TEAM;
+		int tileIdx = tileTotalIndex % GPU_DS_TILES_PER_TEAM;
+		GpuBallGameState& bs = *in.ball;
+		do {
+			if (in.tileDamage[tileTotalIndex] == GPU_DS_TILE_BROKEN)
+				break; // two tiles hit simultaneously
+			if (bs.dsHasDamaged) {
+				// (tickCount - lastDamageTick) is uint64; * tickTime -> float
+				float timeSinceDamage =
+					(float)(in.tickCount - bs.dsLastDamageTick) * in.dt;
+				if (timeSinceDamage <= in.cc.dsMinDamageInterval)
+					break;
+			}
+			CuVec3 velUU = GV(in.bodies[0].linVel) * CU_BT_TO_UU;
+			if (velUU.z > -in.cc.dsMinDownwardSpeedToDamage)
+				break;
+			if (bs.dsChargeLevel > 1 && bs.dsYTargetDir != 0.0f) {
+				// RS_SGN(tilePos.y): team 0 tiles are all y<0, team 1 all y>0
+				float tileYSign = (teamIdx == 0) ? -1.0f : 1.0f;
+				if (tileYSign != bs.dsYTargetDir)
+					break; // wrong side of the arena
+			}
+			// break the tile(s): GetNeighborIndices(tileIdx, chargeLevel)
+			const GpuTileTables& tt = *in.geo.tileTables;
+			if (bs.dsChargeLevel == 1) {
+				uint8_t& st = in.tileDamage[teamIdx * GPU_DS_TILES_PER_TEAM + tileIdx];
+				if (st != GPU_DS_TILE_BROKEN)
+					st++;
+			} else if (bs.dsChargeLevel == 2) {
+				for (int i = 0; i < tt.n1Cnt[tileIdx]; i++) {
+					uint8_t& st = in.tileDamage[teamIdx * GPU_DS_TILES_PER_TEAM + tt.n1[tileIdx][i]];
+					if (st != GPU_DS_TILE_BROKEN)
+						st++;
+				}
+			} else {
+				for (int i = 0; i < tt.n2Cnt[tileIdx]; i++) {
+					uint8_t& st = in.tileDamage[teamIdx * GPU_DS_TILES_PER_TEAM + tt.n2[tileIdx][i]];
+					if (st != GPU_DS_TILE_BROKEN)
+						st++;
+				}
+			}
+			bs.dsHasDamaged = 1;
+			bs.dsLastDamageTick = in.tickCount;
+			bs.dsAccumulatedHitForce = 0;
+			bs.dsChargeLevel = 1;
+			bs.dsYTargetDir = 0;
+		} while (false);
 	} else if (bodyA == 0 && bodyB < 0) {
 		// Ball + World: Ball::_OnWorldCollision, then mark special (non-snowday)
 		if (in.cc.gameMode == CU_GAMEMODE_HEATSEEKER) {
@@ -611,7 +695,44 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 			float dynBreaking = d == 0 ? in.cc.ballBreakingThreshold : in.cc.carBreakingThreshold;
 			float breaking = dynBreaking < so.breakingThreshold ? dynBreaking : so.breakingThreshold;
 
-			if (d == 0) {
+			if (d == 0 && so.kind == 2) {
+				// ball vs dropshot tile: pair order (tile, ball) -> plain convexConvex,
+				// manifold (tile, ball) created lazily in processCollision (the ball is
+				// active here, so creation is unconditional). Result order matches the
+				// manifold; the game callback gets the userIndex-swapped (ball, tile).
+				CuContactBodyInfo ballInfo = { dynBasis, dynPos,
+					in.cc.ballFriction, in.cc.ballRestitution, false, CU_USERIDX_BALL };
+				const GpuTileShape& ts = in.geo.tiles[so.shapeIdx];
+				CuVec3 tileOrigin = GV(ts.origin);
+				CuContactBodyInfo tileInfo = { ident, tileOrigin,
+					so.friction, so.restitution, true, CU_USERIDX_DROPSHOT_TILE };
+				int mIdx = ml.create(-1 - h0, 0, breaking);
+				if (mIdx >= GPU_MAX_MANIFOLDS)
+					continue;
+				CuManifold& m = ml.arr[mIdx];
+				CuGjkShape tileShape = {};
+				tileShape.kind = CU_SHAPE_HULL;
+				tileShape.margin = in.cc.tileMargin;
+				tileShape.hullPts = ts.pts;
+				tileShape.hullN = 6;
+				tileShape.hullLocalAabbMin = GV(ts.localAabbMin);
+				tileShape.hullLocalAabbMax = GV(ts.localAabbMax);
+				CuGjkShape ballShape = {};
+				ballShape.kind = CU_SHAPE_SPHERE;
+				ballShape.margin = in.cc.ballRadius;
+				float maxd = in.cc.tileMargin + in.cc.ballRadius + breaking;
+				CuGjkResult r;
+				CuGjkClosestPoints(tileShape, ident, tileOrigin, ballShape, dynBasis, dynPos,
+					maxd * maxd, true, r);
+				if (r.hasContact) {
+					int idx = CuAddContactPoint(m, tileInfo, ballInfo, false,
+						r.normalOnB, r.pointOnBWorld, r.distance, -1, -1, -1, -1);
+					if (idx >= 0)
+						CuContactAddedCallback(in, m.pts[idx], 0, -1 - h0);
+				}
+				// convexConvex tail: refresh (own manifold), unconditional
+				CuManifoldRefresh(m, ident, tileOrigin, dynBasis, dynPos);
+			} else if (d == 0) {
 				// ball: swappedConvexConcave / planeConvex; manifold (ball, static) at ctor
 				CuContactBodyInfo ballInfo = { dynBasis, dynPos,
 					in.cc.ballFriction, in.cc.ballRestitution, false, CU_USERIDX_BALL };
