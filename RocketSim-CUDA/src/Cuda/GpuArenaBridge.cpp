@@ -15,6 +15,7 @@
 #include "../../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btConvexHullShape.h"
 
 #include <cassert>
+#include <algorithm>
 
 using namespace RocketSim;
 
@@ -748,10 +749,18 @@ GpuArenaBatch::GpuArenaBatch(const std::vector<Arena*>& arenasIn, uint64_t rngSe
 		assert(arena->tickCount == arenas[0]->tickCount);
 	}
 
+	// Car slots must follow CREATION order (ascending id): that is the order the
+	// car bodies were registered with the bullet broadphase, and the device's
+	// slot <-> broadphase-handle mapping depends on it (car-car manifold LO/HI
+	// pairing inverts otherwise). The CPU's pre-tick EXECUTION order (the _cars
+	// set order) is uploaded separately as the carOrder permutation below.
 	carLists.resize(arenas.size());
-	for (size_t a = 0; a < arenas.size(); a++)
+	for (size_t a = 0; a < arenas.size(); a++) {
 		for (Car* car : arenas[a]->_cars)
 			carLists[a].push_back(car);
+		std::sort(carLists[a].begin(), carLists[a].end(),
+			[](Car* x, Car* y) { return x->id < y->id; });
+	}
 
 	batch = CreateBatch((int)arenas.size(), numCars, numPads);
 
@@ -827,12 +836,10 @@ GpuArenaBatch::GpuArenaBatch(const std::vector<Arena*>& arenasIn, uint64_t rngSe
 		}
 	}
 
-	// per-arena: dyn proxies, identity car order (slots ARE the _cars iteration
-	// order), demo-respawn RNG stream
+	// per-arena: dyn proxies, the _cars-iteration-order permutation (the CPU's
+	// pre-tick execution order over creation-order slots), demo-respawn RNG stream
 	{
-		std::vector<int> identityOrder(numCars);
-		for (int c = 0; c < numCars; c++)
-			identityOrder[c] = c;
+		std::vector<int> order(numCars);
 		for (int a = 0; a < (int)arenas.size(); a++) {
 			GpuCollideConsts ccUnused;
 			std::vector<GpuStaticObj> sUnused;
@@ -842,7 +849,14 @@ GpuArenaBatch::GpuArenaBatch(const std::vector<Arena*>& arenasIn, uint64_t rngSe
 			ExtractCollideData(arenas[a], carLists[a], ccUnused, sUnused, aUnused, bUnused,
 				proxies, regCounter);
 			UploadDynProxies(batch, a, proxies.data(), regCounter);
-			UploadCarOrder(batch, a, identityOrder.data());
+			int oc = 0;
+			for (Car* car : arenas[a]->_cars) {
+				for (int slot = 0; slot < numCars; slot++)
+					if (carLists[a][slot] == car)
+						order[oc] = slot;
+				oc++;
+			}
+			UploadCarOrder(batch, a, order.data());
 			UploadRngState(batch, a, MinstdSeedState(SplitMix64(rngSeed ^ (uint64_t)a)));
 		}
 	}

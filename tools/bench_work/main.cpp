@@ -103,6 +103,10 @@ struct Args {
 	bool noBallMotion = false;      // diagnostic: skip the gpu-compare ball-motion injection
 	GameMode gameMode = GameMode::SOCCAR;
 	DemoMode demoMode = DemoMode::DISABLED;
+	// chunked GPU stepping (RL decision-step model): constant per-car controls per
+	// chunk via UploadConstantControls + one StepTicks(N) launch per chunk.
+	// Controls roll exactly every N ticks on both paths so results are comparable.
+	int gpuChunk = 0;
 };
 
 // Demo respawns draw Math::RandInt(0, 4, -1) from the engine; both paths pin it to this
@@ -172,6 +176,9 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 			else if (!strcmp(v, "snowday")) out.gameMode = GameMode::SNOWDAY;
 			else if (!strcmp(v, "dropshot")) out.gameMode = GameMode::DROPSHOT;
 			else { fprintf(stderr, "Unknown game mode: %s\n", v); return false; }
+		} else if (!strcmp(argv[i], "--gpu-chunk")) {
+			const char* v = need("--gpu-chunk"); if (!v) return false;
+			out.gpuChunk = atoi(v);
 		} else if (!strcmp(argv[i], "--demo-mode")) {
 			const char* v = need("--demo-mode"); if (!v) return false;
 			if (!strcmp(v, "disabled")) out.demoMode = DemoMode::DISABLED;
@@ -248,10 +255,12 @@ static CarControls RollControls(Rng& rng) {
 	return c;
 }
 
-static void UpdateControls(CarSlot& slot) {
+static void UpdateControls(CarSlot& slot, int chunkAlign = 0) {
 	if (slot.holdTicks == 0) {
 		slot.car->controls = RollControls(slot.rng);
-		slot.holdTicks = 2 + (int)(slot.rng.Next() % 59); // change every 2-60 ticks
+		slot.holdTicks = chunkAlign > 0
+			? chunkAlign // chunked mode: controls constant within each chunk
+			: 2 + (int)(slot.rng.Next() % 59); // change every 2-60 ticks
 	}
 	slot.holdTicks--;
 }
@@ -422,7 +431,7 @@ static uint64_t RunCpu(const Args& args, double& elapsedS) {
 		auto t0 = std::chrono::steady_clock::now();
 		for (int tick = 0; tick < args.ticks; tick++) {
 			for (CarSlot& slot : slots)
-				UpdateControls(slot);
+				UpdateControls(slot, args.gpuChunk);
 			arena->Step(1);
 		}
 		auto t1 = std::chrono::steady_clock::now();
@@ -2087,7 +2096,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 			for (int t = 0; t < args.ticks; t++) {
 				if (hold == 0) {
 					cur = RollControls(rng);
-					hold = 2 + (int)(rng.Next() % 59);
+					hold = args.gpuChunk > 0 ? args.gpuChunk : 2 + (int)(rng.Next() % 59);
 				}
 				hold--;
 				schedule[((size_t)a * args.cars + c) * args.ticks + t] = ToGpu(cur);
@@ -2119,10 +2128,24 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		}
 		rscuda::UploadArenaState(batch, a, bodies.data(), cars.data(), pads.data());
 	}
-	rscuda::UploadControlSchedule(batch, schedule.data(), args.ticks);
+	if (args.gpuChunk > 0) {
+		// RL decision-step model: constant controls per chunk, one launch per chunk
+		std::vector<rscuda::GpuCarControls> chunkControls((size_t)args.arenas * args.cars);
+		for (int t0 = 0; t0 < args.ticks; t0 += args.gpuChunk) {
+			int n = args.gpuChunk < (args.ticks - t0) ? args.gpuChunk : (args.ticks - t0);
+			for (int a = 0; a < args.arenas; a++)
+				for (int c = 0; c < args.cars; c++)
+					chunkControls[(size_t)a * args.cars + c] =
+						schedule[((size_t)a * args.cars + c) * args.ticks + t0];
+			rscuda::UploadConstantControls(batch, chunkControls.data());
+			rscuda::StepTicks(batch, n);
+		}
+	} else {
+		rscuda::UploadControlSchedule(batch, schedule.data(), args.ticks);
 
-	// THE step: one kernel launch runs every tick of every arena
-	rscuda::StepTicks(batch, args.ticks);
+		// THE step: one kernel launch runs every tick of every arena
+		rscuda::StepTicks(batch, args.ticks);
+	}
 
 	// Download final state and write it back into the arenas (for hashing/inspection)
 	uint64_t combinedHash = FNV_BASIS;
