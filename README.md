@@ -65,17 +65,19 @@ SPS = arena-ticks simulated per second.
 
 | Arenas | GPU SPS | CPU SPS | Speedup |
 |---|---|---|---|
-| 100 | 494,916 | 57,597 | 8.6× |
-| 200 | 638,402 | ~57,500 | 11.1× |
-| 500 | 1,059,946 | 57,505 | 18.4× |
-| 1,000 | 1,146,923 | 57,336 | 20.0× |
-| 2,000 | 1,331,558 | ~57,500 | 23.2× |
-| 5,000 | 1,375,483 | ~57,500 | 23.9× |
-| 10,000 | 1,412,098 | ~57,500 | 24.6× |
+| 100 | 973,327 | 57,597 | 16.9× |
+| 200 | 1,754,096 | ~57,500 | 30.5× |
+| 500 | 2,302,176 | 57,505 | 40.0× |
+| 1,000 | 3,138,585 | 57,336 | 54.7× |
+| 2,000 | 2,758,761 | ~57,500 | 48.0× |
+| 5,000 | 2,528,962 | ~57,500 | 44.0× |
+| 10,000 | 2,643,078 | ~57,500 | 46.0× |
 
 The CPU runs arenas sequentially, so its throughput is flat; the GPU scales with
-batch size and saturates around 1.4M SPS (~24×) on this card. 10,000 simultaneous
-arenas use roughly 2.5 GB of VRAM.
+batch size and peaks around 3.1M SPS (~55×) on this card. 10,000 simultaneous
+arenas use roughly 2.5 GB of VRAM. (2026-06-11: the per-tick car pre-tick wheel
+work — raycasts + friction — now runs four wheels in parallel per car, ~2.2-2.5×
+over the first release; results are bit-identical, all 18 gates re-verified.)
 
 ## Building
 

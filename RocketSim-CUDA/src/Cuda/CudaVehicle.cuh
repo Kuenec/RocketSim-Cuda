@@ -706,6 +706,29 @@ __device__ __forceinline__ void CuApplyCentralImpulseBody(CuCarTickIO& io, CuVec
 
 // Full Car::_PreTickUpdate (Car.cpp:71) minus the demo branch (isDemoed early-outs are
 // honored; demo RESPAWN is excluded by DemoMode::DISABLED in the gates).
+// 2026-06-11: the per-wheel slice of updateVehicleFirst (transform + raycast +
+// friction-impulse calc). Each invocation reads only the shared chassis/world
+// snapshot and ITS wheel's persistent state, and writes only w - the four
+// wheels are independent, so the step kernel runs them on four threads. The
+// fused per-wheel order is bit-identical to the original three 4-iteration
+// loops because no wheel reads another wheel's scratch.
+__device__ __forceinline__ void CuCarPreTickWheel(
+	const CuCarTickIO& io, const GpuCarConsts& cc,
+	const GpuWorldGeo& geo, const GpuGridParams& grid,
+	const GpuDynBody* dyn, int numDyn, int selfDynIdx,
+	const CuBodyDyn* dynBodies, int i, CuWheelScratch& w) {
+
+	if (io.st.isDemoed)
+		return; // mirrors CuCarPreTick's early-out
+
+	CuUpdateWheelTransform(io.body, cc.wheels[i], cc, io.wheels[i].steerAngle,
+		io.wheels[i].suspensionLength, w);
+	w.extraPushback = io.wheels[i].extraPushback; // persistent unless overwritten
+	CuWheelRayCast(io.body, selfDynIdx, cc.wheels[i], cc, geo, grid, dyn, numDyn,
+		dynBodies, io.solverTimeStep, w);
+	CuCalcFrictionImpulse(io.body, cc, io.wheels[i], dynBodies, w);
+}
+
 __device__ __forceinline__ void CuCarPreTick(
 	CuCarTickIO& io, const GpuCarConsts& cc,
 	const GpuWorldGeo& geo, const GpuGridParams& grid,
@@ -713,7 +736,8 @@ __device__ __forceinline__ void CuCarPreTick(
 	const CuBodyDyn* dynBodies,
 	float tickTime,
 	CuWheelScratch* W /*[4] out, for capture compare*/,
-	float* dbgForwardSpeedUU = nullptr) {
+	float* dbgForwardSpeedUU = nullptr,
+	bool wheelsPrecomputed = false /*W already holds CuCarPreTickWheel results*/) {
 
 	// controls.ClampFix()
 	io.controls.throttle = io.controls.throttle < -1 ? -1 : (io.controls.throttle > 1 ? 1 : io.controls.throttle);
@@ -726,16 +750,12 @@ __device__ __forceinline__ void CuCarPreTick(
 		return; // gates: demo respawn disabled; activation flags handled CPU-side later
 
 	// ---- updateVehicleFirst ----
-	for (int i = 0; i < 4; i++)
-		CuUpdateWheelTransform(io.body, cc.wheels[i], cc, io.wheels[i].steerAngle,
-			io.wheels[i].suspensionLength, W[i]);
-	for (int i = 0; i < 4; i++) {
-		W[i].extraPushback = io.wheels[i].extraPushback; // persistent unless overwritten
-		CuWheelRayCast(io.body, selfDynIdx, cc.wheels[i], cc, geo, grid, dyn, numDyn,
-			dynBodies, io.solverTimeStep, W[i]);
-	}
-	for (int i = 0; i < 4; i++)
-		CuCalcFrictionImpulse(io.body, cc, io.wheels[i], dynBodies, W[i]);
+	// (the wheel phase reads no controls, so running it before ClampFix - as the
+	// parallel path does - cannot change results)
+	if (!wheelsPrecomputed)
+		for (int i = 0; i < 4; i++)
+			CuCarPreTickWheel(io, cc, geo, grid, dyn, numDyn, selfDynIdx,
+				dynBodies, i, W[i]);
 
 	// persist wheel raycast state (m_raycastInfo.m_suspensionLength, m_extraPushback)
 	for (int i = 0; i < 4; i++) {

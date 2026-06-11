@@ -141,6 +141,11 @@ void UploadControlSchedule(GpuBatch* batch, const GpuCarControls* schedule, int 
 // chunked stepping (RL decision steps) keeps absolute tick semantics.
 void StepTicks(GpuBatch* batch, int numTicks);
 
+// 2026-06-11: diagnostic per-phase cycle counters (see GpuPhase). Enable before
+// stepping; Get downloads the totals (sum of per-block cycles per phase).
+void EnablePhaseProfiling(GpuBatch* batch);
+void GetPhaseCycles(GpuBatch* batch, unsigned long long out[GPU_PHASE_COUNT]);
+
 // Chunked-stepping controls: one CarControls per car ([arenaIdx * numCars + carIdx]),
 // held constant across subsequent StepTicks calls. Overrides any schedule.
 void UploadConstantControls(GpuBatch* batch, const GpuCarControls* perCar);

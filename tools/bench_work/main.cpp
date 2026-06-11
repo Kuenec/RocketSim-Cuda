@@ -96,6 +96,7 @@ struct Args {
 	std::string dumpStateDir;       // diagnostic: write per-arena serialized state blobs
 	bool profile = false;           // print per-phase timing breakdown after the run
 	bool gpuStep = false;           // GPU produces the simulation result (monolithic kernel)
+	bool phaseProf = false;         // print per-phase GPU cycle breakdown after the run
 	int gpuCompare = 0;             // lockstep-validate ported GPU phases for N ticks
 	int rayFuzz = 0;                // validate device static raycast vs CPU for N rays
 	int manifoldDump = 0;           // diagnostic: print CPU collision manifolds for N ticks
@@ -154,6 +155,8 @@ static bool ParseArgs(int argc, char** argv, Args& out) {
 			out.profile = true;
 		} else if (!strcmp(argv[i], "--gpu-step")) {
 			out.gpuStep = true;
+		} else if (!strcmp(argv[i], "--phase-prof")) {
+			out.phaseProf = true;
 		} else if (!strcmp(argv[i], "--gpu-compare")) {
 			const char* v = need("--gpu-compare"); if (!v) return false;
 			out.gpuCompare = atoi(v);
@@ -2128,6 +2131,8 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		}
 		rscuda::UploadArenaState(batch, a, bodies.data(), cars.data(), pads.data());
 	}
+	if (args.phaseProf)
+		rscuda::EnablePhaseProfiling(batch);
 	if (args.gpuChunk > 0) {
 		// RL decision-step model: constant controls per chunk, one launch per chunk
 		std::vector<rscuda::GpuCarControls> chunkControls((size_t)args.arenas * args.cars);
@@ -2145,6 +2150,19 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 
 		// THE step: one kernel launch runs every tick of every arena
 		rscuda::StepTicks(batch, args.ticks);
+	}
+
+	if (args.phaseProf) {
+		static const char* PHASE_NAMES[rscuda::GPU_PHASE_COUNT] = {
+			"game_pre", "predict", "collision", "solve",
+			"integrate", "activation", "game_post" };
+		unsigned long long pc[rscuda::GPU_PHASE_COUNT];
+		rscuda::GetPhaseCycles(batch, pc);
+		unsigned long long total = 0;
+		for (int i = 0; i < rscuda::GPU_PHASE_COUNT; i++) total += pc[i];
+		for (int i = 0; i < rscuda::GPU_PHASE_COUNT; i++)
+			printf("PHASE %-10s %6.2f%%  (%llu cycles)\n", PHASE_NAMES[i],
+				total ? 100.0 * pc[i] / total : 0.0, pc[i]);
 	}
 
 	// Download final state and write it back into the arenas (for hashing/inspection)
