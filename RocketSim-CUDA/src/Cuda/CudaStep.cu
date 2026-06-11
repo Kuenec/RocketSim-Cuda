@@ -152,6 +152,12 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	GpuBatch* b = new GpuBatch{};
 	b->numArenas = numArenas;
 	b->numCars = numCarsPerArena;
+	// the kernel's parallel pad phase stages grants in a fixed 64-slot shared
+	// array (soccar has the most pads at 34); fail loudly rather than truncate
+	if (numPads > 64) {
+		fprintf(stderr, "CreateBatch: numPads %d exceeds the kernel's 64-pad limit\n", numPads);
+		std::abort();
+	}
 	b->numPads = numPads;
 	b->bodiesPerArena = 1 + numCarsPerArena;
 	b->scheduleTicks = 0;
@@ -902,10 +908,10 @@ __global__ void GpuStepArenasKernel(
 				}
 				__syncthreads();
 			}
+			// pad pre-ticks: independent per pad, strided over the block
+			for (int p = bodyIdx; p < numPads; p += blockDim.x)
+				CuPadPreTick(arenaPads[p], dt);
 			if (bodyIdx == 0) {
-				// pad pre-ticks
-				for (int p = 0; p < numPads; p++)
-					CuPadPreTick(arenaPads[p], dt);
 				// Ball::_PreTickUpdate (heatseeker steering / snowday ground-stick
 				// reset / hoops+dropshot kickoff launch; no-op in soccar)
 				if (ca.consts->gameMode == CU_GAMEMODE_HEATSEEKER)
@@ -916,10 +922,12 @@ __global__ void GpuStepArenasKernel(
 					ca.consts->gameMode == CU_GAMEMODE_DROPSHOT)
 					CuBallPreTickLaunch(arenaBodies[0], ca.ballStates[arenaIdx],
 						*ca.consts, consts[0], dt);
-				// stepSimulation head: applyGravity (active bodies)
-				for (int d = 0; d < bodiesPerArena; d++)
-					CuApplyGravity(arenaBodies[d], consts[d]);
 			}
+			// stepSimulation head: applyGravity (active bodies). After the ball
+			// pre-tick: the kickoff launch sets ACTIVE_TAG, which gravity reads.
+			__syncthreads();
+			if (bodyIdx < bodiesPerArena)
+				CuApplyGravity(arenaBodies[bodyIdx], consts[bodyIdx]);
 		}
 		__syncthreads();
 		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_GAME_PRE] += t - profT0; profT0 = t; }
@@ -1002,25 +1010,52 @@ __global__ void GpuStepArenasKernel(
 		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_ACTIVATION] += t - profT0; profT0 = t; }
 
 		if (ca.tailEnabled && startPhase <= GPU_PHASE_GAME_POST && GPU_PHASE_GAME_POST <= endPhase) {
-			if (bodyIdx == 0) {
+			// 2026-06-11: clearForces and the car post-tick/finish pair touch only
+			// their own body/car state (post-tick's body param is even const), so
+			// they run one-thread-per-body. Only the boost pad grid checks contend
+			// on shared pad state - those stay sequential in _cars order below.
+			// Reordering all post/finish before all grid checks cannot change
+			// results: on CPU, car K's post/finish never reads pads or another
+			// car, and grid checks already ran after their own car's post/finish.
+			{
 				uint64_t tickCount = ca.tickBase + tick;
 				// stepSimulation tail: clearForces (all nonstatic bodies)
-				for (int d = 0; d < bodiesPerArena; d++)
-					CuClearForces(arenaBodies[d]);
-				// car post-ticks + finish + boost pad grid, in _cars order
-				for (int oc = 0; oc < numCars; oc++) {
-					int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
+				if (bodyIdx < bodiesPerArena)
+					CuClearForces(arenaBodies[bodyIdx]);
+				// car post-tick + finish, one car per thread (carOrder is a
+				// permutation; per-car work is order-independent here)
+				if (bodyIdx < numCars) {
+					int ci = bodyIdx;
 					GpuCarControls ctrl = ca.constControls
 						? ca.constControls[(size_t)arenaIdx * numCars + ci]
 						: schedule[((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
 					CuCarPostTick(arenaBodies[1 + ci], arenaCars[ci], *ca.tail, ctrl, dt);
 					CuCarFinish(arenaBodies[1 + ci], arenaCars[ci], *ca.tail);
+				}
+			}
+			__syncthreads();
+			if (bodyIdx == 0) {
+				uint64_t tickCount = ca.tickBase + tick;
+				// boost pad grid checks, in _cars order (shared pad locks)
+				for (int oc = 0; oc < numCars; oc++) {
+					int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
 					CuPadGridCheck(arenaBodies[1 + ci], arenaCars[ci], ci,
 						arenaPads, ca.padConfigs, *ca.tail, *ca.consts);
 				}
-				// pad post-ticks
+			}
+			__syncthreads();
+			// pad post-ticks: per-pad phase in parallel, boost grants in pad order
+			// (see CuPadPostTickPad; soccar has the most pads at 34 < 64)
+			__shared__ int sPadGrant[64];
+			for (int p = bodyIdx; p < numPads && p < 64; p += blockDim.x)
+				sPadGrant[p] = CuPadPostTickPad(arenaPads[p], ca.padConfigs[p],
+					arenaCars, *ca.tail);
+			__syncthreads();
+			if (bodyIdx == 0) {
+				uint64_t tickCount = ca.tickBase + tick;
 				for (int p = 0; p < numPads; p++)
-					CuPadPostTick(arenaPads[p], ca.padConfigs[p], arenaCars, *ca.tail);
+					if (sPadGrant[p] >= 0)
+						CuPadGrantBoost(ca.padConfigs[p], arenaCars[sPadGrant[p]], *ca.tail);
 				// ball finish (goal-score callback is null in the bench)
 				CuBallFinish(arenaBodies[0], ca.ballStates[arenaIdx], *ca.tail);
 				// dropshot: SetDropshotTilesState after a damage tick (deferred so the

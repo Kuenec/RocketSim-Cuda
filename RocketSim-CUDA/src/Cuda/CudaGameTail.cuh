@@ -356,22 +356,43 @@ __device__ inline void CuPadGridCheck(const GpuBodyState& carBody,
 	}
 }
 
-// BoostPad::_PostTickUpdate
-__device__ __forceinline__ void CuPadPostTick(GpuPadState& p, const GpuPadConfig& pc,
-	GpuCarGameState* cars, const GpuTailConsts& tc) {
+// BoostPad::_PostTickUpdate, split for the parallel kernel (2026-06-11):
+// the per-pad state advance touches only its own pad (cars are only READ for
+// carID), so all pads can run concurrently; the boost grant writes car.boost,
+// whose boostMax clamp is order-sensitive when several pads lock one car, so
+// grants are applied afterwards in pad order. The grant DECISION (locked +
+// active) does not depend on car.boost, so the split is exact.
+
+// phase 1, parallel-safe per pad: returns the car index to grant boost to (-1 none)
+__device__ __forceinline__ int CuPadPostTickPad(GpuPadState& p, const GpuPadConfig& pc,
+	const GpuCarGameState* cars, const GpuTailConsts& tc) {
 	uint32_t lockedCarID = 0;
+	int grantTo = -1;
 	if (p.lockedCarIdx >= 0) {
-		GpuCarGameState& car = cars[p.lockedCarIdx];
-		lockedCarID = car.carID;
+		lockedCarID = cars[p.lockedCarIdx].carID;
 		if (p.isActive) {
-			float boostToAdd = pc.isBig ? tc.boostAmountBig : tc.boostAmountSmall;
-			float nb = car.boost + boostToAdd;
-			car.boost = nb < tc.boostMax ? nb : tc.boostMax; // RS_MIN
+			grantTo = p.lockedCarIdx;
 			p.isActive = 0;
 			p.cooldown = pc.isBig ? tc.padCooldownBig : tc.padCooldownSmall;
 		}
 	}
 	p.prevLockedCarID = lockedCarID;
+	return grantTo;
+}
+
+// phase 2, sequential in pad order: the boost grant with the boostMax clamp
+__device__ __forceinline__ void CuPadGrantBoost(const GpuPadConfig& pc,
+	GpuCarGameState& car, const GpuTailConsts& tc) {
+	float boostToAdd = pc.isBig ? tc.boostAmountBig : tc.boostAmountSmall;
+	float nb = car.boost + boostToAdd;
+	car.boost = nb < tc.boostMax ? nb : tc.boostMax; // RS_MIN
+}
+
+__device__ __forceinline__ void CuPadPostTick(GpuPadState& p, const GpuPadConfig& pc,
+	GpuCarGameState* cars, const GpuTailConsts& tc) {
+	int grantTo = CuPadPostTickPad(p, pc, cars, tc);
+	if (grantTo >= 0)
+		CuPadGrantBoost(pc, cars[grantTo], tc);
 }
 
 } // namespace rscuda
