@@ -137,11 +137,21 @@ void RunPhaseSegment(GpuBatch* batch, int startPhase, int endPhase);
 void UploadControlSchedule(GpuBatch* batch, const GpuCarControls* schedule, int numTicks);
 
 // Run the monolithic kernel for numTicks ticks. The GPU result is THE simulation result;
-// the CPU does no physics while this runs.
+// the CPU does no physics while this runs. Advances the batch tick counter, so
+// chunked stepping (RL decision steps) keeps absolute tick semantics.
 void StepTicks(GpuBatch* batch, int numTicks);
+
+// Chunked-stepping controls: one CarControls per car ([arenaIdx * numCars + carIdx]),
+// held constant across subsequent StepTicks calls. Overrides any schedule.
+void UploadConstantControls(GpuBatch* batch, const GpuCarControls* perCar);
 
 // Download full state for one arena slot (same layout as upload).
 void DownloadArenaState(GpuBatch* batch, int arenaIdx,
 	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads);
+
+// Batched downloads across ALL arenas (one device-to-host copy per array)
+void DownloadAllArenaStates(GpuBatch* batch,
+	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads);
+void DownloadAllBallStates(GpuBatch* batch, GpuBallGameState* balls);
 
 } // namespace rscuda

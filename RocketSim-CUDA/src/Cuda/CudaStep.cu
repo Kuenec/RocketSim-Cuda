@@ -83,6 +83,7 @@ struct GpuBatch {
 	GpuMeshBvh* dMeshBvhs;
 	GpuBvhNode* dBvhNodes;
 	GpuVec3* dHullPoints;  // snowday puck (null otherwise)
+	GpuCarControls* dConstControls; // per-car constant controls (chunked RL stepping)
 	GpuTileShape* dTiles;          // dropshot tiles (null otherwise)
 	GpuTileTables* dTileTables;
 	uint8_t* dTileDamage;          // [numArenas * numTiles]
@@ -190,6 +191,7 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dMeshBvhs);
 	cudaFree(b->dBvhNodes);
 	cudaFree(b->dHullPoints);
+	cudaFree(b->dConstControls);
 	cudaFree(b->dTiles);
 	cudaFree(b->dTileTables);
 	cudaFree(b->dTileDamage);
@@ -574,6 +576,20 @@ void UploadControlSchedule(GpuBatch* b, const GpuCarControls* schedule, int numT
 	CudaCheck(cudaMemcpy(b->dSchedule, schedule, sizeof(GpuCarControls) * count,
 		cudaMemcpyHostToDevice), "upload schedule");
 	b->scheduleTicks = numTicks;
+	cudaFree(b->dConstControls);
+	b->dConstControls = nullptr; // schedule mode takes over
+}
+
+// Chunked-stepping controls: one CarControls per car, held constant for every tick
+// of subsequent StepTicks calls (the RL usage: controls change between chunks, not
+// within them). Overrides any uploaded schedule until UploadControlSchedule is called.
+void UploadConstantControls(GpuBatch* b, const GpuCarControls* perCar) {
+	size_t count = (size_t)b->numArenas * b->numCars;
+	if (!b->dConstControls)
+		CudaCheck(cudaMalloc(&b->dConstControls, sizeof(GpuCarControls) * count),
+			"alloc const controls");
+	CudaCheck(cudaMemcpy(b->dConstControls, perCar, sizeof(GpuCarControls) * count,
+		cudaMemcpyHostToDevice), "upload const controls");
 }
 
 // ============================== DEVICE-SIDE PHASES ==============================
@@ -692,6 +708,7 @@ struct GpuCollideKernelArgs {
 	uint8_t* tileDamage;             // [numArenas * numTiles] (dropshot)
 	uint8_t* tileNoResponse;         // [numArenas * numTiles]
 	int numTiles;
+	const GpuCarControls* constControls; // non-null: per-car controls, schedule unused
 };
 
 __device__ static void StoreVec(GpuVec3& dst, CuVec3 v) { dst = { v.x, v.y, v.z }; }
@@ -753,9 +770,11 @@ __global__ void GpuStepArenasKernel(
 				for (int oc = 0; oc < numCars; oc++) {
 					int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
 					GpuCarGameState& cst = arenaCars[ci];
-					// bench sets car->controls from the schedule before each tick
-					GpuCarControls ctrl = schedule[
-						((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
+					// bench sets car->controls from the schedule before each tick;
+					// RL chunked stepping holds per-car constant controls instead
+					GpuCarControls ctrl = ca.constControls
+						? ca.constControls[(size_t)arenaIdx * numCars + ci]
+						: schedule[((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
 
 					// Car::_PreTickUpdate head: demolition handling. RAW activation
 					// writes (the CPU assigns m_activationState1 directly, so
@@ -945,8 +964,9 @@ __global__ void GpuStepArenasKernel(
 				// car post-ticks + finish + boost pad grid, in _cars order
 				for (int oc = 0; oc < numCars; oc++) {
 					int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
-					GpuCarControls ctrl = schedule[
-						((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
+					GpuCarControls ctrl = ca.constControls
+						? ca.constControls[(size_t)arenaIdx * numCars + ci]
+						: schedule[((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
 					CuCarPostTick(arenaBodies[1 + ci], arenaCars[ci], *ca.tail, ctrl, dt);
 					CuCarFinish(arenaBodies[1 + ci], arenaCars[ci], *ca.tail);
 					CuPadGridCheck(arenaBodies[1 + ci], arenaCars[ci], ci,
@@ -1012,6 +1032,7 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.tileDamage = b->dTileDamage;
 		ca.tileNoResponse = b->dTileNoResponse;
 		ca.numTiles = b->numTiles;
+		ca.constControls = b->dConstControls;
 	}
 	GpuStepArenasKernel<<<b->numArenas, threads>>>(
 		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule, b->scheduleTicks,
@@ -1024,6 +1045,29 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 void StepTicks(GpuBatch* b, int numTicks) {
 	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1);
 	b->tickCount += numTicks;
+}
+
+// Batched full-state download: one device-to-host copy per array (the per-arena
+// DownloadArenaState loop is prohibitively chatty at RL batch sizes)
+void DownloadAllArenaStates(GpuBatch* b,
+	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads) {
+	CudaCheck(cudaMemcpy(bodies, b->dBodies,
+		sizeof(GpuBodyState) * b->numArenas * b->bodiesPerArena,
+		cudaMemcpyDeviceToHost), "down all bodies");
+	CudaCheck(cudaMemcpy(cars, b->dCars,
+		sizeof(GpuCarGameState) * b->numArenas * b->numCars,
+		cudaMemcpyDeviceToHost), "down all cars");
+	if (b->numPads > 0)
+		CudaCheck(cudaMemcpy(pads, b->dPads,
+			sizeof(GpuPadState) * b->numArenas * b->numPads,
+			cudaMemcpyDeviceToHost), "down all pads");
+}
+
+// Batched ball game state download (callback side effects: hit info lives in the
+// car states; this carries impulse caches + mode info)
+void DownloadAllBallStates(GpuBatch* b, GpuBallGameState* balls) {
+	CudaCheck(cudaMemcpy(balls, b->dBallStates,
+		sizeof(GpuBallGameState) * b->numArenas, cudaMemcpyDeviceToHost), "down all balls");
 }
 
 void RunPhaseSegment(GpuBatch* b, int startPhase, int endPhase) {
