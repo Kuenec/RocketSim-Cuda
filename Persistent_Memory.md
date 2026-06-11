@@ -152,7 +152,7 @@ The project is complete ONLY when ALL THREE are true:
 
 ## Current State (2026-06-10)
 
-**Status: Exactness 100% | CUDA 100% (--gpu-step passes BOTH gates with IDENTICAL hashes; commit 4fbd3de) | Throughput: GPU 10.6k SPS @128 arenas vs CPU 58.5k single-thread (18%) - OPTIMIZATION IS THE REMAINING WORK**
+**Status: Exactness 100% | CUDA 100% (soccar + heatseeker + demolitions + snowday all pass CPU-identical hash gates) | Throughput GOAL MET: GPU 668k SPS @128 arenas, 1.12M @256, 1.19M @1024 vs CPU 58.3k single-thread (11-20x); 1024-arena cross-check bit-exact (seed 777, hash 10331564264090978240). HOOPS + DROPSHOT BLOCKED on game-dumped mesh assets (see ORDER items 4/5).**
 
 2026-06-10: THE GPU KERNEL OWNS THE ENTIRE SIMULATION STEP. `--gpu-step` runs every
 phase of every tick on-device (one launch per run) and reproduces the CPU reference
@@ -935,13 +935,31 @@ verified in source 2026-06-10):**
           --demo-mode on-contact -> 3415898148067774285  (puck + demolitions)
       Ray-fuzz 200k PASS with the hull ball (--game-mode snowday) AND soccar 200k
       re-PASS. All 12 prior gates (soccar/heatseeker/demo, CPU+GPU) re-PASS.
-   4. HOOPS (#16): hoops meshes (verify obtainable first!), arena setup, launch
-      delay, hoops _OnHit zScale branch.
-   5. DROPSHOT (#17): tile system (per-tile damage state changes collision ->
+   4. HOOPS (#16): **BLOCKED ON ASSETS (verified 2026-06-10).** Hoops needs 12
+      unique .cmf collision meshes (known-hash set in src/RocketSim.cpp MeshHashSet:
+      0x72F2359E, 0x5ED14A26, 0xFD5A0D07, 0x92AFA5B5, 0x0E4133C7, 0x399E8B5F,
+      0xBB9D4FB5, 0x8C87FB93, 0x1CFD0E16, 0xE19E1DF6, 0x9CA179DC, 0x16F3CC19),
+      dumped from the game, placed in collision_meshes/hoops/. The repo has ONLY
+      collision_meshes/soccar. Arena::Create(HOOPS) FATALLY ERRORS without them
+      ("No arena meshes found for gamemode hoops") -> NO CPU reference exists ->
+      no gates possible -> porting now would be unvalidatable speculative code.
+      USER MUST PROVIDE the mesh dumps. Remaining port work once unblocked:
+      arena setup (HOOPS_NET filter statics), ball launch delay (shared
+      _PreTickUpdate branch with dropshot: launch impulse at BALL_HOOPS_LAUNCH_DELAY
+      when ball frozen at kickoff), hoops _OnHit zScale branch, hoops mutator
+      consts, gates. Bench --game-mode hoops flag already parses.
+   5. DROPSHOT (#17): **ALSO BLOCKED ON ASSETS (verified): Arena::Create(DROPSHOT)
+      fatally errors without collision_meshes/dropshot/ meshes** (no known-hash
+      set published in MeshHashSet - any dropshot dump is accepted with a warning).
+      Once unblocked: tile system (per-tile damage state changes collision ->
       device static world becomes stateful), ball charge, launch delay. Largest.
-   THEN: throughput (GPU 10.6k SPS @128 arenas vs CPU 58.5k single-thread; kernel
-   is single-thread-per-arena -> scale arenas / parallelize within phases).
-   Cleanup candidates: TEMP debug[100+/120+] diagnostics in CudaCollideWorld.cuh.
+   THROUGHPUT: GOAL MET (2026-06-10 re-measure): GPU 668k SPS @128 arenas / 1.12M
+   @256 / 1.08M @512 / 1.19M @1024 (1000 ticks, 2 cars, soccar) vs CPU 58.3k
+   single-thread = 11-20x. The old "10.6k SPS" figure was stale. 1024-arena
+   cross-check CPU vs GPU bit-exact (300 ticks seed 777).
+   Cleanup decision: the debug[100+/110+/120+] diagnostic channels in
+   CudaCollideWorld.cuh STAY - they are null-gated compare-harness infrastructure
+   that hoops/dropshot debugging will need when assets arrive.
    Validation plan: chain GPU segment AFTER_PREDICT -> AFTER_SOLVE (collide phase
    already bit-exact feeds the solver in the same kernel run; compare body snaps at
    AFTER_SOLVE: vels + worldTransform [split impulse moves positions!] + the
