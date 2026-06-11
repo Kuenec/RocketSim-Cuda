@@ -215,32 +215,30 @@ __device__ __forceinline__ void CuUpdateWheelTransform(
 	(void)prevSuspensionLength;
 }
 
-// btVehicleRL::rayCast (btVehicleRL.cpp:120). Returns updated wheel scratch; needs the
-// solver timestep actually stored in solverInfo at this point (1/60 on the very first
-// tick before any solve, 1/120 after).
-__device__ __forceinline__ void CuWheelRayCast(
-	const CuBodyDyn& chassis, int selfDynIdx,
-	const GpuWheelConsts& wc, const GpuCarConsts& cc,
-	const GpuWorldGeo& geo, const GpuGridParams& grid,
-	const GpuDynBody* dyn, int numDyn,
-	const CuBodyDyn* dynBodies, // impulse views matching dyn[] indices
-	float solverTimeStep,
-	CuWheelScratch& w) {
+// Ray construction half of CuWheelRayCast (2026-06-11 split so the step kernel
+// can run the mesh tests across several lanes between Prep and Epilogue)
+__device__ __forceinline__ void CuWheelRayPrep(
+	const CuBodyDyn& chassis, const GpuWheelConsts& wc, const GpuCarConsts& cc,
+	CuWheelScratch& w, CuVec3& source, CuVec3& target) {
 
 	CuUpdateWheelTransformsWS(chassis, wc, cc, w);
 
 	float suspensionTravel = wc.maxSuspensionTravelCm / 100.0f;
 	float realRayLength = wc.suspensionRestLength + suspensionTravel + wc.wheelRadius - cc.suspensionSubtraction;
 
-	CuVec3 source = w.hardPointWS;
-	CuVec3 target = source + (w.wheelDirWS * realRayLength);
+	source = w.hardPointWS;
+	target = source + (w.wheelDirWS * realRayLength);
 	w.contactPointWS = target;
 	w.groundIdx = -2;
+}
 
-	// btDefaultVehicleRaycaster::castRay: ClosestRayResultCallback(ignore=chassis),
-	// group |= addedFilterMask, then the hasContactResponse acceptance rule
-	GpuRayHit hit;
-	CuRayTestWorld(geo, grid, dyn, numDyn, selfDynIdx, source, target, cc.rayCastGroup, CU_FILTER_ALL, hit);
+// Acceptance + suspension half of CuWheelRayCast, operating on the finished hit
+__device__ __forceinline__ void CuWheelRayEpilogue(
+	const CuBodyDyn& chassis, const GpuWheelConsts& wc, const GpuCarConsts& cc,
+	const GpuDynBody* dyn, float solverTimeStep,
+	CuVec3 source, CuVec3 target, const GpuRayHit& hit, CuWheelScratch& w) {
+
+	float suspensionTravel = wc.maxSuspensionTravelCm / 100.0f;
 
 	bool accepted = false;
 	CuVec3 hitNormal = { 0, 0, 0 };
@@ -261,8 +259,6 @@ __device__ __forceinline__ void CuWheelRayCast(
 
 	if (accepted) {
 		w.contactPointWS = hitPoint;
-		float depth = realRayLength * hit.fraction;
-		(void)depth;
 		w.contactNormalWS = hitNormal;
 		w.isInContact = 1;
 		w.isInContactWithWorld = (groundIdx == -1);
@@ -323,6 +319,29 @@ __device__ __forceinline__ void CuWheelRayCast(
 		w.clippedInvContactDotSuspension = 1.0f;
 		w.extraPushback = 0.0f;
 	}
+}
+
+// btVehicleRL::rayCast (btVehicleRL.cpp:120). Returns updated wheel scratch; needs the
+// solver timestep actually stored in solverInfo at this point (1/60 on the very first
+// tick before any solve, 1/120 after).
+__device__ __forceinline__ void CuWheelRayCast(
+	const CuBodyDyn& chassis, int selfDynIdx,
+	const GpuWheelConsts& wc, const GpuCarConsts& cc,
+	const GpuWorldGeo& geo, const GpuGridParams& grid,
+	const GpuDynBody* dyn, int numDyn,
+	const CuBodyDyn* dynBodies, // impulse views matching dyn[] indices
+	float solverTimeStep,
+	CuWheelScratch& w) {
+
+	CuVec3 source, target;
+	CuWheelRayPrep(chassis, wc, cc, w, source, target);
+
+	// btDefaultVehicleRaycaster::castRay: ClosestRayResultCallback(ignore=chassis),
+	// group |= addedFilterMask, then the hasContactResponse acceptance rule
+	GpuRayHit hit;
+	CuRayTestWorld(geo, grid, dyn, numDyn, selfDynIdx, source, target, cc.rayCastGroup, CU_FILTER_ALL, hit);
+
+	CuWheelRayEpilogue(chassis, wc, cc, dyn, solverTimeStep, source, target, hit, w);
 }
 
 // btVehicleRL::calcFrictionImpulses (btVehicleRL.cpp:306); reads PREVIOUS-tick wheel
@@ -726,6 +745,43 @@ __device__ __forceinline__ void CuCarPreTickWheel(
 	w.extraPushback = io.wheels[i].extraPushback; // persistent unless overwritten
 	CuWheelRayCast(io.body, selfDynIdx, cc.wheels[i], cc, geo, grid, dyn, numDyn,
 		dynBodies, io.solverTimeStep, w);
+	CuCalcFrictionImpulse(io.body, cc, io.wheels[i], dynBodies, w);
+}
+
+// Cooperative form of CuCarPreTickWheel for the step kernel (2026-06-11):
+// Pre (one thread per wheel) builds the transform and the suspension ray;
+// the kernel then runs CuRayTestStaticMeshes across several lanes per wheel
+// and lex-min-reduces (fraction, mesh index); Post (one thread per wheel)
+// finishes planes + dynamic bodies + suspension + friction. The composition
+// is computation-for-computation identical to CuCarPreTickWheel.
+__device__ __forceinline__ void CuCarPreTickWheelPre(
+	const CuCarTickIO& io, const GpuCarConsts& cc, int i, CuWheelScratch& w,
+	CuVec3& raySource, CuVec3& rayTarget) {
+
+	if (io.st.isDemoed)
+		return;
+
+	CuUpdateWheelTransform(io.body, cc.wheels[i], cc, io.wheels[i].steerAngle,
+		io.wheels[i].suspensionLength, w);
+	w.extraPushback = io.wheels[i].extraPushback; // persistent unless overwritten
+	CuWheelRayPrep(io.body, cc.wheels[i], cc, w, raySource, rayTarget);
+}
+
+__device__ __forceinline__ void CuCarPreTickWheelPost(
+	const CuCarTickIO& io, const GpuCarConsts& cc,
+	const GpuWorldGeo& geo, const GpuGridParams& grid,
+	const GpuDynBody* dyn, int numDyn, int selfDynIdx,
+	const CuBodyDyn* dynBodies, int i,
+	CuVec3 raySource, CuVec3 rayTarget, GpuRayHit& hit, CuWheelScratch& w) {
+
+	if (io.st.isDemoed)
+		return;
+
+	CuRayTestStaticPlanes(geo, raySource, rayTarget, cc.rayCastGroup, CU_FILTER_ALL, hit);
+	CuRayTestDynBodies(geo, grid, dyn, numDyn, selfDynIdx, raySource, rayTarget,
+		cc.rayCastGroup, CU_FILTER_ALL, hit);
+	CuWheelRayEpilogue(io.body, cc.wheels[i], cc, dyn, io.solverTimeStep,
+		raySource, rayTarget, hit, w);
 	CuCalcFrictionImpulse(io.body, cc, io.wheels[i], dynBodies, w);
 }
 

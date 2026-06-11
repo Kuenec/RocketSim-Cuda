@@ -246,19 +246,22 @@ __device__ inline void CuBvhWalkRay(const GpuBvhNode* nodes, int numNodes,
 	}
 }
 
-// Closest-hit ray test against the static world (meshes then planes, mirroring arena
-// setup order). cbGroup/cbMask = callback filters. Returns hit with fraction strictly
-// < 1 if anything was hit. Normal is world-space, NOT normalized (castRay normalizes).
-__device__ __forceinline__ void CuRayTestStatic(
+// Mesh part of the static ray test, callable with a lane/stride so several
+// threads can split the meshes of one ray (2026-06-11). Each call full-walks
+// meshes lane, lane+stride, ... and keeps its running best (bestFraction via
+// the strict < in CuRayTriangle; bestMesh = the mesh that set it). The
+// sequential code shares out.fraction across meshes only as pruning - it
+// cannot change the winner - so reducing per-lane bests by lex-min
+// (fraction, mesh index) reproduces the sequential result exactly,
+// including the first-visited-wins tie-break.
+__device__ inline void CuRayTestStaticMeshes(
 	const GpuWorldGeo& geo, CuVec3 from, CuVec3 to, int cbGroup, int cbMask,
-	GpuRayHit& out) {
-
-	out.fraction = 1.0f;
-	out.hitKind = -1;
+	int lane, int stride,
+	float& bestFraction, CuVec3& bestNormal, int& bestMesh) {
 
 	const CuMat3 ident = CuIdentity3();
 
-	for (int m = 0; m < geo.numMeshes; m++) {
+	for (int m = lane; m < geo.numMeshes; m += stride) {
 		const GpuMeshInfo& mi = geo.meshes[m];
 		if (!((mi.group & cbMask) && (cbGroup & mi.mask)))
 			continue;
@@ -277,16 +280,23 @@ __device__ __forceinline__ void CuRayTestStatic(
 			GV(mb.bvhAabbMin), GV(mb.bvhAabbMax), GV(mb.bvhQuantization),
 			fromL, toL, [&](int t) {
 				if (CuRayTriangle(fromL, toL, GV(tv[t * 3]), GV(tv[t * 3 + 1]), GV(tv[t * 3 + 2]),
-						out.fraction, localNormal))
+						bestFraction, localNormal))
 					hit = true;
 			});
 		if (hit) {
 			// reportHit: hitNormalWorld = basis * localNormal (canonicalizes -0)
-			out.normalWorld = CuMat3MulVec(ident, localNormal);
-			out.hitKind = 0;
+			bestNormal = CuMat3MulVec(ident, localNormal);
+			bestMesh = m;
 		}
 	}
+}
 
+// Plane part of the static ray test: strict < against the running best
+__device__ __forceinline__ void CuRayTestStaticPlanes(
+	const GpuWorldGeo& geo, CuVec3 from, CuVec3 to, int cbGroup, int cbMask,
+	GpuRayHit& out) {
+
+	const CuMat3 ident = CuIdentity3();
 	for (int p = 0; p < geo.numPlanes; p++) {
 		const GpuPlane& pl = geo.planes[p];
 		if (!((pl.group & cbMask) && (cbGroup & pl.mask)))
@@ -300,6 +310,26 @@ __device__ __forceinline__ void CuRayTestStatic(
 			out.hitKind = 0;
 		}
 	}
+}
+
+// Closest-hit ray test against the static world (meshes then planes, mirroring arena
+// setup order). cbGroup/cbMask = callback filters. Returns hit with fraction strictly
+// < 1 if anything was hit. Normal is world-space, NOT normalized (castRay normalizes).
+__device__ __forceinline__ void CuRayTestStatic(
+	const GpuWorldGeo& geo, CuVec3 from, CuVec3 to, int cbGroup, int cbMask,
+	GpuRayHit& out) {
+
+	out.fraction = 1.0f;
+	out.hitKind = -1;
+	int bestMesh = 0x7fffffff;
+	CuVec3 bestNormal = { 0, 0, 0 };
+	CuRayTestStaticMeshes(geo, from, to, cbGroup, cbMask, 0, 1,
+		out.fraction, bestNormal, bestMesh);
+	if (bestMesh != 0x7fffffff) {
+		out.normalWorld = bestNormal;
+		out.hitKind = 0;
+	}
+	CuRayTestStaticPlanes(geo, from, to, cbGroup, cbMask, out);
 }
 
 __device__ __forceinline__ CuMat3 GM(const GpuMat3& m) {
@@ -333,12 +363,26 @@ __device__ __forceinline__ void CuGetCellIndices(const GpuGridParams& g, CuVec3 
 // statics brute force (provably reference-equal: +-1-cell smear >= max short-ray
 // length), dynamics gated by the voxel cell rule for short rays. ignoreIdx excludes
 // a dynamic body (the vehicle's own chassis).
+__device__ __forceinline__ void CuRayTestDynBodies(
+	const GpuWorldGeo& geo, const GpuGridParams& grid,
+	const GpuDynBody* dyn, int numDyn, int ignoreIdx,
+	CuVec3 from, CuVec3 to, int cbGroup, int cbMask, GpuRayHit& out);
+
 __device__ __forceinline__ void CuRayTestWorld(
 	const GpuWorldGeo& geo, const GpuGridParams& grid,
 	const GpuDynBody* dyn, int numDyn, int ignoreIdx,
 	CuVec3 from, CuVec3 to, int cbGroup, int cbMask, GpuRayHit& out) {
 
 	CuRayTestStatic(geo, from, to, cbGroup, cbMask, out);
+	CuRayTestDynBodies(geo, grid, dyn, numDyn, ignoreIdx, from, to, cbGroup, cbMask, out);
+}
+
+// Dynamic-body tail of the world ray test: strict < against the running best,
+// bodies in dyn[] order (factored 2026-06-11 for the cooperative wheel phase)
+__device__ __forceinline__ void CuRayTestDynBodies(
+	const GpuWorldGeo& geo, const GpuGridParams& grid,
+	const GpuDynBody* dyn, int numDyn, int ignoreIdx,
+	CuVec3 from, CuVec3 to, int cbGroup, int cbMask, GpuRayHit& out) {
 
 	// btVector3::distance2(rayTo): (rayTo - rayFrom).length2()
 	CuVec3 rayD = to - from;

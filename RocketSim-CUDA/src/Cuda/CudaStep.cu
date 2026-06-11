@@ -794,6 +794,11 @@ __global__ void GpuStepArenasKernel(
 			__shared__ CuBodyDyn sDynBodies[8];
 			__shared__ CuWheelScratch sW[4];
 			__shared__ int sSkipCar;
+			// per-wheel suspension-ray staging for the 8-lane mesh test
+			__shared__ CuVec3 sRaySrc[4], sRayTgt[4];
+			__shared__ float sRayFrac[4][8];
+			__shared__ int sRayMesh[4][8];
+			__shared__ CuVec3 sRayNrm[4][8];
 
 			if (bodyIdx == 0) {
 				// Arena::Step head: ball zero-vel sleeping
@@ -873,10 +878,50 @@ __global__ void GpuStepArenasKernel(
 				}
 				__syncthreads();
 				if (!sSkipCar) {
-					// the four independent wheel computations, one per thread
+					// Wheel phase, 8 lanes per wheel (block is always 32 threads):
+					// lane 0 of each wheel builds the suspension ray, all 8 lanes
+					// split the static meshes, then lane 0 lex-min-reduces
+					// (fraction, mesh index) - identical to the sequential
+					// strict-< / first-visited tie-break - and finishes planes,
+					// dynamic bodies, suspension and friction.
+					const int wheelIdx = bodyIdx >> 3;
+					const int rayLane = bodyIdx & 7;
 					if (bodyIdx < 4)
-						CuCarPreTickWheel(sIo, *ca.carConsts, geo, ca.grid, sDyn,
-							bodiesPerArena, 1 + ci, sDynBodies, bodyIdx, sW[bodyIdx]);
+						CuCarPreTickWheelPre(sIo, *ca.carConsts, bodyIdx, sW[bodyIdx],
+							sRaySrc[bodyIdx], sRayTgt[bodyIdx]);
+					__syncthreads();
+					{
+						float bf = 1.0f;
+						int bm = 0x7fffffff;
+						CuVec3 bn = { 0, 0, 0 };
+						CuRayTestStaticMeshes(geo, sRaySrc[wheelIdx], sRayTgt[wheelIdx],
+							ca.carConsts->rayCastGroup, CU_FILTER_ALL, rayLane, 8, bf, bn, bm);
+						sRayFrac[wheelIdx][rayLane] = bf;
+						sRayMesh[wheelIdx][rayLane] = bm;
+						sRayNrm[wheelIdx][rayLane] = bn;
+					}
+					__syncthreads();
+					if (bodyIdx < 4) {
+						GpuRayHit hit;
+						hit.fraction = 1.0f;
+						hit.hitKind = -1;
+						hit.normalWorld = { 0, 0, 0 };
+						int bestMesh = 0x7fffffff;
+						for (int l = 0; l < 8; l++) {
+							float f = sRayFrac[bodyIdx][l];
+							int m = sRayMesh[bodyIdx][l];
+							if (f < hit.fraction || (f == hit.fraction && m < bestMesh)) {
+								hit.fraction = f;
+								bestMesh = m;
+								hit.normalWorld = sRayNrm[bodyIdx][l];
+							}
+						}
+						if (bestMesh != 0x7fffffff)
+							hit.hitKind = 0;
+						CuCarPreTickWheelPost(sIo, *ca.carConsts, geo, ca.grid, sDyn,
+							bodiesPerArena, 1 + ci, sDynBodies, bodyIdx,
+							sRaySrc[bodyIdx], sRayTgt[bodyIdx], hit, sW[bodyIdx]);
+					}
 					__syncthreads();
 					if (bodyIdx == 0) {
 						float dbgFwd;
