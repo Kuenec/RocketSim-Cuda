@@ -935,24 +935,47 @@ verified in source 2026-06-10):**
           --demo-mode on-contact -> 3415898148067774285  (puck + demolitions)
       Ray-fuzz 200k PASS with the hull ball (--game-mode snowday) AND soccar 200k
       re-PASS. All 12 prior gates (soccar/heatseeker/demo, CPU+GPU) re-PASS.
-   4. HOOPS (#16): **BLOCKED ON ASSETS (verified 2026-06-10).** Hoops needs 12
-      unique .cmf collision meshes (known-hash set in src/RocketSim.cpp MeshHashSet:
-      0x72F2359E, 0x5ED14A26, 0xFD5A0D07, 0x92AFA5B5, 0x0E4133C7, 0x399E8B5F,
-      0xBB9D4FB5, 0x8C87FB93, 0x1CFD0E16, 0xE19E1DF6, 0x9CA179DC, 0x16F3CC19),
-      dumped from the game, placed in collision_meshes/hoops/. The repo has ONLY
-      collision_meshes/soccar. Arena::Create(HOOPS) FATALLY ERRORS without them
-      ("No arena meshes found for gamemode hoops") -> NO CPU reference exists ->
-      no gates possible -> porting now would be unvalidatable speculative code.
-      USER MUST PROVIDE the mesh dumps. Remaining port work once unblocked:
-      arena setup (HOOPS_NET filter statics), ball launch delay (shared
-      _PreTickUpdate branch with dropshot: launch impulse at BALL_HOOPS_LAUNCH_DELAY
-      when ball frozen at kickoff), hoops _OnHit zScale branch, hoops mutator
-      consts, gates. Bench --game-mode hoops flag already parses.
-   5. DROPSHOT (#17): **ALSO BLOCKED ON ASSETS (verified): Arena::Create(DROPSHOT)
-      fatally errors without collision_meshes/dropshot/ meshes** (no known-hash
-      set published in MeshHashSet - any dropshot dump is accepted with a warning).
-      Once unblocked: tile system (per-tile damage state changes collision ->
-      device static world becomes stateful), ball charge, launch delay. Largest.
+   4. HOOPS (#16, COMPLETE - all gates PASS bit-exact):
+      ASSETS RESOLVED (2026-06-10): user supplied maps.zip with embedded-byte-array
+      headers (maps/{soccar,hoops,dropshot,throwback}.h + generate_maps.py, raw
+      .cmf bytes + MeshSpan offsets). Converted hoops (12) + dropshot (2) back to
+      .cmf in collision_meshes/{hoops,dropshot}/. PROOF: the soccar header's 16
+      meshes are byte-identical (sha256) to the existing trusted soccar files, and
+      all 12 hoops files hash-match the known MeshHashSet in src/RocketSim.cpp
+      (CollisionMeshFile::UpdateHash replicated in python: float->uint32 truncate,
+      2x mueller mix, shift-xor accumulate). collision_meshes/soccar was NOT
+      touched (directory_iterator order feeds creation order -> gates).
+      PORT (small - statics machinery was already generic): hoops arena = 12
+      meshes (505-vert net detected, HOOPS_NET group/mask - flows through generic
+      static extraction) + 6 planes (incl. Y walls); hoops pads use the same
+      BoostPadGrid (generic extraction); CAR_RESPAWN_LOCATIONS_HOOPS already
+      mode-dispatched. New device code: CuBallPreTickLaunch (CudaGameTail -
+      Ball::_PreTickUpdate hoops/dropshot kickoff launch: tickCountSinceUpdate*dt
+      crossing the delay, frozen-ball check [vel/angVel zero + pos.To2D zero in
+      UU], applyCentralImpulse((0,0,L)*mass*UU_TO_BT) * linearFactor * invMass,
+      GUARDED setActivationState(ACTIVE_TAG)); hoops _OnHit zScale branch in the
+      callback (isOnGround && CACHED rotMat.up.z [= rotMat.row[2].z, RotMat is
+      column-major] > thresh -> Z_SCALE_HOOPS_GROUND). GpuCollideConsts +=
+      ballLaunchDelay/ballLaunchZVel/ballMassBT/hoopsZScaleGround/hoopsZScaleThresh.
+      BENCH COVERAGE: random-control cars essentially NEVER reach a center-resting
+      ball (soccar/snowday configs: 0 hits; heatseeker hits come from the moving
+      ball). SetupArena hoops: per-arena coin (spawnRng) - half the arenas keep
+      the frozen kickoff (launch coverage), half get a seed-derived live ball
+      (pos.z=400, vel=1300@angle + 600z) -> 7-10 car-ball hits per 32x6x2000 run
+      (zScale branch + net/wall contacts exercised).
+      HOOPS GATES (work-bench CPU = reference, GPU PASS):
+        --game-mode hoops --ticks 20000 --arenas 1 --cars 2 --seed 1337
+          -> 14674870656341860422
+        --game-mode hoops --ticks 2000 --arenas 32 --cars 6 --seed 4242
+          -> 14326563309044877142
+        --game-mode hoops --ticks 3000 --arenas 8 --cars 6 --seed 99
+          --demo-mode on-contact -> 6767940556749896631
+      Hoops ray-fuzz 200k PASS (new meshes + net BVHs). All 18 prior gates re-PASS.
+   5. DROPSHOT (#17, UNBLOCKED - meshes converted, NOT yet ported): tile system
+      (per-tile damage state changes collision -> device static world becomes
+      stateful), ball charge mechanics, launch delay (CuBallPreTickLaunch already
+      handles the dropshot consts), dropshot floor/tile collision masks
+      (DROPSHOT_FLOOR/DROPSHOT_TILE), BALL_COLLISION_RADIUS_DROPSHOT. Largest.
    THROUGHPUT: GOAL MET (2026-06-10 re-measure): GPU 668k SPS @128 arenas / 1.12M
    @256 / 1.08M @512 / 1.19M @1024 (1000 ticks, 2 cars, soccar) vs CPU 58.3k
    single-thread = 11-20x. The old "10.6k SPS" figure was stale. 1024-arena

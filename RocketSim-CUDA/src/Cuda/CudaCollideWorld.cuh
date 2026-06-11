@@ -415,8 +415,13 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 				float relSpeed = relLen < in.cc.ballCarExtraMaxDeltaVelUU
 					? relLen : in.cc.ballCarExtraMaxDeltaVelUU; // RS_MIN
 				if (relSpeed > 0) {
-					// soccar: no hoops zScale branch
-					float zScale = in.cc.ballCarExtraZScale;
+					// hoops: grounded upright cars use the boosted zScale (reads the
+					// CACHED rotMat, like the CPU's carState.rotMat.up.z)
+					bool extraZScale = in.cc.gameMode == CU_GAMEMODE_HOOPS &&
+						car.isOnGround &&
+						car.rotMat.row[2].z > in.cc.hoopsZScaleThresh;
+					float zScale = extraZScale ? in.cc.hoopsZScaleGround
+						: in.cc.ballCarExtraZScale;
 					CuVec3 scaled = { relPos.x * 1.0f, relPos.y * 1.0f, relPos.z * zScale };
 					CuVec3 hitDir = CuVecNormalizedRS(scaled);
 					float dotF = hitDir.x * carForward.x + hitDir.y * carForward.y + hitDir.z * carForward.z;

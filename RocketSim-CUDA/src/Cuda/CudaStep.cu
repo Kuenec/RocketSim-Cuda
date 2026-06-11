@@ -804,11 +804,15 @@ __global__ void GpuStepArenasKernel(
 				for (int p = 0; p < numPads; p++)
 					CuPadPreTick(arenaPads[p], dt);
 				// Ball::_PreTickUpdate (heatseeker steering / snowday ground-stick
-				// reset; no-op in soccar)
+				// reset / hoops+dropshot kickoff launch; no-op in soccar)
 				if (ca.consts->gameMode == CU_GAMEMODE_HEATSEEKER)
 					CuBallPreTickHS(arenaBodies[0], ca.ballStates[arenaIdx], *ca.consts, dt);
 				else if (ca.consts->gameMode == CU_GAMEMODE_SNOWDAY)
 					ca.ballStates[arenaIdx].groundStickApplied = 0;
+				else if (ca.consts->gameMode == CU_GAMEMODE_HOOPS ||
+					ca.consts->gameMode == CU_GAMEMODE_DROPSHOT)
+					CuBallPreTickLaunch(arenaBodies[0], ca.ballStates[arenaIdx],
+						*ca.consts, consts[0], dt);
 				// stepSimulation head: applyGravity (active bodies)
 				for (int d = 0; d < bodiesPerArena; d++)
 					CuApplyGravity(arenaBodies[d], consts[d]);

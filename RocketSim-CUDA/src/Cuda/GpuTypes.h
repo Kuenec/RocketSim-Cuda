@@ -397,6 +397,13 @@ struct GpuCollideConsts {
 	float ballHullMargin;              // m_collisionMargin (CONVEX_DISTANCE_MARGIN)
 	GpuVec3 ballHullLocalAabbMin, ballHullLocalAabbMax; // cached local aabb
 	float puckGroundStickForce;        // Snowday::PUCK_GROUND_STICK_FORCE
+	// hoops/dropshot kickoff ball launch (Ball::_PreTickUpdate)
+	float ballLaunchDelay;             // BALL_HOOPS_LAUNCH_DELAY / Dropshot::BALL_LAUNCH_DELAY
+	float ballLaunchZVel;              // BALL_HOOPS_LAUNCH_Z_VEL / Dropshot::BALL_LAUNCH_Z_VEL
+	float ballMassBT;                  // rb.getMass() (launch impulse factor)
+	// hoops _OnHit extra-impulse zScale branch
+	float hoopsZScaleGround;           // BALL_CAR_EXTRA_IMPULSE_Z_SCALE_HOOPS_GROUND
+	float hoopsZScaleThresh;           // ..._HOOPS_NORMAL_Z_THRESH
 	GpuVec3 carBoxHalfExtNoMargin;
 	float carBoxMargin;
 	GpuVec3 carChildOffset;            // compound child transform origin (basis = I)

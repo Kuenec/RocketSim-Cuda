@@ -305,6 +305,18 @@ static Arena* SetupArena(const Args& args, int arenaIdxIn, std::vector<CarSlot>&
 		BallState bs = BallState();
 		bs.vel.z = FLT_EPSILON;
 		arena->ball->SetState(bs);
+	} else if (args.gameMode == GameMode::HOOPS) {
+		// Per-arena coin: half the arenas keep the frozen kickoff state (covers the
+		// launch-delay impulse), half get a seed-derived live ball (covers car-ball
+		// hits incl. the hoops zScale branch, net mesh and wall plane contacts -
+		// random-control cars essentially never reach a center-resting ball)
+		if (spawnRng.Next() & 1) {
+			BallState bs = BallState();
+			float ang = spawnRng.NextSigned() * (float)M_PI;
+			bs.pos.z = 400.0f;
+			bs.vel = Vec(cosf(ang) * 1300.0f, sinf(ang) * 1300.0f, 600.0f);
+			arena->ball->SetState(bs);
+		}
 	}
 	// Soccar: ball stays at its deterministic default rest state (center, BALL_REST_Z)
 	return arena;
@@ -793,6 +805,13 @@ static void ExtractCollideData(Arena* arena, const std::vector<CarSlot>& slots,
 		cc.ballHullLocalAabbMax = ToGpuB(lmx);
 	}
 	cc.puckGroundStickForce = Snowday::PUCK_GROUND_STICK_FORCE;
+	cc.ballLaunchDelay = (arena->gameMode == GameMode::DROPSHOT)
+		? Dropshot::BALL_LAUNCH_DELAY : BALL_HOOPS_LAUNCH_DELAY;
+	cc.ballLaunchZVel = (arena->gameMode == GameMode::DROPSHOT)
+		? Dropshot::BALL_LAUNCH_Z_VEL : BALL_HOOPS_LAUNCH_Z_VEL;
+	cc.ballMassBT = arena->ball->GetMass();
+	cc.hoopsZScaleGround = BALL_CAR_EXTRA_IMPULSE_Z_SCALE_HOOPS_GROUND;
+	cc.hoopsZScaleThresh = BALL_CAR_EXTRA_IMPULSE_Z_SCALE_HOOPS_NORMAL_Z_THRESH;
 	const btBoxShape& box = car->_childHitboxShape;
 	cc.carBoxHalfExtNoMargin = ToGpuB(box.getHalfExtentsWithoutMargin());
 	cc.carBoxMargin = box.getMargin();

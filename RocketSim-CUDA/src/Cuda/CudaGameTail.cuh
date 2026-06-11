@@ -110,6 +110,33 @@ __device__ __forceinline__ void CuBallFinish(GpuBodyState& b, GpuBallGameState& 
 	st.tickCountSinceUpdate++;
 }
 
+// Ball::_PreTickUpdate hoops/dropshot branch: launch the kickoff-frozen ball with an
+// upward impulse once tickCountSinceUpdate crosses the launch delay
+__device__ __forceinline__ void CuBallPreTickLaunch(GpuBodyState& b, GpuBallGameState& st,
+	const GpuCollideConsts& cc, const GpuBodyConsts& bc, float tickTime) {
+	float curKickoffTime = (float)st.tickCountSinceUpdate * tickTime;
+	float prevKickoffTime = curKickoffTime - tickTime;
+	if (prevKickoffTime < cc.ballLaunchDelay && curKickoffTime >= cc.ballLaunchDelay) {
+		// GetState(): vel/pos in UU, angVel raw
+		CuVec3 velUU = GV(b.linVel) * CU_BT_TO_UU;
+		CuVec3 angVel = GV(b.angVel);
+		CuVec3 posUU = GV(b.pos) * CU_BT_TO_UU;
+		if (velUU.x == 0.0f && velUU.y == 0.0f && velUU.z == 0.0f &&
+			angVel.x == 0.0f && angVel.y == 0.0f && angVel.z == 0.0f &&
+			posUU.x == 0.0f && posUU.y == 0.0f) {
+			// applyCentralImpulse(Vec(0,0,launchVelZ) * GetMass() * UU_TO_BT):
+			// m_linearVelocity += impulse * m_linearFactor(1,1,1) * m_inverseMass
+			float impZ = (cc.ballLaunchZVel * cc.ballMassBT) * CU_UU_TO_BT;
+			CuVec3 v = GV(b.linVel);
+			v.x = v.x + (0.0f * 1.0f) * bc.invMass;
+			v.y = v.y + (0.0f * 1.0f) * bc.invMass;
+			v.z = v.z + (impZ * 1.0f) * bc.invMass;
+			b.linVel = { v.x, v.y, v.z };
+			CuSetActivationState(b.activationState, CU_ACTIVE_TAG);
+		}
+	}
+}
+
 // ---- demolition respawn (Car::Respawn + Car::SetState) -----------------------------
 
 // libstdc++ std::default_random_engine = minstd_rand0: x = x * 16807 % 2147483647
