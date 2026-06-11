@@ -63,6 +63,7 @@ struct GpuBatch {
 	int numPads;        // per arena
 	int bodiesPerArena; // 1 ball + numCars
 	unsigned long long* dProfCycles = nullptr; // [GPU_PHASE_COUNT], diagnostic
+	int* dArenaList = nullptr; // [numArenas], subset-step index list (lazy alloc)
 
 	GpuBodyState* dBodies;      // [numArenas * bodiesPerArena]
 	GpuBodyConsts* dConsts;     // [bodiesPerArena]
@@ -719,6 +720,10 @@ struct GpuCollideKernelArgs {
 	// 2026-06-11: diagnostic - non-null enables per-phase clock64 accumulation
 	// ([GPU_PHASE_COUNT] device counters, summed over blocks). See --phase-prof.
 	unsigned long long* profCycles;
+	// 2026-06-11: non-null = step only these arena indices (grid = list length).
+	// Arenas are independent, so a subset step is bit-identical to its slice of
+	// a full step. Used to re-step reset arenas after an async chunk launch.
+	const int* arenaList;
 };
 
 __device__ static void StoreVec(GpuVec3& dst, CuVec3 v) { dst = { v.x, v.y, v.z }; }
@@ -766,7 +771,7 @@ __global__ void GpuStepArenasKernel(
 	int startPhase, int endPhase, float dt,
 	GpuWorldGeo geo, GpuCollideKernelArgs ca) {
 
-	const int arenaIdx = blockIdx.x;
+	const int arenaIdx = ca.arenaList ? ca.arenaList[blockIdx.x] : blockIdx.x;
 	const int bodiesPerArena = 1 + numCars;
 	const int bodyIdx = threadIdx.x;
 
@@ -1126,7 +1131,9 @@ __global__ void GpuStepArenasKernel(
 			atomicAdd(&ca.profCycles[p], profAcc[p]);
 }
 
-static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
+static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase,
+	bool sync = true, const int* dArenaList = nullptr, int listCount = 0,
+	long long tickBaseOverride = -1) {
 	constexpr float TICK_TIME = 1.0f / 120.0f;
 	int threads = b->bodiesPerArena > 32 ? 64 : 32;
 	GpuCollideKernelArgs ca = {};
@@ -1166,18 +1173,54 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase) {
 		ca.numTiles = b->numTiles;
 		ca.constControls = b->dConstControls;
 		ca.profCycles = b->dProfCycles;
+		ca.arenaList = dArenaList;
+		if (tickBaseOverride >= 0)
+			ca.tickBase = (uint64_t)tickBaseOverride;
 	}
-	GpuStepArenasKernel<<<b->numArenas, threads>>>(
+	int grid = dArenaList ? listCount : b->numArenas;
+	GpuStepArenasKernel<<<grid, threads>>>(
 		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule, b->scheduleTicks,
 		b->numCars, b->numPads, numTicks, startPhase, endPhase, TICK_TIME,
 		b->geo, ca);
 	CudaCheck(cudaGetLastError(), "kernel launch");
-	CudaCheck(cudaDeviceSynchronize(), "kernel run");
+	if (sync)
+		CudaCheck(cudaDeviceSynchronize(), "kernel run");
 }
 
 void StepTicks(GpuBatch* b, int numTicks) {
 	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1);
 	b->tickCount += numTicks;
+}
+
+// 2026-06-11 async stepping: launch without the device sync so the chunk can
+// overlap CPU work; SyncBatch() completes it. StepTicksSubset re-steps ONLY the
+// listed arenas over the same tick window (explicit tickBase) - used when a
+// reset invalidates an arena's async chunk; bit-identical to its slice of a
+// full chunk because arenas are independent.
+void StepTicksAsync(GpuBatch* b, int numTicks) {
+	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1, /*sync=*/false);
+	b->tickCount += numTicks;
+}
+
+unsigned long long BatchTickCount(GpuBatch* b) {
+	return (unsigned long long)b->tickCount;
+}
+
+void SyncBatch(GpuBatch* b) {
+	CudaCheck(cudaDeviceSynchronize(), "async kernel run");
+}
+
+void StepTicksSubset(GpuBatch* b, int numTicks, const int* arenaIdxs, int count,
+	unsigned long long tickBase) {
+	if (count <= 0)
+		return;
+	if (!b->dArenaList)
+		CudaCheck(cudaMalloc(&b->dArenaList, sizeof(int) * b->numArenas), "list alloc");
+	CudaCheck(cudaMemcpy(b->dArenaList, arenaIdxs, sizeof(int) * count,
+		cudaMemcpyHostToDevice), "list up");
+	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1, /*sync=*/true,
+		b->dArenaList, count, (long long)tickBase);
+	// tickCount not advanced: this re-covers a window already counted
 }
 
 // 2026-06-11: per-phase cycle profiling (diagnostic; ~zero cost while disabled)

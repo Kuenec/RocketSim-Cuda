@@ -141,6 +141,15 @@ void UploadControlSchedule(GpuBatch* batch, const GpuCarControls* schedule, int 
 // chunked stepping (RL decision steps) keeps absolute tick semantics.
 void StepTicks(GpuBatch* batch, int numTicks);
 
+// 2026-06-11 async stepping (see CudaStep.cu): launch-without-sync + completion,
+// and an arena-subset re-step over an explicit tick window (for arenas whose
+// async chunk was invalidated by a CPU-side reset).
+void StepTicksAsync(GpuBatch* batch, int numTicks);
+unsigned long long BatchTickCount(GpuBatch* batch);
+void SyncBatch(GpuBatch* batch);
+void StepTicksSubset(GpuBatch* batch, int numTicks, const int* arenaIdxs, int count,
+	unsigned long long tickBase);
+
 // 2026-06-11: diagnostic per-phase cycle counters (see GpuPhase). Enable before
 // stepping; Get downloads the totals (sum of per-block cycles per phase).
 void EnablePhaseProfiling(GpuBatch* batch);

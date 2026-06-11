@@ -33,6 +33,12 @@ public:
 	// Gather car->controls from the arenas, hold them constant, simulate numTicks
 	void Step(int numTicks);
 
+	// Async form (kernel overlaps CPU work until Sync) + an arena-subset re-step
+	// over the same window for reset arenas (see GpuArenaBridge.cpp)
+	void StepAsync(int numTicks);
+	void Sync();
+	void StepSubset(const int* slots, int count, int numTicks);
+
 	// Batched download + write results back into the CPU arenas (bodies, car
 	// states incl. wheels and rotMat, ball, pads, tickCount advance).
 	// Equivalent to Download() + WritebackArena(all) + FinishWriteback().
@@ -70,7 +76,8 @@ private:
 	GpuBatch* batch = nullptr;
 	int numCars = 0;
 	int numPads = 0;
-	int pendingTicks = 0; // simulated since the last Writeback
+	int pendingTicks = 0;  // downloaded-or-complete ticks since the last Writeback
+	int inFlightTicks = 0; // async-launched ticks not yet Sync()ed
 	std::vector<GpuBodyState> bodiesScratch;
 	std::vector<GpuCarGameState> curCars, prevCars;
 	std::vector<GpuPadState> padsScratch;

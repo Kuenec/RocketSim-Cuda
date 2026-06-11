@@ -934,6 +934,41 @@ void GpuArenaBatch::Step(int numTicks) {
 	pendingTicks += numTicks;
 }
 
+// 2026-06-11 async chunk: identical to Step() but returns with the kernel still
+// running so it can overlap CPU work; Sync() completes it. StepSubset re-covers
+// the last numTicks window for the listed arena slots only (after a CPU-side
+// reset invalidated their async results): controls are re-gathered first - for
+// non-reset arenas they are unchanged since the launch, for reset arenas this
+// picks up the post-reset values, exactly like a synchronous chunk would.
+void GpuArenaBatch::StepAsync(int numTicks) {
+	for (int a = 0; a < (int)arenas.size(); a++)
+		for (int c = 0; c < numCars; c++)
+			controlsScratch[(size_t)a * numCars + c] = ToGpu(carLists[a][c]->controls);
+	UploadConstantControls(batch, controlsScratch.data());
+	StepTicksAsync(batch, numTicks);
+	// NOT added to pendingTicks yet: pendingTicks drives arena->tickCount at
+	// writeback time, and a mid-window ScatterArena (reset path) re-applies the
+	// last DOWNLOADED state - ticks still in flight must not advance the clock
+	inFlightTicks += numTicks;
+}
+
+void GpuArenaBatch::Sync() {
+	SyncBatch(batch);
+	pendingTicks += inFlightTicks;
+	inFlightTicks = 0;
+}
+
+void GpuArenaBatch::StepSubset(const int* slots, int count, int numTicks) {
+	if (count <= 0)
+		return;
+	for (int a = 0; a < (int)arenas.size(); a++)
+		for (int c = 0; c < numCars; c++)
+			controlsScratch[(size_t)a * numCars + c] = ToGpu(carLists[a][c]->controls);
+	UploadConstantControls(batch, controlsScratch.data());
+	StepTicksSubset(batch, numTicks, slots, count,
+		BatchTickCount(batch) - (unsigned long long)numTicks);
+}
+
 // BallState game fields from the device ball state (shared by the full Arena
 // writeback and the GPU-direct GameState fill)
 static void FillBallStateFields(BallState& st, const rscuda::GpuBallGameState& bs) {
