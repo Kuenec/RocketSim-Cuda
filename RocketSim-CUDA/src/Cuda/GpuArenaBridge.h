@@ -39,6 +39,22 @@ public:
 	void Sync();
 	void StepSubset(const int* slots, int count, int numTicks);
 
+	// 2026-09-02 asynchronous reset re-upload + subset re-step: queued on the
+	// batch stream behind the in-flight chunk from pinned staging, so the small
+	// subset kernel runs beside the trainer's inference instead of idling the
+	// GPU at Sync time. Staging slots are per arena; call Sync before the next
+	// reset touches the same slots.
+	void UploadArenaAsync(int idx);
+	void StepSubsetAsync(const int* slots, int count, int numTicks);
+
+	// 2026-09-02: this step's second-half chunk, the state download and the
+	// NEXT step's first-half chunk enqueued back-to-back on the batch stream
+	// (both chunks run under the controls gathered here); the host waits only
+	// for the download, so the writeback overlaps the in-flight chunk instead
+	// of the GPU idling through the copy and the scatter. Bookkeeping matches
+	// Step(numTicks) + Download() + StepAsync(nextTicks).
+	void StepDownloadAndLaunch(int numTicks, int nextTicks);
+
 	// Batched download + write results back into the CPU arenas (bodies, car
 	// states incl. wheels and rotMat, ball, pads, tickCount advance).
 	// Equivalent to Download() + WritebackArena(all) + FinishWriteback().
@@ -70,6 +86,10 @@ public:
 	int NumArenas() const { return (int)arenas.size(); }
 	int NumCars() const { return numCars; }
 
+	// Diagnostic passthroughs to the kernel's per-phase cycle counters
+	void EnablePhaseProfiling();
+	void GetPhaseCycles(unsigned long long out[rscuda::GPU_PHASE_PROF_SLOTS]);
+
 private:
 	std::vector<RocketSim::Arena*> arenas;
 	std::vector<std::vector<RocketSim::Car*>> carLists; // _cars order per arena
@@ -83,6 +103,18 @@ private:
 	std::vector<GpuPadState> padsScratch;
 	std::vector<GpuBallGameState> ballsScratch;
 	std::vector<GpuCarControls> controlsScratch;
+
+	// pinned staging for the asynchronous reset path (cudaHostAlloc)
+	GpuBodyState* stageBodies = nullptr;    // [numArenas * (1 + numCars)]
+	GpuCarGameState* stageCars = nullptr;   // [numArenas * numCars]
+	GpuPadState* stagePads = nullptr;       // [numArenas * numPads]
+	GpuBallGameState* stageBalls = nullptr; // [numArenas]
+	GpuCarControls* stageControls = nullptr;// [numArenas * numCars]
+	int* stageSlots = nullptr;              // [numArenas]
+
+	void SnapshotArena(int idx, GpuBodyState* bodies, GpuCarGameState* cars,
+		GpuPadState* pads, GpuBallGameState& ball) const;
+	void GatherControls(GpuCarControls* out) const;
 };
 
 } // namespace rscuda

@@ -93,6 +93,9 @@ struct CuCollideIn {
 	int* numPairsOut;
 	// diagnostic channel: [0]=numPairs, then (h0,h1) per pair (h < numStatics: static)
 	int* debug;                      // capacity 2*CU_MAX_PAIRS+1
+#ifdef RS_GPU_PHASE_PROF
+	unsigned long long* prof; // [5]: aabbs, pairs, narrowphase cycles, pair count, manifold count
+#endif
 };
 
 // btAabbUtil2 TestAabbAgainstAabb2 (x, then z, then y)
@@ -187,8 +190,14 @@ __device__ __forceinline__ void CuBoxAabbAt(CuVec3 heNoMargin, float margin,
 }
 
 // ---- updateAabbs + btRSBroadphase::setAabb (dyn bodies only; statics no-op) ----
-__device__ inline void CuCollideUpdateAabbs(const CuCollideIn& in) {
-	for (int d = 0; d < in.numBodies; d++) {
+// One body's aabb refresh (btCollisionWorld::updateSingleAabb + the RS
+// broadphase cell move). Every field except regSeq is written here; regSeq
+// is the arena-wide registration counter incremented in body order, so the
+// caller assigns it: sequentially (CuCollideUpdateAabbs) or by rank among the
+// moved bodies (the step kernel, one lane per body - the same sequence).
+// Returns whether the body changed cell (needs a new regSeq).
+__device__ inline bool CuCollideUpdateAabbBody(const CuCollideIn& in, int d) {
+	{
 		const GpuBodyState& s = in.bodies[d];
 		CuMat3 basis = CuLoadBasis(s.basis);
 		CuVec3 pos = GV(s.pos);
@@ -220,7 +229,7 @@ __device__ inline void CuCollideUpdateAabbs(const CuCollideIn& in) {
 		bool changed = omn.x != mn.x || omn.y != mn.y || omn.z != mn.z ||
 		               omx.x != mx.x || omx.y != mx.y || omx.z != mx.z;
 		if (!changed)
-			continue;
+			return false;
 		p.aabbMin = { mn.x, mn.y, mn.z };
 		p.aabbMax = { mx.x, mx.y, mx.z };
 		int oldCell = p.cellIdx;
@@ -232,9 +241,16 @@ __device__ inline void CuCollideUpdateAabbs(const CuCollideIn& in) {
 			p.i = ni;
 			p.j = nj;
 			p.k = nk;
-			p.regSeq = ++(*in.regCounter);
+			return true;
 		}
+		return false;
 	}
+}
+
+__device__ inline void CuCollideUpdateAabbs(const CuCollideIn& in) {
+	for (int d = 0; d < in.numBodies; d++)
+		if (CuCollideUpdateAabbBody(in, d))
+			in.proxies[d].regSeq = ++(*in.regCounter);
 }
 
 // ---- btRSBroadphase::calculateOverlappingPairs ----
@@ -247,9 +263,46 @@ __device__ __forceinline__ void CuDynFilter(const CuCollideIn& in, int slot, int
 	else { g = in.cc.carFilterGroup; m = in.cc.carFilterMask; }
 }
 
-__device__ inline int CuCollideGenPairs(const CuCollideIn& in, int2* pairs) {
+// Body d's static-pair candidates in CSR (CPU smear insertion) order:
+// out[0] = count, out[1..count] = static indices. Independent per body, so
+// the step kernel runs one lane per body; the merge below consumes them in
+// body order. A body with more than CU_STATIC_CAND_MAX candidates writes
+// count = -1 and the merge falls back to the serial scan (exact, just slower).
+#define CU_STATIC_CAND_MAX 31
+__device__ inline void CuCollideStaticCandidates(const CuCollideIn& in, int d, int* out) {
+	const GpuDynProxy& p = in.proxies[d];
+	CuVec3 pmin = GV(p.aabbMin), pmax = GV(p.aabbMax);
+	int dg, dm;
+	CuDynFilter(in, d, dg, dm);
+	int n = 0;
+	for (int it = in.cellStaticStart[p.cellIdx]; it < in.cellStaticStart[p.cellIdx + 1]; it++) {
+		int s = in.cellStaticList[it];
+		const GpuStaticObj& so = in.statics[s];
+		if (!CuTestAabb2(pmin, pmax, GV(so.aabbMin), GV(so.aabbMax)))
+			continue;
+		if (!CuNeedsBroadphase(dg, dm, so.group, so.mask))
+			continue;
+		if (n == CU_STATIC_CAND_MAX) {
+			n = -1;
+			break;
+		}
+		out[1 + n++] = s;
+	}
+	out[0] = n;
+}
+
+// staticCand: per-body candidate lists from CuCollideStaticCandidates
+// ([numBodies][1 + CU_STATIC_CAND_MAX]) or null for the fully serial scan.
+// Both produce the same pair list: statics of body d in CSR order, then its
+// dyn pairs with the findPair dedup, body by body, capped at CU_MAX_PAIRS.
+__device__ inline int CuCollideGenPairs(const CuCollideIn& in, int2* pairs,
+	const int* staticCand = nullptr) {
 	int numPairs = 0;
 	const int cellsYZ = in.grid.cellsY * in.grid.cellsZ;
+	if (staticCand)
+		for (int d = 0; d < in.numBodies; d++)
+			if (staticCand[d * (1 + CU_STATIC_CAND_MAX)] < 0)
+				staticCand = nullptr; // overflow: exact serial path
 	for (int d = 0; d < in.numBodies; d++) {
 		const GpuDynProxy& p = in.proxies[d];
 		CuVec3 pmin = GV(p.aabbMin), pmax = GV(p.aabbMax);
@@ -270,17 +323,24 @@ __device__ inline int CuCollideGenPairs(const CuCollideIn& in, int2* pairs) {
 		}
 
 		// statics of the aabbMin cell (CSR list order = CPU smear insertion order)
-		for (int it = in.cellStaticStart[p.cellIdx]; it < in.cellStaticStart[p.cellIdx + 1]; it++) {
-			int s = in.cellStaticList[it];
-			const GpuStaticObj& so = in.statics[s];
-			if (!CuTestAabb2(pmin, pmax, GV(so.aabbMin), GV(so.aabbMax)))
-				continue;
-			if (!CuNeedsBroadphase(dg, dm, so.group, so.mask))
-				continue;
-			// findPair dedup: a static appears at most once per cell, each dyn visits
-			// one cell -> no duplicate possible
-			if (numPairs < CU_MAX_PAIRS)
-				pairs[numPairs++] = { s, in.numStatics + d };
+		// findPair dedup: a static appears at most once per cell, each dyn visits
+		// one cell -> no duplicate possible
+		if (staticCand) {
+			const int* c = staticCand + d * (1 + CU_STATIC_CAND_MAX);
+			for (int i = 0; i < c[0]; i++)
+				if (numPairs < CU_MAX_PAIRS)
+					pairs[numPairs++] = { c[1 + i], in.numStatics + d };
+		} else {
+			for (int it = in.cellStaticStart[p.cellIdx]; it < in.cellStaticStart[p.cellIdx + 1]; it++) {
+				int s = in.cellStaticList[it];
+				const GpuStaticObj& so = in.statics[s];
+				if (!CuTestAabb2(pmin, pmax, GV(so.aabbMin), GV(so.aabbMax)))
+					continue;
+				if (!CuNeedsBroadphase(dg, dm, so.group, so.mask))
+					continue;
+				if (numPairs < CU_MAX_PAIRS)
+					pairs[numPairs++] = { s, in.numStatics + d };
+			}
 		}
 
 		// dyns of the same cell, in cell-list order = ascending regSeq
@@ -648,11 +708,25 @@ __device__ inline void CuContactAddedCallback(const CuCollideIn& in,
 }
 
 // ---- the collide phase for one arena (single thread) ----
-__device__ inline void CuCollideTick(const CuCollideIn& in) {
-	CuCollideUpdateAabbs(in);
+// staticCand != null: the caller already ran CuCollideUpdateAabbBody for every
+// body (assigning regSeq) and CuCollideStaticCandidates into staticCand.
+__device__ inline void CuCollideTick(const CuCollideIn& in, const int* staticCand = nullptr) {
+#ifdef RS_GPU_PHASE_PROF
+	long long profT = clock64();
+	auto profLap = [&](int slot) { long long t = clock64(); if (in.prof) atomicAdd(&in.prof[slot], (unsigned long long)(t - profT)); profT = t; };
+#else
+	auto profLap = [](int) {};
+#endif
+	if (!staticCand)
+		CuCollideUpdateAabbs(in);
+	profLap(0);
 
 	int2 pairs[CU_MAX_PAIRS];
-	int numPairs = CuCollideGenPairs(in, pairs);
+	int numPairs = CuCollideGenPairs(in, pairs, staticCand);
+	profLap(1);
+#ifdef RS_GPU_PHASE_PROF
+	if (in.prof) atomicAdd(&in.prof[3], (unsigned long long)numPairs);
+#endif
 
 	if (in.pairsOut) {
 		for (int i = 0; i < numPairs; i++)
@@ -996,6 +1070,10 @@ __device__ inline void CuCollideTick(const CuCollideIn& in) {
 		}
 	}
 
+	profLap(2);
+#ifdef RS_GPU_PHASE_PROF
+	if (in.prof) atomicAdd(&in.prof[4], (unsigned long long)ml.n);
+#endif
 	*in.numManifolds = ml.n;
 }
 

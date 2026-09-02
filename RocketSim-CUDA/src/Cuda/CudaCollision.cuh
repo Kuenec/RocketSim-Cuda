@@ -925,7 +925,31 @@ struct Cu2EPA {
 	Cu2Face fcStore[CU2_EPA_MAX_FACES];
 	int nextsv;
 	int hullRoot, hullCount;
-	int stockRoot, stockCount;
+	// 2026-09-02: the reference stock list is a LIFO of released faces sitting
+	// on top of the pristine ascending sequence 0..MAX-1 (built by appending
+	// MAX-1 down to 0), so a released-face stack threaded through l[1] plus a
+	// bump index over the never-used faces yields exactly the same face for
+	// every allocation while touching only faces that are actually used - the
+	// reference linked all 256 faces on every construction (16 KB of local
+	// traffic per penetration query). A stock face's l[0] was never read.
+	int stockNext; // smallest never-allocated face
+	int freeRoot;  // most recently released face (-1 none)
+
+	__device__ bool stockAvailable() const {
+		return freeRoot >= 0 || stockNext < CU2_EPA_MAX_FACES;
+	}
+	__device__ int popStock() {
+		if (freeRoot >= 0) {
+			int face = freeRoot;
+			freeRoot = fcStore[face].l[1];
+			return face;
+		}
+		return stockNext++;
+	}
+	__device__ void pushStock(int face) {
+		fcStore[face].l[1] = freeRoot;
+		freeRoot = face;
+	}
 
 	__device__ Cu2SV& svAt(int i) { return i < 4 ? initStore[i] : svStore[i - 4]; }
 
@@ -955,9 +979,7 @@ struct Cu2EPA {
 		depth = 0;
 		nextsv = 0;
 		hullRoot = -1; hullCount = 0;
-		stockRoot = -1; stockCount = 0;
-		for (int i = 0; i < CU2_EPA_MAX_FACES; i++)
-			appendList(stockRoot, stockCount, CU2_EPA_MAX_FACES - i - 1);
+		stockNext = 0; freeRoot = -1;
 	}
 
 	__device__ bool getedgedist(Cu2Face& face, Cu2SV& a, Cu2SV& b, float& dist) {
@@ -983,10 +1005,9 @@ struct Cu2EPA {
 	}
 
 	__device__ int newface(int a, int b, int c, bool forced) {
-		if (stockRoot >= 0) {
-			int face = stockRoot;
+		if (stockAvailable()) {
+			int face = popStock();
 			Cu2Face& f = fcStore[face];
-			removeList(stockRoot, stockCount, face);
 			appendList(hullRoot, hullCount, face);
 			f.pass = 0;
 			f.c[0] = a; f.c[1] = b; f.c[2] = c;
@@ -1010,10 +1031,10 @@ struct Cu2EPA {
 				status = 2; // Degenerated
 			}
 			removeList(hullRoot, hullCount, face);
-			appendList(stockRoot, stockCount, face);
+			pushStock(face);
 			return -1;
 		}
-		status = stockRoot >= 0 ? 6 : 5; // OutOfVertices : OutOfFaces
+		status = stockAvailable() ? 6 : 5; // OutOfVertices : OutOfFaces
 		return -1;
 	}
 
@@ -1054,7 +1075,7 @@ struct Cu2EPA {
 				if (expand(pass, w, f.f[e1], f.e[e1], horizonCf, horizonFf, horizonNf) &&
 					expand(pass, w, f.f[e2], f.e[e2], horizonCf, horizonFf, horizonNf)) {
 					removeList(hullRoot, hullCount, fIdx);
-					appendList(stockRoot, stockCount, fIdx);
+					pushStock(fIdx);
 					return true;
 				}
 			}
@@ -1068,7 +1089,7 @@ struct Cu2EPA {
 			while (hullRoot >= 0) {
 				int f = hullRoot;
 				removeList(hullRoot, hullCount, f);
-				appendList(stockRoot, stockCount, f);
+				pushStock(f);
 			}
 			status = 0; // Valid
 			nextsv = 0;
@@ -1120,7 +1141,7 @@ struct Cu2EPA {
 							if (valid && (horizonNf >= 3)) {
 								bind(horizonCf, 1, horizonFf, 2);
 								removeList(hullRoot, hullCount, best);
-								appendList(stockRoot, stockCount, best);
+								pushStock(best);
 								best = findbest();
 								outer = fcStore[best];
 							} else {

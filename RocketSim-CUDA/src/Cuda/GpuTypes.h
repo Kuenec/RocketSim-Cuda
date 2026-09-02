@@ -62,6 +62,9 @@ enum GpuPhase : int {
 	GPU_PHASE_GAME_POST = 6,  // clearForces + car post/finish + pads + ball finish
 	GPU_PHASE_COUNT
 };
+// Phase profiler read-out: the GPU_PHASE_COUNT phase totals followed by the
+// sub-phase laps and counters (all zero unless built with RS_GPU_PHASE_PROF)
+constexpr int GPU_PHASE_PROF_SLOTS = GPU_PHASE_COUNT + 12;
 
 struct GpuCarControls {
 	float throttle, steer, pitch, yaw, roll;
@@ -287,13 +290,30 @@ struct GpuBvhNode {
 	uint16_t qmin[3], qmax[3];
 	int32_t escapeIndexOrTriangleIndex; // >=0 leaf (triangleIndex), <0 internal (-escape)
 };
+// Per-node unquantized bounds for the ray walk's slab test, built ON THE
+// DEVICE at upload by the same expression the walk used to evaluate inline
+// ((float)q / quantization + bvhAabbMin, six IEEE divisions per visited node)
+struct GpuBvhNodeBounds {
+	GpuVec3 mn, mx;
+};
+// Per-mesh record for the wheel ray test, mirrored into constant memory at
+// upload (uniform per-mesh loop -> broadcast constant-cache reads instead of
+// dependent global loads that miss the L1 the kernel's stack frames thrash)
+#define GPU_MAX_CONST_MESHES 64
+struct GpuConstMesh {
+	int triStart, group, mask;
+	int nodeStart, numNodes;
+	GpuVec3 bvhAabbMin, bvhAabbMax, bvhQuantization;
+	GpuBvhNode root;           // node 0 (the whole array is never a leaf for >1 tri)
+	GpuBvhNodeBounds rootBounds;
+};
 struct GpuBvhSubtree {
 	uint16_t qmin[3], qmax[3];
 	int32_t rootNodeIndex, subtreeSize;
 };
 struct GpuMeshBvh {
 	int nodeStart;      // into shared node buffer
-	int numNodes;       // m_curNodeIndex (the ray walk scans the whole array)
+	int numNodes;       // m_curNodeIndex: the ray walk's bound (root escape index)
 	int subtreeStart;   // into shared subtree buffer
 	int numSubtrees;
 	GpuVec3 bvhAabbMin, bvhAabbMax, bvhQuantization;

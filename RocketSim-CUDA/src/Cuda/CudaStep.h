@@ -147,13 +147,22 @@ void StepTicks(GpuBatch* batch, int numTicks);
 void StepTicksAsync(GpuBatch* batch, int numTicks);
 unsigned long long BatchTickCount(GpuBatch* batch);
 void SyncBatch(GpuBatch* batch);
+// 2026-09-02 asynchronous forms of the reset re-upload + subset re-step: no
+// stream sync, ordered on the batch stream behind the in-flight chunk. The
+// caller's host buffers must be PINNED and stay untouched until SyncBatch.
+void UploadArenaStateAsync(GpuBatch* batch, int arenaIdx,
+	const GpuBodyState* bodies, const GpuCarGameState* cars, const GpuPadState* pads);
+void UploadBallStateAsync(GpuBatch* batch, int arenaIdx, const GpuBallGameState* state);
+void UploadConstantControlsAsync(GpuBatch* batch, const GpuCarControls* perCar);
+void StepTicksSubsetAsync(GpuBatch* batch, int numTicks, const int* arenaIdxs, int count,
+	unsigned long long tickBase);
 void StepTicksSubset(GpuBatch* batch, int numTicks, const int* arenaIdxs, int count,
 	unsigned long long tickBase);
 
 // 2026-06-11: diagnostic per-phase cycle counters (see GpuPhase). Enable before
 // stepping; Get downloads the totals (sum of per-block cycles per phase).
 void EnablePhaseProfiling(GpuBatch* batch);
-void GetPhaseCycles(GpuBatch* batch, unsigned long long out[GPU_PHASE_COUNT]);
+void GetPhaseCycles(GpuBatch* batch, unsigned long long out[GPU_PHASE_PROF_SLOTS]);
 
 // Chunked-stepping controls: one CarControls per car ([arenaIdx * numCars + carIdx]),
 // held constant across subsequent StepTicks calls. Overrides any schedule.
@@ -167,5 +176,14 @@ void DownloadArenaState(GpuBatch* batch, int arenaIdx,
 void DownloadAllArenaStates(GpuBatch* batch,
 	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads);
 void DownloadAllBallStates(GpuBatch* batch, GpuBallGameState* balls);
+
+// 2026-09-02 asynchronous downloads into PINNED host memory plus the event
+// that marks their completion, so the next chunk can be enqueued behind them
+// and the host waits only for the copies (WaitDownloadEvent).
+void DownloadAllArenaStatesAsync(GpuBatch* batch,
+	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads);
+void DownloadAllBallStatesAsync(GpuBatch* batch, GpuBallGameState* balls);
+void RecordDownloadEvent(GpuBatch* batch);
+void WaitDownloadEvent(GpuBatch* batch);
 
 } // namespace rscuda

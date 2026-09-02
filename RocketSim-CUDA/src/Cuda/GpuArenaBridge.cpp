@@ -14,6 +14,7 @@
 #include "../../libsrc/bullet3-3.24/BulletCollision/NarrowPhaseCollision/btPersistentManifold.h"
 #include "../../libsrc/bullet3-3.24/BulletCollision/CollisionShapes/btConvexHullShape.h"
 
+#include <cuda_runtime.h>
 #include <cassert>
 #include <algorithm>
 
@@ -258,7 +259,14 @@ static void ExtractMeshBvhs(Arena* arena,
 		rscuda::GpuMeshBvh mb;
 		mb.nodeStart = (int)nodes.size();
 		mb.subtreeStart = (int)subtrees.size();
-		mb.numNodes = bvh->getQuantizedNodeArray().size();
+		// Ray walks scan [0, m_curNodeIndex) on the CPU. Bullet sizes the node
+		// array to 2 * numLeafNodes and never shrinks it, so the array's last
+		// entry is an unused zero node; the tree's node count is the root's
+		// escape index (the root is a leaf only for a one-triangle mesh).
+		{
+			const QuantizedNodeArray& na0 = bvh->getQuantizedNodeArray();
+			mb.numNodes = na0[0].isLeafNode() ? 1 : -na0[0].m_escapeIndexOrTriangleIndex;
+		}
 		mb.bvhAabbMin = ToGpuB(bvh->getBvhAabbMin());
 		mb.bvhAabbMax = ToGpuB(bvh->getBvhAabbMax());
 		mb.bvhQuantization = ToGpuB(bvh->getBvhQuantization());
@@ -779,9 +787,18 @@ GpuArenaBatch::GpuArenaBatch(const std::vector<Arena*>& arenasIn, uint64_t rngSe
 		UploadCarConsts(batch, ExtractCarConsts(arenas[0], carLists[0][0]));
 	}
 
-	// statics reach their steady-state proxy aabbs/cell smear before extraction
-	for (Arena* arena : arenas)
-		arena->_bulletWorld.updateAabbs();
+	// statics reach their steady-state proxy aabbs/cell smear before extraction.
+	// The static world is extracted from arena 0 alone; every other arena only
+	// contributes its dynamic proxies, so only its ball and cars are refreshed
+	// (a full updateAabbs per arena re-smears every static mesh cell: ~25 s at
+	// 2000 arenas for state nothing reads)
+	arenas[0]->_bulletWorld.updateAabbs();
+	for (size_t a = 1; a < arenas.size(); a++) {
+		Arena* arena = arenas[a];
+		arena->_bulletWorld.updateSingleAabb(&arena->ball->_rigidBody);
+		for (Car* car : arena->_cars)
+			arena->_bulletWorld.updateSingleAabb(&car->_rigidBody);
+	}
 
 	{ // world geometry + collide + tail data (identical across arenas)
 		std::vector<GpuPlane> planes;
@@ -875,6 +892,29 @@ GpuArenaBatch::GpuArenaBatch(const std::vector<Arena*>& arenasIn, uint64_t rngSe
 	padsScratch.resize(arenas.size() * (size_t)numPads);
 	ballsScratch.resize(arenas.size());
 	controlsScratch.resize(arenas.size() * (size_t)numCars);
+	auto pinned = [](auto*& ptr, size_t count, const char* what) {
+		if (cudaHostAlloc((void**)&ptr, sizeof(*ptr) * (count ? count : 1),
+				cudaHostAllocDefault) != cudaSuccess)
+			RS_ERR_CLOSE("GpuArenaBatch: pinned staging allocation failed (" << what << ")");
+	};
+	pinned(stageBodies, arenas.size() * (size_t)(1 + numCars), "bodies");
+	pinned(stageCars, arenas.size() * (size_t)numCars, "cars");
+	pinned(stagePads, arenas.size() * (size_t)numPads, "pads");
+	pinned(stageBalls, arenas.size(), "balls");
+	pinned(stageControls, arenas.size() * (size_t)numCars, "controls");
+	pinned(stageSlots, arenas.size(), "slots");
+	// the download scratch is page-locked in place so the asynchronous state
+	// downloads are real DMA transfers the host can wait on by event
+	auto lock = [](auto& vec, const char* what) {
+		if (!vec.empty() && cudaHostRegister(vec.data(), vec.size() * sizeof(vec[0]),
+				cudaHostRegisterDefault) != cudaSuccess)
+			RS_ERR_CLOSE("GpuArenaBatch: pinning the download scratch failed (" << what << ")");
+	};
+	lock(bodiesScratch, "bodies");
+	lock(curCars, "cars");
+	lock(prevCars, "prev cars");
+	lock(padsScratch, "pads");
+	lock(ballsScratch, "balls");
 
 	for (int a = 0; a < (int)arenas.size(); a++)
 		UploadArena(a);
@@ -884,13 +924,69 @@ GpuArenaBatch::GpuArenaBatch(const std::vector<Arena*>& arenasIn, uint64_t rngSe
 GpuArenaBatch::~GpuArenaBatch() {
 	if (batch)
 		DestroyBatch(batch);
+	for (void* p : { (void*)stageBodies, (void*)stageCars, (void*)stagePads,
+			(void*)stageBalls, (void*)stageControls, (void*)stageSlots })
+		if (p)
+			cudaFreeHost(p);
+	for (void* p : { (void*)bodiesScratch.data(), (void*)curCars.data(), (void*)prevCars.data(),
+			(void*)padsScratch.data(), (void*)ballsScratch.data() })
+		if (p)
+			cudaHostUnregister(p);
+}
+
+void GpuArenaBatch::StepDownloadAndLaunch(int numTicks, int nextTicks) {
+	GatherControls(controlsScratch.data());
+	UploadConstantControls(batch, controlsScratch.data());
+	StepTicksAsync(batch, numTicks);
+	pendingTicks += numTicks;
+	std::swap(prevCars, curCars);
+	DownloadAllArenaStatesAsync(batch, bodiesScratch.data(), curCars.data(), padsScratch.data());
+	DownloadAllBallStatesAsync(batch, ballsScratch.data());
+	RecordDownloadEvent(batch);
+	StepTicksAsync(batch, nextTicks);
+	inFlightTicks += nextTicks;
+	WaitDownloadEvent(batch);
+}
+
+void GpuArenaBatch::GatherControls(GpuCarControls* out) const {
+	for (int a = 0; a < (int)arenas.size(); a++)
+		for (int c = 0; c < numCars; c++)
+			out[(size_t)a * numCars + c] = ToGpu(carLists[a][c]->controls);
+}
+
+void GpuArenaBatch::UploadArenaAsync(int idx) {
+	GpuBodyState* bodies = stageBodies + (size_t)idx * (1 + numCars);
+	GpuCarGameState* cars = stageCars + (size_t)idx * numCars;
+	GpuPadState* pads = stagePads + (size_t)idx * numPads;
+	SnapshotArena(idx, bodies, cars, pads, stageBalls[idx]);
+	UploadArenaStateAsync(batch, idx, bodies, cars, pads);
+	UploadBallStateAsync(batch, idx, stageBalls + idx);
+}
+
+void GpuArenaBatch::StepSubsetAsync(const int* slots, int count, int numTicks) {
+	if (count <= 0)
+		return;
+	GatherControls(stageControls);
+	UploadConstantControlsAsync(batch, stageControls);
+	for (int i = 0; i < count; i++)
+		stageSlots[i] = slots[i];
+	StepTicksSubsetAsync(batch, numTicks, stageSlots, count,
+		BatchTickCount(batch) - (unsigned long long)numTicks);
 }
 
 void GpuArenaBatch::UploadArena(int idx) {
-	Arena* arena = arenas[idx];
 	GpuBodyState* bodies = bodiesScratch.data() + (size_t)idx * (1 + numCars);
 	GpuCarGameState* cars = curCars.data() + (size_t)idx * numCars;
 	GpuPadState* pads = padsScratch.data() + (size_t)idx * numPads;
+	GpuBallGameState bs = {};
+	SnapshotArena(idx, bodies, cars, pads, bs);
+	UploadArenaState(batch, idx, bodies, cars, pads);
+	UploadBallState(batch, idx, bs);
+}
+
+void GpuArenaBatch::SnapshotArena(int idx, GpuBodyState* bodies, GpuCarGameState* cars,
+	GpuPadState* pads, GpuBallGameState& bs) const {
+	Arena* arena = arenas[idx];
 
 	SnapshotBody(arena->ball->_rigidBody, bodies[0]);
 	for (int c = 0; c < numCars; c++)
@@ -906,9 +1002,8 @@ void GpuArenaBatch::UploadArena(int idx) {
 			if (ps.curLockedCar == carLists[idx][c])
 				pads[p].lockedCarIdx = c;
 	}
-	UploadArenaState(batch, idx, bodies, cars, pads);
 
-	GpuBallGameState bs = {};
+	bs = {};
 	Ball* ball = arena->ball;
 	bs.velocityImpulseCache = ToGpu(ball->_velocityImpulseCache);
 	bs.tickCountSinceUpdate = ball->_internalState.tickCountSinceUpdate;
@@ -922,13 +1017,18 @@ void GpuArenaBatch::UploadArena(int idx) {
 	bs.dsYTargetDir = dsi.yTargetDir;
 	bs.dsHasDamaged = dsi.hasDamaged;
 	bs.dsLastDamageTick = dsi.hasDamaged ? dsi.lastDamageTick : 0;
-	UploadBallState(batch, idx, bs);
+}
+
+void GpuArenaBatch::EnablePhaseProfiling() {
+	rscuda::EnablePhaseProfiling(batch);
+}
+
+void GpuArenaBatch::GetPhaseCycles(unsigned long long out[rscuda::GPU_PHASE_PROF_SLOTS]) {
+	rscuda::GetPhaseCycles(batch, out);
 }
 
 void GpuArenaBatch::Step(int numTicks) {
-	for (int a = 0; a < (int)arenas.size(); a++)
-		for (int c = 0; c < numCars; c++)
-			controlsScratch[(size_t)a * numCars + c] = ToGpu(carLists[a][c]->controls);
+	GatherControls(controlsScratch.data());
 	UploadConstantControls(batch, controlsScratch.data());
 	StepTicks(batch, numTicks);
 	pendingTicks += numTicks;
@@ -941,9 +1041,7 @@ void GpuArenaBatch::Step(int numTicks) {
 // non-reset arenas they are unchanged since the launch, for reset arenas this
 // picks up the post-reset values, exactly like a synchronous chunk would.
 void GpuArenaBatch::StepAsync(int numTicks) {
-	for (int a = 0; a < (int)arenas.size(); a++)
-		for (int c = 0; c < numCars; c++)
-			controlsScratch[(size_t)a * numCars + c] = ToGpu(carLists[a][c]->controls);
+	GatherControls(controlsScratch.data());
 	UploadConstantControls(batch, controlsScratch.data());
 	StepTicksAsync(batch, numTicks);
 	// NOT added to pendingTicks yet: pendingTicks drives arena->tickCount at
@@ -961,9 +1059,7 @@ void GpuArenaBatch::Sync() {
 void GpuArenaBatch::StepSubset(const int* slots, int count, int numTicks) {
 	if (count <= 0)
 		return;
-	for (int a = 0; a < (int)arenas.size(); a++)
-		for (int c = 0; c < numCars; c++)
-			controlsScratch[(size_t)a * numCars + c] = ToGpu(carLists[a][c]->controls);
+	GatherControls(controlsScratch.data());
 	UploadConstantControls(batch, controlsScratch.data());
 	StepTicksSubset(batch, numTicks, slots, count,
 		BatchTickCount(batch) - (unsigned long long)numTicks);

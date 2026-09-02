@@ -46,10 +46,17 @@ if(CMAKE_CUDA_COMPILER)
 	find_package(CUDAToolkit REQUIRED)
 	file(GLOB_RECURSE WORK_CUDA_SRC CONFIGURE_DEPENDS ${WORK_DIR}/src/Cuda/*.cu)
 	target_sources(rocketsim_work PRIVATE ${WORK_CUDA_SRC})
-	set_target_properties(rocketsim_work PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+	# the target predates enable_language(CUDA), so set the arch on it explicitly
+	set_target_properties(rocketsim_work PROPERTIES
+		CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+		CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
 	target_compile_definitions(rocketsim_work PUBLIC RS_CUDA=1)
 	# -fmad=false: GPU math must be plain IEEE mul+add to match the -ffp-contract=off CPU reference
 	target_compile_options(rocketsim_work PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+	# In-kernel phase profiler (bench --phase-prof): its accumulators cost
+	# registers in the 255-register step kernel, so it is compiled in only on request
+	option(RS_GPU_PHASE_PROF "Compile the GPU step kernel's phase profiler" OFF)
+	target_compile_definitions(rocketsim_work PRIVATE $<$<BOOL:${RS_GPU_PHASE_PROF}>:RS_GPU_PHASE_PROF>)
 	target_link_libraries(rocketsim_work PUBLIC CUDA::cudart_static)
 
 	# Bit-exactness regression guard for the device math layer (see CudaMath.cuh)

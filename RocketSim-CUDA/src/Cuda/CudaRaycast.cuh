@@ -34,6 +34,7 @@ struct GpuWorldGeo {
 	// proven by a wheel ray crossing a triangle edge, heatseeker seed 42 tick 1402)
 	const GpuMeshBvh* bvhs;
 	const GpuBvhNode* bvhNodes;
+	const GpuBvhNodeBounds* bvhNodeBounds; // parallel to bvhNodes
 	// snowday puck hull points (null/0 in sphere-ball modes)
 	const GpuVec3* hullPoints;
 	int numHullPoints;
@@ -196,46 +197,99 @@ __device__ __forceinline__ bool CuRayAabb2(CuVec3 rayFrom, CuVec3 rayInvDir,
 // btQuantizedBvh::walkStacklessQuantizedTreeAgainstRay (RAYAABB2 path): linear
 // depth-first scan over the contiguous node array with quantized-box + slab tests.
 // processLeaf(triIdx) runs in the EXACT CPU visit order.
-template <typename F>
-__device__ inline void CuBvhWalkRay(const GpuBvhNode* nodes, int numNodes,
-	CuVec3 bvhMin, CuVec3 bvhMax, CuVec3 quantization,
-	CuVec3 raySource, CuVec3 rayTarget, F&& processLeaf) {
-	float lambda_max = 1.0f;
+// unQuantize: (float)q / quantization + bvhAabbMin (per-component division);
+// box-cast extents are zero (x -= 0 is exact). Evaluated once per node at
+// upload (BuildBvhNodeBoundsKernel) into GpuBvhNodeBounds; the walk reads it.
+__device__ __forceinline__ void CuBvhUnquantizeNode(const GpuBvhNode& n,
+	CuVec3 quantization, CuVec3 bvhMin, CuVec3 bounds[2]) {
+	bounds[0] = { (float)n.qmin[0] / quantization.x + bvhMin.x,
+		(float)n.qmin[1] / quantization.y + bvhMin.y,
+		(float)n.qmin[2] / quantization.z + bvhMin.z };
+	bounds[1] = { (float)n.qmax[0] / quantization.x + bvhMin.x,
+		(float)n.qmax[1] / quantization.y + bvhMin.y,
+		(float)n.qmax[2] / quantization.z + bvhMin.z };
+}
+
+// Mesh-independent part of the ray walk prologue (2026-09-02: hoisted out of
+// the per-mesh loop; the same expressions on the same ray give the same bits)
+struct CuBvhRay {
+	CuVec3 source;
+	CuVec3 rid;
+	unsigned int sign[3];
+	float lambda_max;
+	CuVec3 aabbMin, aabbMax;
+};
+
+__device__ __forceinline__ CuBvhRay CuBvhRaySetup(CuVec3 raySource, CuVec3 rayTarget) {
+	CuBvhRay r;
+	r.source = raySource;
 	CuVec3 rayDirection = rayTarget - raySource;
 	rayDirection = CuSafeNormalize3(rayDirection);
-	lambda_max = CuDot3(rayDirection, rayTarget - raySource);
-	CuVec3 rid = {
+	r.lambda_max = CuDot3(rayDirection, rayTarget - raySource);
+	r.rid = {
 		rayDirection.x == 0.0f ? 1e18f /*BT_LARGE_FLOAT*/ : 1.0f / rayDirection.x,
 		rayDirection.y == 0.0f ? 1e18f : 1.0f / rayDirection.y,
 		rayDirection.z == 0.0f ? 1e18f : 1.0f / rayDirection.z };
-	unsigned int sign[3] = { rid.x < 0.0f, rid.y < 0.0f, rid.z < 0.0f };
+	r.sign[0] = r.rid.x < 0.0f;
+	r.sign[1] = r.rid.y < 0.0f;
+	r.sign[2] = r.rid.z < 0.0f;
+	r.aabbMin = CuMin3(raySource, rayTarget); // (box-cast extents are zero)
+	r.aabbMax = CuMax3(raySource, rayTarget);
+	return r;
+}
 
-	CuVec3 rayAabbMin = CuMin3(raySource, rayTarget); // (box-cast extents are zero)
-	CuVec3 rayAabbMax = CuMax3(raySource, rayTarget);
+static __device__ __constant__ GpuConstMesh g_constMeshes[GPU_MAX_CONST_MESHES];
+
+// One node test of the stackless walk: quantized box test, then the slab test
+// on the node's unquantized bounds. Returns the ray/box overlap flag.
+__device__ __forceinline__ unsigned CuBvhNodeTest(const GpuBvhNode& n, const GpuBvhNodeBounds& nb,
+	const uint16_t qmin[3], const uint16_t qmax[3], const CuBvhRay& ray) {
+	unsigned rayBoxOverlap = 0;
+	float param = 1.0f;
+	unsigned boxBoxOverlap = CuRayTestQuantAabb(qmin, qmax, n.qmin, n.qmax);
+	if (boxBoxOverlap) {
+		CuVec3 bounds[2] = { GV(nb.mn), GV(nb.mx) };
+		rayBoxOverlap = CuRayAabb2(ray.source, ray.rid, ray.sign, bounds, param, 0.0f, ray.lambda_max)
+			? 1u : 0u;
+	}
+	return rayBoxOverlap;
+}
+
+// The root (node 0) comes from the constant-memory mesh record; the loop then
+// continues at node 1 exactly where the CPU's scan would - the visit sequence
+// is unchanged, only where the root's bytes are read from.
+// Root (node 0) test of a mesh against a ray: the walk's first step
+__device__ __forceinline__ unsigned CuBvhRootOverlap(const GpuConstMesh& cm, const CuBvhRay& ray,
+	uint16_t qmin[3], uint16_t qmax[3]) {
+	CuRayQuantizeClamp(GV(cm.bvhAabbMin), GV(cm.bvhAabbMax), GV(cm.bvhQuantization), ray.aabbMin, 0, qmin);
+	CuRayQuantizeClamp(GV(cm.bvhAabbMin), GV(cm.bvhAabbMax), GV(cm.bvhQuantization), ray.aabbMax, 1, qmax);
+	return CuBvhNodeTest(cm.root, cm.rootBounds, qmin, qmax, ray);
+}
+
+template <typename F>
+__device__ inline void CuBvhWalkRay(const GpuBvhNode* nodes, const GpuBvhNodeBounds* nodeBounds,
+	int numNodes, const GpuConstMesh& cm, const CuBvhRay& ray, F&& processLeaf) {
 	uint16_t qmin[3], qmax[3];
-	CuRayQuantizeClamp(bvhMin, bvhMax, quantization, rayAabbMin, 0, qmin);
-	CuRayQuantizeClamp(bvhMin, bvhMax, quantization, rayAabbMax, 1, qmax);
 
-	int curIndex = 0;
+	if (numNodes <= 0)
+		return;
+	{
+		const GpuBvhNode& n = cm.root;
+		bool isLeafNode = n.escapeIndexOrTriangleIndex >= 0;
+		unsigned rayBoxOverlap = CuBvhRootOverlap(cm, ray, qmin, qmax);
+		if (isLeafNode) {
+			if (rayBoxOverlap)
+				processLeaf(n.escapeIndexOrTriangleIndex & ~((~0u) << (31 - 10)));
+			return; // curIndex = 1 = numNodes for a one-leaf tree
+		}
+		if (!rayBoxOverlap)
+			return; // curIndex += escape (= numNodes): scan over
+	}
+	int curIndex = 1;
 	while (curIndex < numNodes) {
 		const GpuBvhNode& n = nodes[curIndex];
 		bool isLeafNode = n.escapeIndexOrTriangleIndex >= 0;
-		unsigned rayBoxOverlap = 0;
-		float param = 1.0f;
-		unsigned boxBoxOverlap = CuRayTestQuantAabb(qmin, qmax, n.qmin, n.qmax);
-		if (boxBoxOverlap) {
-			// unQuantize: (float)q / quantization + bvhAabbMin (per-component
-			// division); box-cast extents are zero (x -= 0 is exact)
-			CuVec3 bounds[2];
-			bounds[0] = { (float)n.qmin[0] / quantization.x + bvhMin.x,
-				(float)n.qmin[1] / quantization.y + bvhMin.y,
-				(float)n.qmin[2] / quantization.z + bvhMin.z };
-			bounds[1] = { (float)n.qmax[0] / quantization.x + bvhMin.x,
-				(float)n.qmax[1] / quantization.y + bvhMin.y,
-				(float)n.qmax[2] / quantization.z + bvhMin.z };
-			rayBoxOverlap = CuRayAabb2(raySource, rid, sign, bounds, param, 0.0f, lambda_max)
-				? 1u : 0u;
-		}
+		unsigned rayBoxOverlap = CuBvhNodeTest(n, nodeBounds[curIndex], qmin, qmax, ray);
 		if (isLeafNode && rayBoxOverlap)
 			processLeaf(n.escapeIndexOrTriangleIndex & ~((~0u) << (31 - 10)));
 		if (rayBoxOverlap != 0 || isLeafNode) {
@@ -260,25 +314,26 @@ __device__ inline void CuRayTestStaticMeshes(
 	float& bestFraction, CuVec3& bestNormal, int& bestMesh) {
 
 	const CuMat3 ident = CuIdentity3();
+	// worldToCollisionObject = inverse(identity, origin=0): basisT=I, invOrigin =
+	// I * -(0,0,0) = (-0,-0,-0); CPU runs endpoints through the transform trees.
+	// Every static mesh sits at the identity, so the local endpoints and the
+	// walk's ray setup are the same for all of them: computed once per ray.
+	const CuVec3 invOrigin = CuMat3MulVec(ident, CuNeg({ 0, 0, 0 }));
+	const CuVec3 fromL = CuTransformPoint(ident, invOrigin, from);
+	const CuVec3 toL = CuTransformPoint(ident, invOrigin, to);
+	const CuBvhRay ray = CuBvhRaySetup(fromL, toL);
 
 	for (int m = lane; m < geo.numMeshes; m += stride) {
-		const GpuMeshInfo& mi = geo.meshes[m];
-		if (!((mi.group & cbMask) && (cbGroup & mi.mask)))
+		const GpuConstMesh& cm = g_constMeshes[m];
+		if (!((cm.group & cbMask) && (cbGroup & cm.mask)))
 			continue;
-		// worldToCollisionObject = inverse(identity, origin=0): basisT=I, invOrigin =
-		// I * -(0,0,0) = (-0,-0,-0); CPU runs endpoints through the transform trees
-		CuVec3 invOrigin = CuMat3MulVec(ident, CuNeg({ 0, 0, 0 }));
-		CuVec3 fromL = CuTransformPoint(ident, invOrigin, from);
-		CuVec3 toL = CuTransformPoint(ident, invOrigin, to);
-		const GpuVec3* tv = geo.meshTris + (size_t)mi.triStart * 3;
+		const GpuVec3* tv = geo.meshTris + (size_t)cm.triStart * 3;
 		CuVec3 localNormal;
 		bool hit = false;
 		// performRaycast: triangles visited in the btQuantizedBvh ray-walk order
 		// (the strict < in CuRayTriangle makes the visit order the tie-breaker)
-		const GpuMeshBvh& mb = geo.bvhs[m];
-		CuBvhWalkRay(geo.bvhNodes + mb.nodeStart, mb.numNodes,
-			GV(mb.bvhAabbMin), GV(mb.bvhAabbMax), GV(mb.bvhQuantization),
-			fromL, toL, [&](int t) {
+		CuBvhWalkRay(geo.bvhNodes + cm.nodeStart, geo.bvhNodeBounds + cm.nodeStart, cm.numNodes,
+			cm, ray, [&](int t) {
 				if (CuRayTriangle(fromL, toL, GV(tv[t * 3]), GV(tv[t * 3 + 1]), GV(tv[t * 3 + 2]),
 						bestFraction, localNormal))
 					hit = true;

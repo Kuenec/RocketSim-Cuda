@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 namespace rscuda {
 
@@ -43,6 +44,19 @@ static void CudaCheck(cudaError_t err, const char* what) {
 		fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(err));
 		exit(2);
 	}
+}
+
+struct GpuBatch;
+static cudaStream_t BatchStream(GpuBatch* b);
+
+// Stream-ordered equivalent of a blocking cudaMemcpy: identical bytes,
+// identical returns-after-completion semantics, but ordered on the batch's
+// private stream so it synchronizes with the batch's kernels (and never with
+// unrelated work on the legacy default stream).
+static void MemcpyOnBatchStream(GpuBatch* b, void* dst, const void* src,
+	size_t bytes, cudaMemcpyKind kind, const char* what) {
+	CudaCheck(cudaMemcpyAsync(dst, src, bytes, kind, BatchStream(b)), what);
+	CudaCheck(cudaStreamSynchronize(BatchStream(b)), what);
 }
 
 bool Available() {
@@ -62,6 +76,18 @@ struct GpuBatch {
 	int numCars;        // per arena
 	int numPads;        // per arena
 	int bodiesPerArena; // 1 ball + numCars
+
+	// 2026-07-16: all of this batch's runtime work (step kernel, per-step
+	// control uploads, state downloads, reset re-uploads) runs on a private
+	// non-blocking stream instead of the legacy default stream. The physics
+	// itself is unchanged - same kernel, same launch shape, same copy
+	// contents; only the stream the work is ordered on differs. This stops
+	// the simulation from serializing against the trainer's ML kernels
+	// (libtorch uses the legacy stream), letting the inference forward run
+	// concurrently with the in-flight physics chunk. Blocking-call semantics
+	// are preserved: every copy is async-on-stream + stream-sync.
+	cudaStream_t stream = nullptr;
+	cudaEvent_t downloadEvent = nullptr; // completion of the async state download
 	unsigned long long* dProfCycles = nullptr; // [GPU_PHASE_COUNT], diagnostic
 	int* dArenaList = nullptr; // [numArenas], subset-step index list (lazy alloc)
 
@@ -84,6 +110,7 @@ struct GpuBatch {
 	// mesh BVHs + internal-edge data (uploaded once)
 	GpuMeshBvh* dMeshBvhs;
 	GpuBvhNode* dBvhNodes;
+	GpuBvhNodeBounds* dBvhNodeBounds;
 	GpuVec3* dHullPoints;  // snowday puck (null otherwise)
 	GpuCarControls* dConstControls; // per-car constant controls (chunked RL stepping)
 	GpuTileShape* dTiles;          // dropshot tiles (null otherwise)
@@ -186,10 +213,21 @@ GpuBatch* CreateBatch(int numArenas, int numCarsPerArena, int numPads) {
 	CudaCheck(cudaMalloc(&b->dSolveScratch, sizeof(CuSolveCtx) * numArenas), "alloc solve scratch");
 	CudaCheck(cudaMalloc(&b->dRngStates, sizeof(uint32_t) * numArenas), "alloc rng states");
 	CudaCheck(cudaMemset(b->dRngStates, 1, sizeof(uint32_t) * numArenas), "init rng states");
+	CudaCheck(cudaStreamCreateWithFlags(&b->stream, cudaStreamNonBlocking), "create stream");
+	CudaCheck(cudaEventCreateWithFlags(&b->downloadEvent, cudaEventDisableTiming), "create event");
 	return b;
 }
 
+static cudaStream_t BatchStream(GpuBatch* b) {
+	return b->stream;
+}
+
 void DestroyBatch(GpuBatch* b) {
+	if (b->stream) {
+		cudaStreamSynchronize(b->stream);
+		cudaEventDestroy(b->downloadEvent);
+		cudaStreamDestroy(b->stream);
+	}
 	cudaFree(b->dBodies);
 	cudaFree(b->dConsts);
 	cudaFree(b->dCars);
@@ -201,6 +239,7 @@ void DestroyBatch(GpuBatch* b) {
 	cudaFree(b->dCarConsts);
 	cudaFree(b->dMeshBvhs);
 	cudaFree(b->dBvhNodes);
+	cudaFree(b->dBvhNodeBounds);
 	cudaFree(b->dHullPoints);
 	cudaFree(b->dConstControls);
 	cudaFree(b->dTiles);
@@ -232,6 +271,19 @@ void DestroyBatch(GpuBatch* b) {
 	delete b;
 }
 
+// Unquantized node bounds for one mesh's node span (same device expression the
+// ray walk evaluated inline before 2026-09-02, so the table is bit-identical)
+__global__ void BuildBvhNodeBoundsKernel(const GpuBvhNode* nodes, GpuBvhNodeBounds* out,
+	int count, GpuVec3 quantization, GpuVec3 bvhMin) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= count)
+		return;
+	CuVec3 bounds[2];
+	CuBvhUnquantizeNode(nodes[i], GV(quantization), GV(bvhMin), bounds);
+	out[i].mn = { bounds[0].x, bounds[0].y, bounds[0].z };
+	out[i].mx = { bounds[1].x, bounds[1].y, bounds[1].z };
+}
+
 void UploadMeshBvhs(GpuBatch* b,
 	const GpuMeshBvh* bvhs, int numMeshes,
 	const GpuBvhNode* nodes, int numNodes,
@@ -240,6 +292,8 @@ void UploadMeshBvhs(GpuBatch* b,
 	const float* meshMargins) {
 	CudaCheck(cudaMalloc(&b->dMeshBvhs, sizeof(GpuMeshBvh) * numMeshes), "alloc bvhs");
 	CudaCheck(cudaMalloc(&b->dBvhNodes, sizeof(GpuBvhNode) * numNodes), "alloc bvh nodes");
+	CudaCheck(cudaMalloc(&b->dBvhNodeBounds, sizeof(GpuBvhNodeBounds) * (numNodes > 0 ? numNodes : 1)),
+		"alloc bvh node bounds");
 	CudaCheck(cudaMalloc(&b->dBvhSubtrees, sizeof(GpuBvhSubtree) * numSubtrees), "alloc bvh subtrees");
 	CudaCheck(cudaMalloc(&b->dTriInfos, sizeof(GpuTriInfo) * numTris), "alloc tri infos");
 	CudaCheck(cudaMalloc(&b->dMeshMargins, sizeof(float) * numMeshes), "alloc mesh margins");
@@ -248,9 +302,52 @@ void UploadMeshBvhs(GpuBatch* b,
 	CudaCheck(cudaMemcpy(b->dBvhSubtrees, subtrees, sizeof(GpuBvhSubtree) * numSubtrees, cudaMemcpyHostToDevice), "up bvh subtrees");
 	CudaCheck(cudaMemcpy(b->dTriInfos, triInfos, sizeof(GpuTriInfo) * numTris, cudaMemcpyHostToDevice), "up tri infos");
 	CudaCheck(cudaMemcpy(b->dMeshMargins, meshMargins, sizeof(float) * numMeshes, cudaMemcpyHostToDevice), "up mesh margins");
+	// per-mesh node spans: [nodeStart, next mesh's nodeStart) in upload order
+	for (int m = 0; m < numMeshes; m++) {
+		int end = m + 1 < numMeshes ? bvhs[m + 1].nodeStart : numNodes;
+		int count = end - bvhs[m].nodeStart;
+		if (count <= 0)
+			continue;
+		BuildBvhNodeBoundsKernel<<<(count + 255) / 256, 256>>>(
+			b->dBvhNodes + bvhs[m].nodeStart, b->dBvhNodeBounds + bvhs[m].nodeStart,
+			count, bvhs[m].bvhQuantization, bvhs[m].bvhAabbMin);
+		CudaCheck(cudaGetLastError(), "bvh node bounds launch");
+	}
+	CudaCheck(cudaDeviceSynchronize(), "bvh node bounds build");
 	// the ray tests reach the BVHs through the world-geo descriptor
 	b->geo.bvhs = b->dMeshBvhs;
 	b->geo.bvhNodes = b->dBvhNodes;
+	b->geo.bvhNodeBounds = b->dBvhNodeBounds;
+
+	// constant-memory mesh records for the wheel ray test (UploadWorldGeo has
+	// already placed the mesh infos on the device; read them back rather than
+	// keeping a host copy)
+	if (numMeshes > GPU_MAX_CONST_MESHES) {
+		fprintf(stderr, "UploadMeshBvhs: %d meshes exceed GPU_MAX_CONST_MESHES (%d)\n",
+			numMeshes, GPU_MAX_CONST_MESHES);
+		abort();
+	}
+	if (numMeshes > 0) {
+		std::vector<GpuMeshInfo> meshes(numMeshes);
+		CudaCheck(cudaMemcpy(meshes.data(), b->dMeshes, sizeof(GpuMeshInfo) * numMeshes,
+			cudaMemcpyDeviceToHost), "read back meshes");
+		std::vector<GpuConstMesh> cm(numMeshes);
+		for (int m = 0; m < numMeshes; m++) {
+			cm[m].triStart = meshes[m].triStart;
+			cm[m].group = meshes[m].group;
+			cm[m].mask = meshes[m].mask;
+			cm[m].nodeStart = bvhs[m].nodeStart;
+			cm[m].numNodes = bvhs[m].numNodes;
+			cm[m].bvhAabbMin = bvhs[m].bvhAabbMin;
+			cm[m].bvhAabbMax = bvhs[m].bvhAabbMax;
+			cm[m].bvhQuantization = bvhs[m].bvhQuantization;
+			cm[m].root = nodes[bvhs[m].nodeStart];
+			CudaCheck(cudaMemcpy(&cm[m].rootBounds, b->dBvhNodeBounds + bvhs[m].nodeStart,
+				sizeof(GpuBvhNodeBounds), cudaMemcpyDeviceToHost), "read back root bounds");
+		}
+		CudaCheck(cudaMemcpyToSymbol(g_constMeshes, cm.data(), sizeof(GpuConstMesh) * numMeshes),
+			"upload const meshes");
+	}
 }
 
 // dropshot tile shapes + neighbor tables (uploaded once) and per-arena tile state
@@ -321,13 +418,13 @@ void UploadDynProxies(GpuBatch* b, int arenaIdx, const GpuDynProxy* proxies, int
 }
 
 void UploadBallState(GpuBatch* b, int arenaIdx, const GpuBallGameState& state) {
-	CudaCheck(cudaMemcpy(b->dBallStates + arenaIdx, &state, sizeof(GpuBallGameState),
-		cudaMemcpyHostToDevice), "up ball state");
+	MemcpyOnBatchStream(b, b->dBallStates + arenaIdx, &state, sizeof(GpuBallGameState),
+		cudaMemcpyHostToDevice, "up ball state");
 }
 
 void DownloadBallState(GpuBatch* b, int arenaIdx, GpuBallGameState* state) {
-	CudaCheck(cudaMemcpy(state, b->dBallStates + arenaIdx, sizeof(GpuBallGameState),
-		cudaMemcpyDeviceToHost), "down ball state");
+	MemcpyOnBatchStream(b, state, b->dBallStates + arenaIdx, sizeof(GpuBallGameState),
+		cudaMemcpyDeviceToHost, "down ball state");
 }
 
 void SetTickCount(GpuBatch* b, uint64_t tickCount) {
@@ -567,12 +664,30 @@ void RunRayFuzz(GpuBatch* b, const GpuVec3* fromTo, int numRays,
 
 void UploadArenaState(GpuBatch* b, int arenaIdx,
 	const GpuBodyState* bodies, const GpuCarGameState* cars, const GpuPadState* pads) {
-	CudaCheck(cudaMemcpy(b->dBodies + (size_t)arenaIdx * b->bodiesPerArena, bodies,
-		sizeof(GpuBodyState) * b->bodiesPerArena, cudaMemcpyHostToDevice), "upload bodies");
-	CudaCheck(cudaMemcpy(b->dCars + (size_t)arenaIdx * b->numCars, cars,
-		sizeof(GpuCarGameState) * b->numCars, cudaMemcpyHostToDevice), "upload cars");
-	CudaCheck(cudaMemcpy(b->dPads + (size_t)arenaIdx * b->numPads, pads,
-		sizeof(GpuPadState) * b->numPads, cudaMemcpyHostToDevice), "upload pads");
+	MemcpyOnBatchStream(b, b->dBodies + (size_t)arenaIdx * b->bodiesPerArena, bodies,
+		sizeof(GpuBodyState) * b->bodiesPerArena, cudaMemcpyHostToDevice, "upload bodies");
+	MemcpyOnBatchStream(b, b->dCars + (size_t)arenaIdx * b->numCars, cars,
+		sizeof(GpuCarGameState) * b->numCars, cudaMemcpyHostToDevice, "upload cars");
+	MemcpyOnBatchStream(b, b->dPads + (size_t)arenaIdx * b->numPads, pads,
+		sizeof(GpuPadState) * b->numPads, cudaMemcpyHostToDevice, "upload pads");
+}
+
+void UploadArenaStateAsync(GpuBatch* b, int arenaIdx,
+	const GpuBodyState* bodies, const GpuCarGameState* cars, const GpuPadState* pads) {
+	CudaCheck(cudaMemcpyAsync(b->dBodies + (size_t)arenaIdx * b->bodiesPerArena, bodies,
+		sizeof(GpuBodyState) * b->bodiesPerArena, cudaMemcpyHostToDevice, b->stream),
+		"upload bodies async");
+	CudaCheck(cudaMemcpyAsync(b->dCars + (size_t)arenaIdx * b->numCars, cars,
+		sizeof(GpuCarGameState) * b->numCars, cudaMemcpyHostToDevice, b->stream),
+		"upload cars async");
+	CudaCheck(cudaMemcpyAsync(b->dPads + (size_t)arenaIdx * b->numPads, pads,
+		sizeof(GpuPadState) * b->numPads, cudaMemcpyHostToDevice, b->stream),
+		"upload pads async");
+}
+
+void UploadBallStateAsync(GpuBatch* b, int arenaIdx, const GpuBallGameState* state) {
+	CudaCheck(cudaMemcpyAsync(b->dBallStates + arenaIdx, state, sizeof(GpuBallGameState),
+		cudaMemcpyHostToDevice, b->stream), "up ball state async");
 }
 
 void UploadBodyConsts(GpuBatch* b, const GpuBodyConsts* consts) {
@@ -599,8 +714,17 @@ void UploadConstantControls(GpuBatch* b, const GpuCarControls* perCar) {
 	if (!b->dConstControls)
 		CudaCheck(cudaMalloc(&b->dConstControls, sizeof(GpuCarControls) * count),
 			"alloc const controls");
-	CudaCheck(cudaMemcpy(b->dConstControls, perCar, sizeof(GpuCarControls) * count,
-		cudaMemcpyHostToDevice), "upload const controls");
+	MemcpyOnBatchStream(b, b->dConstControls, perCar, sizeof(GpuCarControls) * count,
+		cudaMemcpyHostToDevice, "upload const controls");
+}
+
+void UploadConstantControlsAsync(GpuBatch* b, const GpuCarControls* perCar) {
+	size_t count = (size_t)b->numArenas * b->numCars;
+	if (!b->dConstControls)
+		CudaCheck(cudaMalloc(&b->dConstControls, sizeof(GpuCarControls) * count),
+			"alloc const controls");
+	CudaCheck(cudaMemcpyAsync(b->dConstControls, perCar, sizeof(GpuCarControls) * count,
+		cudaMemcpyHostToDevice, b->stream), "upload const controls async");
 }
 
 // ============================== DEVICE-SIDE PHASES ==============================
@@ -761,25 +885,91 @@ __device__ static void EmitManifoldsOut(const CuManifold* src, int n, GpuManifol
 	}
 }
 
-// 2026-06-11: 255 regs/thread + ~25KB stack is measured-optimal here; capping
-// registers via __launch_bounds__ (tested 128 and ~170 per thread) raises
-// occupancy 2x but the extra spill traffic makes the kernel 23-32% SLOWER.
-// Do not add launch bounds without re-measuring; hashes stay identical either
+// 2026-06-11: 255 regs/thread + ~21KB stack is measured-optimal here; capping
+// registers via __launch_bounds__ raises occupancy but the extra spill traffic
+// makes the kernel slower (2026-06-11: 128 / ~170 regs 23-32% slower with one
+// arena per block; 2026-09-02: __launch_bounds__(32, 11) = 168 regs fits the
+// 2000-arena batch in one wave and cuts the kickoff-scenario bench 1.83 ->
+// 1.58 ms, yet loses 1-3% end-to-end where arenas are contact-heavy). Do not
+// add launch bounds without an end-to-end A/B; hashes stay identical either
 // way (register allocation does not change FP results).
+// Per-lane-group shared scratch for the car pre-tick / pad phases, carved
+// from dynamic shared memory. The layout is sized by this batch's staged
+// bodies, ray lanes per wheel and pads (host and device compute the same
+// offsets), so a 1v1 batch does not pay the 8-body / 16-lane worst case:
+// shared memory per SM is what the L1 cache has to give up.
+struct CuStepGroupLayout {
+	int io, dyn, dynBodies, raySrc, rayTgt, rayFrac, rayMesh, rayNrm, padGrant, flags;
+	int bytes;
+};
+
+__host__ __device__ inline int CuStepPlace(int& field, int offset, size_t bytes) {
+	offset = (offset + 15) & ~15;
+	field = offset;
+	return offset + (int)bytes;
+}
+
+// Per-arena shared scratch. Car pre-ticks run in batches of lanes/4 cars
+// (one lane per wheel, see the kernel): each car slot has its own staged
+// CuCarTickIO; every body is staged once per batch (the wheel ray tests visit
+// all of them); the ray arrays hold one entry per (wheel slot, ray lane).
+// Wheel scratch lives in the wheel lane's registers/local memory and reaches
+// the car's leader lane by warp shuffle, so it costs no shared memory.
+__host__ __device__ inline CuStepGroupLayout CuStepGroupSmemLayout(int bodies, int lanes,
+	int numPads) {
+	const int carsPerBatch = lanes / 4;
+	CuStepGroupLayout L;
+	int off = 0;
+	// the collision phase aliases the IO staging for its per-body static-pair
+	// candidate lists ([bodies][1 + CU_STATIC_CAND_MAX] ints)
+	size_t ioBytes = sizeof(CuCarTickIO) * carsPerBatch;
+	size_t candBytes = sizeof(int) * (1 + CU_STATIC_CAND_MAX) * bodies;
+	off = CuStepPlace(L.io, off, ioBytes > candBytes ? ioBytes : candBytes);
+	off = CuStepPlace(L.dyn, off, sizeof(GpuDynBody) * bodies);
+	off = CuStepPlace(L.dynBodies, off, sizeof(CuBodyDyn) * bodies);
+	off = CuStepPlace(L.raySrc, off, sizeof(CuVec3) * 4 * carsPerBatch);
+	off = CuStepPlace(L.rayTgt, off, sizeof(CuVec3) * 4 * carsPerBatch);
+	off = CuStepPlace(L.rayFrac, off, sizeof(float) * lanes);
+	off = CuStepPlace(L.rayMesh, off, sizeof(int) * lanes);
+	off = CuStepPlace(L.rayNrm, off, sizeof(CuVec3) * lanes);
+	off = CuStepPlace(L.padGrant, off, sizeof(int) * (numPads > 0 ? numPads : 1));
+	// [0..cpb) skip flags, [cpb..2cpb) car indices, then dep flag, ok flag
+	off = CuStepPlace(L.flags, off, sizeof(int) * (2 * carsPerBatch + 2));
+	L.bytes = off;
+	return L;
+}
+
 __global__ void GpuStepArenasKernel(
 	GpuBodyState* bodies, const GpuBodyConsts* consts,
 	GpuCarGameState* cars, GpuPadState* pads,
 	const GpuCarControls* schedule, int scheduleTicks,
 	int numCars, int numPads, int numTicks,
 	int startPhase, int endPhase, float dt,
+	int lanesPerArena, int numActive, int arenasPerBlock,
 	GpuWorldGeo geo, GpuCollideKernelArgs ca) {
 
-	const int arenaIdx = ca.arenaList ? ca.arenaList[blockIdx.x] : blockIdx.x;
+	// 2026-09-02: arenasPerBlock arenas share one block as lane groups of lanesPerArena
+	// threads (lane 0 of each group runs the order-sensitive serial phases);
+	// every arena's computation is unchanged, the packing only raises the
+	// number of arenas resident per SM. Barriers stay block-wide and
+	// unconditional; an inactive group (past numActive) idles through them.
+	const int sub = threadIdx.x / lanesPerArena;
+	const int lane = threadIdx.x - sub * lanesPerArena;
+	const int slot = blockIdx.x * arenasPerBlock + sub;
+	const bool active = slot < numActive;
+	const int arenaIdx = active ? (ca.arenaList ? ca.arenaList[slot] : slot) : 0;
 	const int bodiesPerArena = 1 + numCars;
-	const int bodyIdx = threadIdx.x;
+	extern __shared__ __align__(16) unsigned char sStepSmem[];
+	const CuStepGroupLayout sgL = CuStepGroupSmemLayout(bodiesPerArena, lanesPerArena, numPads);
+	unsigned char* sgBase = sStepSmem + (size_t)sub * sgL.bytes;
 
-	// per-phase cycle accumulation (diagnostic; ca.profCycles null in production)
+	// per-phase cycle accumulation (diagnostic build only: the accumulators
+	// and clock reads cost registers in a kernel pinned at the 255 cap)
+#ifdef RS_GPU_PHASE_PROF
 	const bool profOn = ca.profCycles != nullptr;
+#else
+	constexpr bool profOn = false;
+#endif
 	unsigned long long profAcc[GPU_PHASE_COUNT] = {};
 	long long profT0 = 0;
 
@@ -788,65 +978,114 @@ __global__ void GpuStepArenasKernel(
 	GpuPadState* arenaPads = pads + (size_t)arenaIdx * numPads;
 
 	for (int tick = 0; tick < numTicks; tick++) {
-		if (profOn && bodyIdx == 0)
+		if (profOn && lane == 0)
 			profT0 = clock64();
 		if (ca.tailEnabled && startPhase <= GPU_PHASE_GAME_PRE && GPU_PHASE_GAME_PRE <= endPhase) {
-			// 2026-06-11: car pre-ticks stay sequential in the CPU's _cars order
-			// (each car sees the previous cars' post-pre-tick state), but WITHIN
-			// a car the four wheel raycast/friction computations are independent
-			// (see CuCarPreTickWheel) and run on threads 0-3. Per-car staging
-			// lives in shared memory so the wheel threads can read it; thread 0
-			// still runs every order-sensitive section.
-			__shared__ CuCarTickIO sIo;
-			__shared__ GpuDynBody sDyn[8];
-			__shared__ CuBodyDyn sDynBodies[8];
-			__shared__ CuWheelScratch sW[4];
-			__shared__ int sSkipCar;
-			// per-wheel suspension-ray staging for the 8-lane mesh test
-			__shared__ CuVec3 sRaySrc[4], sRayTgt[4];
-			__shared__ float sRayFrac[4][8];
-			__shared__ int sRayMesh[4][8];
-			__shared__ CuVec3 sRayNrm[4][8];
+			// 2026-09-02: car pre-ticks run in batches of carsPerBatch = lanes/4
+			// cars, one lane per wheel and one leader lane (wheel 0's) per car
+			// for the order-sensitive Car::_PreTickUpdate body. The CPU runs
+			// cars sequentially in _cars order and a later car can observe an
+			// earlier one only through (a) the demolition block's activation /
+			// contact-response writes and (b) wheel friction against a dynamic
+			// ground body (the pre-tick never moves a body, and no helper writes
+			// the staged body tables). A batch is first attempted speculatively
+			// from the committed state: if any car in it is demoed, still
+			// carries a respawn no-response flag, is not ACTIVE_TAG, or has a
+			// wheel resting on a dynamic body, nothing is committed and the
+			// batch is redone one car at a time by the same code (exact CPU
+			// order, all lanes on that car's rays). Otherwise the cars' inputs
+			// are identical to the sequential ones and their writes are
+			// disjoint, so committing them together is bit-identical. Barrier
+			// counts are uniform across the block's lane groups: every attempt
+			// runs its barriers whether or not its work is predicated off.
+			CuCarTickIO* sIoAll = reinterpret_cast<CuCarTickIO*>(sgBase + sgL.io);
+			GpuDynBody* sDyn = reinterpret_cast<GpuDynBody*>(sgBase + sgL.dyn);
+			CuBodyDyn* sDynBodies = reinterpret_cast<CuBodyDyn*>(sgBase + sgL.dynBodies);
+			CuVec3* sRaySrc = reinterpret_cast<CuVec3*>(sgBase + sgL.raySrc);
+			CuVec3* sRayTgt = reinterpret_cast<CuVec3*>(sgBase + sgL.rayTgt);
+			float* sRayFrac = reinterpret_cast<float*>(sgBase + sgL.rayFrac);
+			int* sRayMesh = reinterpret_cast<int*>(sgBase + sgL.rayMesh);
+			CuVec3* sRayNrm = reinterpret_cast<CuVec3*>(sgBase + sgL.rayNrm);
+			const int carsPerBatch = lanesPerArena >> 2;
+			int* sSkip = reinterpret_cast<int*>(sgBase + sgL.flags);
+			int* sCi = sSkip + carsPerBatch;
+			int& sDep = sSkip[2 * carsPerBatch];
+			int& sOk = sSkip[2 * carsPerBatch + 1];
+			static_assert(sizeof(CuWheelScratch) % 4 == 0, "wheel scratch shuffles whole words");
+			constexpr int kWheelWords = (int)(sizeof(CuWheelScratch) / 4);
 
-			if (bodyIdx == 0) {
+			if (active && lane == 0) {
 				// Arena::Step head: ball zero-vel sleeping
 				CuBallSleepCheck(arenaBodies[0]);
 			}
 			uint64_t tickCount = ca.tickBase + tick;
-			for (int oc = 0; oc < numCars; oc++) {
-				int ci = ca.carOrder[(size_t)arenaIdx * numCars + oc];
-				GpuCarGameState& cst = arenaCars[ci];
-				if (bodyIdx == 0) {
-					// bench sets car->controls from the schedule before each tick;
-					// RL chunked stepping holds per-car constant controls instead
-					GpuCarControls ctrl = ca.constControls
-						? ca.constControls[(size_t)arenaIdx * numCars + ci]
-						: schedule[((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
-
-					// Car::_PreTickUpdate head: demolition handling. RAW activation
-					// writes (the CPU assigns m_activationState1 directly, so
-					// non-demoed cars are forced awake every tick).
-					sSkipCar = 0;
-					if (cst.isDemoed) {
-						float t = cst.demoRespawnTimer - dt;
-						cst.demoRespawnTimer = t > 0.0f ? t : 0.0f; // RS_MAX
-						if (cst.demoRespawnTimer == 0.0f)
-							CuCarRespawn(arenaBodies[1 + ci], cst,
-								ca.rngStates[arenaIdx], consts[1 + ci], *ca.tail);
-						arenaBodies[1 + ci].activationState = CU_DISABLE_SIMULATION;
-						cst.noContactResponse = 1;
-						// CPU re-evaluates isDemoed: a just-respawned car continues
-						// the pre-tick (with the disabled body + response flag still
-						// set for this tick - quirk preserved)
-						if (cst.isDemoed)
-							sSkipCar = 1;
-					} else {
-						arenaBodies[1 + ci].activationState = CU_ACTIVE_TAG;
-						cst.noContactResponse = 0;
+#ifdef RS_GPU_PHASE_PROF
+			long long subT = clock64();
+			auto subLap = [&](int k) { if (profOn && lane == 0) { long long t = clock64(); atomicAdd(&ca.profCycles[GPU_PHASE_COUNT + 5 + k], (unsigned long long)(t - subT)); subT = t; } };
+#else
+			auto subLap = [](int) {};
+#endif
+			const int wheel = lane & 3;
+			const int slot = lane >> 2; // car slot of this lane's wheel work
+			for (int oc = 0; oc < numCars; oc += carsPerBatch) {
+				const int nb = numCars - oc < carsPerBatch ? numCars - oc : carsPerBatch;
+				// attempt 0: speculative batch of nb cars; attempts 1..nb: exact
+				// single-car passes, predicated off when attempt 0 committed
+				for (int attempt = 0; attempt <= nb; attempt++) {
+					const bool exact = attempt > 0;
+					const int carsHere = exact ? 1 : nb;
+					const int first = exact ? oc + attempt - 1 : oc;
+					const int raysPerWheel = lanesPerArena / (4 * carsHere);
+					if (lane == 0) {
+						sDep = 0;
+						if (!exact)
+							sOk = 0;
 					}
+					__syncthreads();
+					const bool work = active && (exact ? !sOk : true);
+					const bool isLeader = wheel == 0 && slot < carsHere;
 
-					if (!sSkipCar) {
-						{
+					// phase 1 (leaders): dependency check or demolition block,
+					// then stage this car's tick IO
+					if (work && isLeader) {
+						const int ci = ca.carOrder[(size_t)arenaIdx * numCars + first + slot];
+						GpuCarGameState& cst = arenaCars[ci];
+						sCi[slot] = ci;
+						int skip = 0;
+						if (!exact) {
+							if (cst.isDemoed || cst.noContactResponse != 0 ||
+								arenaBodies[1 + ci].activationState != CU_ACTIVE_TAG)
+								sDep = 1;
+						} else {
+							// Car::_PreTickUpdate head: demolition handling. RAW activation
+							// writes (the CPU assigns m_activationState1 directly, so
+							// non-demoed cars are forced awake every tick).
+							if (cst.isDemoed) {
+								float t = cst.demoRespawnTimer - dt;
+								cst.demoRespawnTimer = t > 0.0f ? t : 0.0f; // RS_MAX
+								if (cst.demoRespawnTimer == 0.0f)
+									CuCarRespawn(arenaBodies[1 + ci], cst,
+										ca.rngStates[arenaIdx], consts[1 + ci], *ca.tail);
+								arenaBodies[1 + ci].activationState = CU_DISABLE_SIMULATION;
+								cst.noContactResponse = 1;
+								// CPU re-evaluates isDemoed: a just-respawned car continues
+								// the pre-tick (with the disabled body + response flag still
+								// set for this tick - quirk preserved)
+								if (cst.isDemoed)
+									skip = 1;
+							} else {
+								arenaBodies[1 + ci].activationState = CU_ACTIVE_TAG;
+								cst.noContactResponse = 0;
+							}
+						}
+						sSkip[slot] = skip;
+						if (!skip) {
+							// bench sets car->controls from the schedule before each tick;
+							// RL chunked stepping holds per-car constant controls instead
+							GpuCarControls ctrl = ca.constControls
+								? ca.constControls[(size_t)arenaIdx * numCars + ci]
+								: schedule[((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
+							CuCarTickIO& sIo = sIoAll[slot];
 							const GpuBodyState& s = arenaBodies[1 + ci];
 							sIo.body.basis = CuLoadBasis(s.basis);
 							sIo.body.origin = GV(s.pos);
@@ -857,17 +1096,27 @@ __global__ void GpuStepArenasKernel(
 							sIo.body.invMass = consts[1 + ci].invMass;
 							sIo.totalForce = GV(s.totalForce);
 							sIo.totalTorque = GV(s.totalTorque);
+							sIo.st = cst;
+							for (int w = 0; w < 4; w++)
+								sIo.wheels[w] = cst.wheels[w];
+							sIo.controls = ctrl;
+							// solverInfo.m_timeStep: 1/60 ctor default until the first
+							// bullet step assigns the tick time
+							sIo.solverTimeStep = tickCount == 0 ? (1.0f / 60.0f) : dt;
 						}
-						sIo.st = cst;
-						for (int w = 0; w < 4; w++)
-							sIo.wheels[w] = cst.wheels[w];
-						sIo.controls = ctrl;
-						// solverInfo.m_timeStep: 1/60 ctor default until the first
-						// bullet step assigns the tick time
-						sIo.solverTimeStep = tickCount == 0 ? (1.0f / 60.0f) : dt;
+					}
+					__syncthreads();
+					subLap(0);
 
-						// live dyn-body table (templates + current state + proxy aabbMin)
-						for (int d = 0; d < bodiesPerArena && d < 8; d++) {
+					// phase 2: live dyn-body table (templates + committed state +
+					// proxy aabbMin), one lane per body, after the demolition
+					// block's response-flag writes; wheel lanes build their
+					// wheel transform and suspension ray
+					CuWheelScratch w;
+					const bool dep1 = sDep != 0;
+					if (work && !dep1) {
+						if (lane < bodiesPerArena) {
+							const int d = lane;
 							sDyn[d] = ca.dynTemplates[d];
 							const GpuBodyState& s = arenaBodies[d];
 							sDyn[d].basis = s.basis;
@@ -882,89 +1131,112 @@ __global__ void GpuStepArenasKernel(
 								sDyn[d].hasContactResponse = arenaCars[d - 1].noContactResponse ? 0 : 1;
 							sDynBodies[d] = DynToBody(sDyn[d]);
 						}
+						if (slot < carsHere && !sSkip[slot])
+							CuCarPreTickWheelPre(sIoAll[slot], *ca.carConsts, wheel, w,
+								sRaySrc[lane], sRayTgt[lane]);
 					}
-				}
-				__syncthreads();
-				if (!sSkipCar) {
-					// Wheel phase, 8 lanes per wheel (block is always 32 threads):
-					// lane 0 of each wheel builds the suspension ray, all 8 lanes
-					// split the static meshes, then lane 0 lex-min-reduces
-					// (fraction, mesh index) - identical to the sequential
-					// strict-< / first-visited tie-break - and finishes planes,
-					// dynamic bodies, suspension and friction.
-					const int wheelIdx = bodyIdx >> 3;
-					const int rayLane = bodyIdx & 7;
-					if (bodyIdx < 4)
-						CuCarPreTickWheelPre(sIo, *ca.carConsts, bodyIdx, sW[bodyIdx],
-							sRaySrc[bodyIdx], sRayTgt[bodyIdx]);
 					__syncthreads();
+
+					// phase 3: static-mesh ray test, raysPerWheel lanes per wheel
+					// slot; lane 0 of each wheel later lex-min-reduces (fraction,
+					// mesh index), identical to the sequential strict-< /
+					// first-visited tie-break for any lane count
 					{
-						float bf = 1.0f;
-						int bm = 0x7fffffff;
-						CuVec3 bn = { 0, 0, 0 };
-						CuRayTestStaticMeshes(geo, sRaySrc[wheelIdx], sRayTgt[wheelIdx],
-							ca.carConsts->rayCastGroup, CU_FILTER_ALL, rayLane, 8, bf, bn, bm);
-						sRayFrac[wheelIdx][rayLane] = bf;
-						sRayMesh[wheelIdx][rayLane] = bm;
-						sRayNrm[wheelIdx][rayLane] = bn;
+						const int wheelSlot = lane / raysPerWheel;
+						const int rayLane = lane - wheelSlot * raysPerWheel;
+						if (work && !dep1 && !sSkip[wheelSlot >> 2]) {
+							float bf = 1.0f;
+							int bm = 0x7fffffff;
+							CuVec3 bn = { 0, 0, 0 };
+							CuRayTestStaticMeshes(geo, sRaySrc[wheelSlot], sRayTgt[wheelSlot],
+								ca.carConsts->rayCastGroup, CU_FILTER_ALL, rayLane, raysPerWheel, bf, bn, bm);
+							sRayFrac[wheelSlot * raysPerWheel + rayLane] = bf;
+							sRayMesh[wheelSlot * raysPerWheel + rayLane] = bm;
+							sRayNrm[wheelSlot * raysPerWheel + rayLane] = bn;
+						}
 					}
 					__syncthreads();
-					if (bodyIdx < 4) {
+					subLap(1);
+
+					// phase 4 (wheel lanes): reduce, planes, dynamic bodies,
+					// suspension, friction; a wheel resting on a dynamic body
+					// makes the speculative batch order-dependent
+					if (work && !dep1 && slot < carsHere && !sSkip[slot]) {
 						GpuRayHit hit;
 						hit.fraction = 1.0f;
 						hit.hitKind = -1;
 						hit.normalWorld = { 0, 0, 0 };
 						int bestMesh = 0x7fffffff;
-						for (int l = 0; l < 8; l++) {
-							float f = sRayFrac[bodyIdx][l];
-							int m = sRayMesh[bodyIdx][l];
+						for (int l = 0; l < raysPerWheel; l++) {
+							float f = sRayFrac[lane * raysPerWheel + l];
+							int m = sRayMesh[lane * raysPerWheel + l];
 							if (f < hit.fraction || (f == hit.fraction && m < bestMesh)) {
 								hit.fraction = f;
 								bestMesh = m;
-								hit.normalWorld = sRayNrm[bodyIdx][l];
+								hit.normalWorld = sRayNrm[lane * raysPerWheel + l];
 							}
 						}
 						if (bestMesh != 0x7fffffff)
 							hit.hitKind = 0;
-						CuCarPreTickWheelPost(sIo, *ca.carConsts, geo, ca.grid, sDyn,
-							bodiesPerArena, 1 + ci, sDynBodies, bodyIdx,
-							sRaySrc[bodyIdx], sRayTgt[bodyIdx], hit, sW[bodyIdx]);
+						CuCarPreTickWheelPost(sIoAll[slot], *ca.carConsts, geo, ca.grid, sDyn,
+							bodiesPerArena, 1 + sCi[slot], sDynBodies, wheel,
+							sRaySrc[lane], sRayTgt[lane], hit, w);
+						if (!exact && w.groundIdx >= 0)
+							sDep = 1;
 					}
 					__syncthreads();
-					if (bodyIdx == 0) {
-						float dbgFwd;
-						CuCarPreTick(sIo, *ca.carConsts, geo, ca.grid, sDyn, bodiesPerArena,
-							1 + ci, sDynBodies, dt, sW, &dbgFwd, /*wheelsPrecomputed=*/true);
-						// write back chassis + game state + wheels
-						{
-							GpuBodyState& s = arenaBodies[1 + ci];
-							for (int r = 0; r < 3; r++)
-								s.basis.row[r] = { sIo.body.basis.r[r].x, sIo.body.basis.r[r].y, sIo.body.basis.r[r].z };
-							s.pos = { sIo.body.origin.x, sIo.body.origin.y, sIo.body.origin.z };
-							s.linVel = { sIo.body.linVel.x, sIo.body.linVel.y, sIo.body.linVel.z };
-							s.angVel = { sIo.body.angVel.x, sIo.body.angVel.y, sIo.body.angVel.z };
-							s.totalForce = { sIo.totalForce.x, sIo.totalForce.y, sIo.totalForce.z };
-							s.totalTorque = { sIo.totalTorque.x, sIo.totalTorque.y, sIo.totalTorque.z };
-						}
-						cst = sIo.st;
-						for (int w = 0; w < 4; w++)
-							cst.wheels[w] = sIo.wheels[w];
-						// friction impulses on dynamic ground bodies (ball / other cars)
-						for (int d = 0; d < bodiesPerArena && d < 8; d++) {
-							if (d == 1 + ci)
-								continue;
-							GpuBodyState& s = arenaBodies[d];
-							s.linVel = { sDynBodies[d].linVel.x, sDynBodies[d].linVel.y, sDynBodies[d].linVel.z };
-							s.angVel = { sDynBodies[d].angVel.x, sDynBodies[d].angVel.y, sDynBodies[d].angVel.z };
+					subLap(2);
+#ifdef RS_GPU_PHASE_PROF
+					if (profOn && lane == 0 && active && attempt == 0) {
+						atomicAdd(&ca.profCycles[GPU_PHASE_COUNT + 10], 1ull); // speculative batches
+						if (sDep) atomicAdd(&ca.profCycles[GPU_PHASE_COUNT + 11], 1ull); // fell back
+					}
+#endif
+
+					// phase 5: leaders gather their four wheels' scratch by warp
+					// shuffle (uniform: every lane shuffles), run the car body
+					// and commit chassis + game state + wheels
+					CuWheelScratch W[4];
+					{
+						const unsigned* src = reinterpret_cast<const unsigned*>(&w);
+						const int base = (threadIdx.x & 31) & ~3;
+						for (int i = 0; i < 4; i++) {
+							unsigned* dst = reinterpret_cast<unsigned*>(&W[i]);
+							for (int j = 0; j < kWheelWords; j++)
+								dst[j] = __shfl_sync(0xffffffffu, src[j], base + i);
 						}
 					}
+					const bool commit = work && sDep == 0;
+					if (commit && isLeader && !sSkip[slot]) {
+						const int ci = sCi[slot];
+						CuCarTickIO& sIo = sIoAll[slot];
+						float dbgFwd;
+						CuCarPreTick(sIo, *ca.carConsts, geo, ca.grid, sDyn, bodiesPerArena,
+							1 + ci, sDynBodies, dt, W, &dbgFwd, /*wheelsPrecomputed=*/true);
+						GpuBodyState& s = arenaBodies[1 + ci];
+						for (int r = 0; r < 3; r++)
+							s.basis.row[r] = { sIo.body.basis.r[r].x, sIo.body.basis.r[r].y, sIo.body.basis.r[r].z };
+						s.pos = { sIo.body.origin.x, sIo.body.origin.y, sIo.body.origin.z };
+						s.linVel = { sIo.body.linVel.x, sIo.body.linVel.y, sIo.body.linVel.z };
+						s.angVel = { sIo.body.angVel.x, sIo.body.angVel.y, sIo.body.angVel.z };
+						s.totalForce = { sIo.totalForce.x, sIo.totalForce.y, sIo.totalForce.z };
+						s.totalTorque = { sIo.totalTorque.x, sIo.totalTorque.y, sIo.totalTorque.z };
+						GpuCarGameState& cst = arenaCars[ci];
+						cst = sIo.st;
+						for (int w2 = 0; w2 < 4; w2++)
+							cst.wheels[w2] = sIo.wheels[w2];
+					}
+					if (!exact && lane == 0)
+						sOk = sDep == 0 ? 1 : 0;
+					__syncthreads();
+					subLap(3);
 				}
-				__syncthreads();
 			}
-			// pad pre-ticks: independent per pad, strided over the block
-			for (int p = bodyIdx; p < numPads; p += blockDim.x)
-				CuPadPreTick(arenaPads[p], dt);
-			if (bodyIdx == 0) {
+			// pad pre-ticks: independent per pad, strided over the lane group
+			if (active)
+				for (int p = lane; p < numPads; p += lanesPerArena)
+					CuPadPreTick(arenaPads[p], dt);
+			if (active && lane == 0) {
 				// Ball::_PreTickUpdate (heatseeker steering / snowday ground-stick
 				// reset / hoops+dropshot kickoff launch; no-op in soccar)
 				if (ca.consts->gameMode == CU_GAMEMODE_HEATSEEKER)
@@ -979,21 +1251,31 @@ __global__ void GpuStepArenasKernel(
 			// stepSimulation head: applyGravity (active bodies). After the ball
 			// pre-tick: the kickoff launch sets ACTIVE_TAG, which gravity reads.
 			__syncthreads();
-			if (bodyIdx < bodiesPerArena)
-				CuApplyGravity(arenaBodies[bodyIdx], consts[bodyIdx]);
+			if (active && lane < bodiesPerArena)
+				CuApplyGravity(arenaBodies[lane], consts[lane]);
+			__syncthreads();
+			subLap(4);
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_GAME_PRE] += t - profT0; profT0 = t; }
+		if (profOn && lane == 0) { long long t = clock64(); profAcc[GPU_PHASE_GAME_PRE] += t - profT0; profT0 = t; }
 
 		if (startPhase <= GPU_PHASE_PREDICT && GPU_PHASE_PREDICT <= endPhase) {
-			if (bodyIdx < bodiesPerArena)
-				PhasePredict(arenaBodies[bodyIdx], consts[bodyIdx]);
+			if (active && lane < bodiesPerArena)
+				PhasePredict(arenaBodies[lane], consts[lane]);
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_PREDICT] += t - profT0; profT0 = t; }
+		if (profOn && lane == 0) { long long t = clock64(); profAcc[GPU_PHASE_PREDICT] += t - profT0; profT0 = t; }
 
 		if (ca.enabled && startPhase <= GPU_PHASE_COLLISION && GPU_PHASE_COLLISION <= endPhase) {
-			if (bodyIdx == 0) {
+			// 2026-09-02: the aabb refresh and the static-pair candidate scan run
+			// one lane per body (independent per body); regSeq - the arena-wide
+			// registration counter the CPU increments in body order - is
+			// assigned by rank among the bodies that changed cell (ballot), the
+			// same sequence. Thread 0 then merges candidates in body order and
+			// runs the rest of the collision tick. The candidate lists alias the
+			// car pre-tick's IO staging, which is dead in this phase.
+			int* staticCand = reinterpret_cast<int*>(sgBase + sgL.io);
+			{
 				CuCollideIn cin;
 				cin.bodies = arenaBodies;
 				cin.bodyConsts = consts;
@@ -1025,16 +1307,39 @@ __global__ void GpuStepArenasKernel(
 					? ca.tileDamage + (size_t)arenaIdx * ca.numTiles : nullptr;
 				cin.tileNoResponse = ca.tileNoResponse
 					? ca.tileNoResponse + (size_t)arenaIdx * ca.numTiles : nullptr;
-				CuCollideTick(cin);
-				EmitManifoldsOut(cin.manifolds, *cin.numManifolds,
-					ca.manifoldsOut + (size_t)arenaIdx * GPU_MAX_MANIFOLDS);
+#ifdef RS_GPU_PHASE_PROF
+				cin.prof = profOn ? ca.profCycles + GPU_PHASE_COUNT : nullptr;
+#endif
+				const bool body = active && lane < bodiesPerArena;
+				const int regBase = body ? *cin.regCounter : 0;
+				const bool moved = body && CuCollideUpdateAabbBody(cin, lane);
+				const unsigned ballot = __ballot_sync(0xffffffffu, moved);
+				const int groupBase = (sub * lanesPerArena) & 31;
+				const unsigned groupBits = (ballot >> groupBase) &
+					(lanesPerArena >= 32 ? 0xffffffffu : ((1u << lanesPerArena) - 1u));
+				if (moved)
+					cin.proxies[lane].regSeq = regBase + __popc(groupBits & ((1u << lane) - 1u)) + 1;
+				if (body && lane == 0 && groupBits)
+					*cin.regCounter = regBase + __popc(groupBits);
+				__syncthreads();
+				if (body)
+					CuCollideStaticCandidates(cin, lane, staticCand + lane * (1 + CU_STATIC_CAND_MAX));
+				__syncthreads();
+				if (active && lane == 0) {
+					CuCollideTick(cin, staticCand);
+					EmitManifoldsOut(cin.manifolds, *cin.numManifolds,
+						ca.manifoldsOut + (size_t)arenaIdx * GPU_MAX_MANIFOLDS);
+				}
 			}
+		} else {
+			__syncthreads();
+			__syncthreads();
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_COLLISION] += t - profT0; profT0 = t; }
+		if (profOn && lane == 0) { long long t = clock64(); profAcc[GPU_PHASE_COLLISION] += t - profT0; profT0 = t; }
 
 		if (ca.enabled && startPhase <= GPU_PHASE_SOLVE && GPU_PHASE_SOLVE <= endPhase) {
-			if (bodyIdx == 0) {
+			if (active && lane == 0) {
 				CuSolveTick(arenaBodies, consts, arenaCars, bodiesPerArena, ca.numStatics,
 					ca.manifolds + (size_t)arenaIdx * GPU_MAX_MANIFOLDS,
 					ca.numManifolds[arenaIdx],
@@ -1046,21 +1351,21 @@ __global__ void GpuStepArenasKernel(
 			}
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_SOLVE] += t - profT0; profT0 = t; }
+		if (profOn && lane == 0) { long long t = clock64(); profAcc[GPU_PHASE_SOLVE] += t - profT0; profT0 = t; }
 
 		if (startPhase <= GPU_PHASE_INTEGRATE && GPU_PHASE_INTEGRATE <= endPhase) {
-			if (bodyIdx < bodiesPerArena)
-				PhaseIntegrate(arenaBodies[bodyIdx], consts[bodyIdx], dt);
+			if (active && lane < bodiesPerArena)
+				PhaseIntegrate(arenaBodies[lane], consts[lane], dt);
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_INTEGRATE] += t - profT0; profT0 = t; }
+		if (profOn && lane == 0) { long long t = clock64(); profAcc[GPU_PHASE_INTEGRATE] += t - profT0; profT0 = t; }
 
 		if (startPhase <= GPU_PHASE_ACTIVATION && GPU_PHASE_ACTIVATION <= endPhase) {
-			if (bodyIdx < bodiesPerArena)
-				PhaseActivation(arenaBodies[bodyIdx], consts[bodyIdx], dt);
+			if (active && lane < bodiesPerArena)
+				PhaseActivation(arenaBodies[lane], consts[lane], dt);
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0) { long long t = clock64(); profAcc[GPU_PHASE_ACTIVATION] += t - profT0; profT0 = t; }
+		if (profOn && lane == 0) { long long t = clock64(); profAcc[GPU_PHASE_ACTIVATION] += t - profT0; profT0 = t; }
 
 		if (ca.tailEnabled && startPhase <= GPU_PHASE_GAME_POST && GPU_PHASE_GAME_POST <= endPhase) {
 			// 2026-06-11: clearForces and the car post-tick/finish pair touch only
@@ -1073,12 +1378,12 @@ __global__ void GpuStepArenasKernel(
 			{
 				uint64_t tickCount = ca.tickBase + tick;
 				// stepSimulation tail: clearForces (all nonstatic bodies)
-				if (bodyIdx < bodiesPerArena)
-					CuClearForces(arenaBodies[bodyIdx]);
-				// car post-tick + finish, one car per thread (carOrder is a
+				if (active && lane < bodiesPerArena)
+					CuClearForces(arenaBodies[lane]);
+				// car post-tick + finish, one car per lane (carOrder is a
 				// permutation; per-car work is order-independent here)
-				if (bodyIdx < numCars) {
-					int ci = bodyIdx;
+				if (active && lane < numCars) {
+					int ci = lane;
 					GpuCarControls ctrl = ca.constControls
 						? ca.constControls[(size_t)arenaIdx * numCars + ci]
 						: schedule[((size_t)arenaIdx * numCars + ci) * (size_t)scheduleTicks + (size_t)tickCount];
@@ -1087,7 +1392,7 @@ __global__ void GpuStepArenasKernel(
 				}
 			}
 			__syncthreads();
-			if (bodyIdx == 0) {
+			if (active && lane == 0) {
 				uint64_t tickCount = ca.tickBase + tick;
 				// boost pad grid checks, in _cars order (shared pad locks)
 				for (int oc = 0; oc < numCars; oc++) {
@@ -1099,12 +1404,13 @@ __global__ void GpuStepArenasKernel(
 			__syncthreads();
 			// pad post-ticks: per-pad phase in parallel, boost grants in pad order
 			// (see CuPadPostTickPad; soccar has the most pads at 34 < 64)
-			__shared__ int sPadGrant[64];
-			for (int p = bodyIdx; p < numPads && p < 64; p += blockDim.x)
-				sPadGrant[p] = CuPadPostTickPad(arenaPads[p], ca.padConfigs[p],
-					arenaCars, *ca.tail);
+			int* sPadGrant = reinterpret_cast<int*>(sgBase + sgL.padGrant);
+			if (active)
+				for (int p = lane; p < numPads; p += lanesPerArena)
+					sPadGrant[p] = CuPadPostTickPad(arenaPads[p], ca.padConfigs[p],
+						arenaCars, *ca.tail);
 			__syncthreads();
-			if (bodyIdx == 0) {
+			if (active && lane == 0) {
 				uint64_t tickCount = ca.tickBase + tick;
 				for (int p = 0; p < numPads; p++)
 					if (sPadGrant[p] >= 0)
@@ -1125,11 +1431,11 @@ __global__ void GpuStepArenasKernel(
 			}
 		}
 		__syncthreads();
-		if (profOn && bodyIdx == 0)
+		if (profOn && lane == 0)
 			profAcc[GPU_PHASE_GAME_POST] += clock64() - profT0;
 	}
 
-	if (profOn && bodyIdx == 0)
+	if (profOn && lane == 0 && active)
 		for (int p = 0; p < GPU_PHASE_COUNT; p++)
 			atomicAdd(&ca.profCycles[p], profAcc[p]);
 }
@@ -1138,7 +1444,17 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase,
 	bool sync = true, const int* dArenaList = nullptr, int listCount = 0,
 	long long tickBaseOverride = -1) {
 	constexpr float TICK_TIME = 1.0f / 120.0f;
-	int threads = b->bodiesPerArena > 32 ? 64 : 32;
+	// 2026-09-02: lane group per arena = 16 threads (two arenas per 32-thread
+	// block), widened to the next power of two when an arena has more bodies.
+	// Measured on an RTX 5070 at 2000-4000 1v1 arenas: 16 lanes beats 8 and
+	// 4 (their extra residency is eaten by the longer per-lane mesh walks)
+	// and cuts the 7-tick chunk 42% versus one arena per block, with every
+	// per-step state hash unchanged (gpusim_validate).
+	int lanes = 8;
+	while (lanes < b->bodiesPerArena)
+		lanes *= 2;
+	int threads = lanes > 32 ? 64 : 32;
+	int apb = threads / lanes;
 	GpuCollideKernelArgs ca = {};
 	ca.enabled = b->hasCollideData ? 1 : 0;
 	if (b->hasCollideData) {
@@ -1180,14 +1496,17 @@ static void Launch(GpuBatch* b, int numTicks, int startPhase, int endPhase,
 		if (tickBaseOverride >= 0)
 			ca.tickBase = (uint64_t)tickBaseOverride;
 	}
-	int grid = dArenaList ? listCount : b->numArenas;
-	GpuStepArenasKernel<<<grid, threads>>>(
+	int count = dArenaList ? listCount : b->numArenas;
+	int grid = (count + apb - 1) / apb;
+	size_t smemBytes = (size_t)CuStepGroupSmemLayout(b->bodiesPerArena, lanes,
+		b->numPads).bytes * (size_t)apb;
+	GpuStepArenasKernel<<<grid, threads, smemBytes, b->stream>>>(
 		b->dBodies, b->dConsts, b->dCars, b->dPads, b->dSchedule, b->scheduleTicks,
 		b->numCars, b->numPads, numTicks, startPhase, endPhase, TICK_TIME,
-		b->geo, ca);
+		lanes, count, apb, b->geo, ca);
 	CudaCheck(cudaGetLastError(), "kernel launch");
 	if (sync)
-		CudaCheck(cudaDeviceSynchronize(), "kernel run");
+		CudaCheck(cudaStreamSynchronize(b->stream), "kernel run");
 }
 
 void StepTicks(GpuBatch* b, int numTicks) {
@@ -1210,7 +1529,7 @@ unsigned long long BatchTickCount(GpuBatch* b) {
 }
 
 void SyncBatch(GpuBatch* b) {
-	CudaCheck(cudaDeviceSynchronize(), "async kernel run");
+	CudaCheck(cudaStreamSynchronize(b->stream), "async kernel run");
 }
 
 void StepTicksSubset(GpuBatch* b, int numTicks, const int* arenaIdxs, int count,
@@ -1219,30 +1538,45 @@ void StepTicksSubset(GpuBatch* b, int numTicks, const int* arenaIdxs, int count,
 		return;
 	if (!b->dArenaList)
 		CudaCheck(cudaMalloc(&b->dArenaList, sizeof(int) * b->numArenas), "list alloc");
-	CudaCheck(cudaMemcpy(b->dArenaList, arenaIdxs, sizeof(int) * count,
-		cudaMemcpyHostToDevice), "list up");
+	MemcpyOnBatchStream(b, b->dArenaList, arenaIdxs, sizeof(int) * count,
+		cudaMemcpyHostToDevice, "list up");
 	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1, /*sync=*/true,
 		b->dArenaList, count, (long long)tickBase);
 	// tickCount not advanced: this re-covers a window already counted
+}
+
+void StepTicksSubsetAsync(GpuBatch* b, int numTicks, const int* arenaIdxs, int count,
+	unsigned long long tickBase) {
+	if (count <= 0)
+		return;
+	if (!b->dArenaList)
+		CudaCheck(cudaMalloc(&b->dArenaList, sizeof(int) * b->numArenas), "list alloc");
+	CudaCheck(cudaMemcpyAsync(b->dArenaList, arenaIdxs, sizeof(int) * count,
+		cudaMemcpyHostToDevice, b->stream), "list up async");
+	Launch(b, numTicks, 0, GPU_PHASE_COUNT - 1, /*sync=*/false,
+		b->dArenaList, count, (long long)tickBase);
 }
 
 // 2026-06-11: per-phase cycle profiling (diagnostic; ~zero cost while disabled)
 void EnablePhaseProfiling(GpuBatch* b) {
 	if (b->dProfCycles)
 		return;
+#ifndef RS_GPU_PHASE_PROF
+	fprintf(stderr, "EnablePhaseProfiling: built without RS_GPU_PHASE_PROF, phase cycles will read 0\n");
+#endif
 	CudaCheck(cudaMalloc(&b->dProfCycles,
-		sizeof(unsigned long long) * GPU_PHASE_COUNT), "prof alloc");
+		sizeof(unsigned long long) * (GPU_PHASE_PROF_SLOTS)), "prof alloc");
 	CudaCheck(cudaMemset(b->dProfCycles, 0,
-		sizeof(unsigned long long) * GPU_PHASE_COUNT), "prof zero");
+		sizeof(unsigned long long) * (GPU_PHASE_PROF_SLOTS)), "prof zero");
 }
 
-void GetPhaseCycles(GpuBatch* b, unsigned long long out[GPU_PHASE_COUNT]) {
+void GetPhaseCycles(GpuBatch* b, unsigned long long out[GPU_PHASE_PROF_SLOTS]) {
 	if (!b->dProfCycles) {
-		for (int i = 0; i < GPU_PHASE_COUNT; i++) out[i] = 0;
+		for (int i = 0; i < GPU_PHASE_PROF_SLOTS; i++) out[i] = 0;
 		return;
 	}
 	CudaCheck(cudaMemcpy(out, b->dProfCycles,
-		sizeof(unsigned long long) * GPU_PHASE_COUNT,
+		sizeof(unsigned long long) * (GPU_PHASE_PROF_SLOTS),
 		cudaMemcpyDeviceToHost), "prof down");
 }
 
@@ -1250,23 +1584,51 @@ void GetPhaseCycles(GpuBatch* b, unsigned long long out[GPU_PHASE_COUNT]) {
 // DownloadArenaState loop is prohibitively chatty at RL batch sizes)
 void DownloadAllArenaStates(GpuBatch* b,
 	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads) {
-	CudaCheck(cudaMemcpy(bodies, b->dBodies,
+	MemcpyOnBatchStream(b, bodies, b->dBodies,
 		sizeof(GpuBodyState) * b->numArenas * b->bodiesPerArena,
-		cudaMemcpyDeviceToHost), "down all bodies");
-	CudaCheck(cudaMemcpy(cars, b->dCars,
+		cudaMemcpyDeviceToHost, "down all bodies");
+	MemcpyOnBatchStream(b, cars, b->dCars,
 		sizeof(GpuCarGameState) * b->numArenas * b->numCars,
-		cudaMemcpyDeviceToHost), "down all cars");
+		cudaMemcpyDeviceToHost, "down all cars");
 	if (b->numPads > 0)
-		CudaCheck(cudaMemcpy(pads, b->dPads,
+		MemcpyOnBatchStream(b, pads, b->dPads,
 			sizeof(GpuPadState) * b->numArenas * b->numPads,
-			cudaMemcpyDeviceToHost), "down all pads");
+			cudaMemcpyDeviceToHost, "down all pads");
 }
 
 // Batched ball game state download (callback side effects: hit info lives in the
 // car states; this carries impulse caches + mode info)
 void DownloadAllBallStates(GpuBatch* b, GpuBallGameState* balls) {
-	CudaCheck(cudaMemcpy(balls, b->dBallStates,
-		sizeof(GpuBallGameState) * b->numArenas, cudaMemcpyDeviceToHost), "down all balls");
+	MemcpyOnBatchStream(b, balls, b->dBallStates,
+		sizeof(GpuBallGameState) * b->numArenas, cudaMemcpyDeviceToHost, "down all balls");
+}
+
+void DownloadAllArenaStatesAsync(GpuBatch* b,
+	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads) {
+	CudaCheck(cudaMemcpyAsync(bodies, b->dBodies,
+		sizeof(GpuBodyState) * b->numArenas * b->bodiesPerArena,
+		cudaMemcpyDeviceToHost, b->stream), "down all bodies async");
+	CudaCheck(cudaMemcpyAsync(cars, b->dCars,
+		sizeof(GpuCarGameState) * b->numArenas * b->numCars,
+		cudaMemcpyDeviceToHost, b->stream), "down all cars async");
+	if (b->numPads > 0)
+		CudaCheck(cudaMemcpyAsync(pads, b->dPads,
+			sizeof(GpuPadState) * b->numArenas * b->numPads,
+			cudaMemcpyDeviceToHost, b->stream), "down all pads async");
+}
+
+void DownloadAllBallStatesAsync(GpuBatch* b, GpuBallGameState* balls) {
+	CudaCheck(cudaMemcpyAsync(balls, b->dBallStates,
+		sizeof(GpuBallGameState) * b->numArenas, cudaMemcpyDeviceToHost, b->stream),
+		"down all balls async");
+}
+
+void RecordDownloadEvent(GpuBatch* b) {
+	CudaCheck(cudaEventRecord(b->downloadEvent, b->stream), "record download event");
+}
+
+void WaitDownloadEvent(GpuBatch* b) {
+	CudaCheck(cudaEventSynchronize(b->downloadEvent), "wait download event");
 }
 
 void RunPhaseSegment(GpuBatch* b, int startPhase, int endPhase) {
@@ -1275,12 +1637,12 @@ void RunPhaseSegment(GpuBatch* b, int startPhase, int endPhase) {
 
 void DownloadArenaState(GpuBatch* b, int arenaIdx,
 	GpuBodyState* bodies, GpuCarGameState* cars, GpuPadState* pads) {
-	CudaCheck(cudaMemcpy(bodies, b->dBodies + (size_t)arenaIdx * b->bodiesPerArena,
-		sizeof(GpuBodyState) * b->bodiesPerArena, cudaMemcpyDeviceToHost), "download bodies");
-	CudaCheck(cudaMemcpy(cars, b->dCars + (size_t)arenaIdx * b->numCars,
-		sizeof(GpuCarGameState) * b->numCars, cudaMemcpyDeviceToHost), "download cars");
-	CudaCheck(cudaMemcpy(pads, b->dPads + (size_t)arenaIdx * b->numPads,
-		sizeof(GpuPadState) * b->numPads, cudaMemcpyDeviceToHost), "download pads");
+	MemcpyOnBatchStream(b, bodies, b->dBodies + (size_t)arenaIdx * b->bodiesPerArena,
+		sizeof(GpuBodyState) * b->bodiesPerArena, cudaMemcpyDeviceToHost, "download bodies");
+	MemcpyOnBatchStream(b, cars, b->dCars + (size_t)arenaIdx * b->numCars,
+		sizeof(GpuCarGameState) * b->numCars, cudaMemcpyDeviceToHost, "download cars");
+	MemcpyOnBatchStream(b, pads, b->dPads + (size_t)arenaIdx * b->numPads,
+		sizeof(GpuPadState) * b->numPads, cudaMemcpyDeviceToHost, "download pads");
 }
 
 } // namespace rscuda

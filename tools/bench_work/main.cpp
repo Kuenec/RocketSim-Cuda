@@ -2156,7 +2156,7 @@ static uint64_t RunGpu(const Args& args, double& elapsedS) {
 		static const char* PHASE_NAMES[rscuda::GPU_PHASE_COUNT] = {
 			"game_pre", "predict", "collision", "solve",
 			"integrate", "activation", "game_post" };
-		unsigned long long pc[rscuda::GPU_PHASE_COUNT];
+		unsigned long long pc[rscuda::GPU_PHASE_PROF_SLOTS];
 		rscuda::GetPhaseCycles(batch, pc);
 		unsigned long long total = 0;
 		for (int i = 0; i < rscuda::GPU_PHASE_COUNT; i++) total += pc[i];
