@@ -342,6 +342,7 @@ struct BatchConfig {
   MutatorConfig mutators;
   std::vector<CarSpec> cars;
   std::vector<uint64_t> rng_seeds;
+  uint32_t cpu_threads = 0;
 };
 
 MutatorConfig default_mutators(GameMode mode);

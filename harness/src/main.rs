@@ -58,7 +58,7 @@ fn parse_args() -> Result<Options, String> {
         Some("bench") => Command::Bench,
         other => {
             return Err(format!(
-                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|both] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cuda] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N]"
+                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|both] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cpu-mt,cuda] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N]"
             ));
         }
     };
@@ -89,6 +89,7 @@ fn parse_args() -> Result<Options, String> {
                         "upstream" => Ok(bench::Target::Upstream),
                         "cpu" => Ok(bench::Target::Ours(Backend::Cpu)),
                         "cuda" => Ok(bench::Target::Ours(Backend::Cuda)),
+                        "cpu-mt" => Ok(bench::Target::CpuThreads),
                         other => Err(format!("invalid bench target {other}")),
                     })
                     .collect::<Result<_, _>>()?

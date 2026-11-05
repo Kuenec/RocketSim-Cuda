@@ -326,6 +326,7 @@ fn batch_desc(
         mutators: to_ffi_mutators(&mutators),
         cars,
         rng_seeds: seeds.to_vec(),
+        cpu_threads: 0,
     })
 }
 

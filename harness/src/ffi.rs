@@ -305,6 +305,7 @@ pub struct RscBatchDesc {
     pub num_arenas: u32,
     pub custom_pads: *const BoostPadConfig,
     pub num_custom_pads: i32,
+    pub cpu_threads: u32,
 }
 
 #[repr(C)]
@@ -657,6 +658,7 @@ pub struct BatchDesc {
     pub mutators: MutatorConfig,
     pub cars: Vec<CarSpec>,
     pub rng_seeds: Vec<u64>,
+    pub cpu_threads: u32,
 }
 
 pub struct DeviceExport {
@@ -720,6 +722,7 @@ impl Batch {
             num_arenas: desc.rng_seeds.len() as u32,
             custom_pads: std::ptr::null(),
             num_custom_pads: -1,
+            cpu_threads: desc.cpu_threads,
         };
         let ptr = unsafe { rsc_batch_create(meshes.0, &raw) };
         if ptr.is_null() {

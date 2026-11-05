@@ -1,9 +1,12 @@
 #include "rocketsim_cuda/rocketsim_cuda.hpp"
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 
 #include "rocketsim_cuda/convert.hpp"
 #include "rocketsim_cuda/cuda_batch.hpp"
@@ -66,6 +69,98 @@ bool MeshSet::has_game_mode(GameMode mode) const {
   return impl_->library.has_mode(to_internal(mode));
 }
 
+class CpuStepPool {
+public:
+  CpuStepPool(const rsc::ArenaStatic &view, std::vector<rsc::Arena> &arenas,
+              uint32_t threads)
+      : view_(view), arenas_(arenas) {
+    uint32_t n = static_cast<uint32_t>(arenas.size());
+    uint32_t count = std::max(1u, std::min(threads, n));
+    for (uint32_t w = 0; w < count; ++w) {
+      scratch_.push_back(std::make_unique<rsc::StepScratch>());
+    }
+    for (uint32_t w = 1; w < count; ++w) {
+      workers_.emplace_back([this, w] { run_worker(w); });
+    }
+  }
+
+  CpuStepPool(const CpuStepPool &) = delete;
+  CpuStepPool &operator=(const CpuStepPool &) = delete;
+
+  ~CpuStepPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    start_.notify_all();
+    for (std::thread &t : workers_) {
+      t.join();
+    }
+  }
+
+  void step(uint32_t ticks) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ticks_ = ticks;
+      pending_ = static_cast<uint32_t>(workers_.size());
+      ++generation_;
+    }
+    start_.notify_all();
+    step_range(0, ticks);
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_.wait(lock, [this] { return pending_ == 0; });
+  }
+
+private:
+  void step_range(uint32_t worker, uint32_t ticks) {
+    size_t n = arenas_.size();
+    size_t count = scratch_.size();
+    size_t first = n * worker / count;
+    size_t last = n * (worker + 1) / count;
+    for (size_t i = first; i < last; ++i) {
+      rsc::Arena &a = arenas_[i];
+      a.counters = rsc::ArenaEventCounters{};
+      for (uint32_t t = 0; t < ticks; ++t) {
+        rsc::arena_step_tick(view_, a, *scratch_[worker]);
+      }
+    }
+  }
+
+  void run_worker(uint32_t worker) {
+    uint64_t seen = 0;
+    for (;;) {
+      uint32_t ticks;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        start_.wait(lock, [&] { return stop_ || generation_ != seen; });
+        if (stop_) {
+          return;
+        }
+        seen = generation_;
+        ticks = ticks_;
+      }
+      step_range(worker, ticks);
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        --pending_;
+      }
+      done_.notify_one();
+    }
+  }
+
+  const rsc::ArenaStatic &view_;
+  std::vector<rsc::Arena> &arenas_;
+  std::vector<std::unique_ptr<rsc::StepScratch>> scratch_;
+  std::vector<std::thread> workers_;
+  std::mutex mutex_;
+  std::condition_variable start_;
+  std::condition_variable done_;
+  uint64_t generation_ = 0;
+  uint32_t ticks_ = 0;
+  uint32_t pending_ = 0;
+  bool stop_ = false;
+};
+
 struct ArenaBatch::Impl {
   Backend backend;
   GameMode mode;
@@ -77,7 +172,7 @@ struct ArenaBatch::Impl {
   std::vector<CarInfo> car_infos;
   std::vector<rsc::MutatorConfig> mutators;
   std::vector<rsc::Arena> host;
-  std::unique_ptr<rsc::StepScratch> scratch;
+  std::unique_ptr<CpuStepPool> cpu_pool;
   std::vector<CarControls> staged_controls;
   std::vector<uint8_t> staged_mask;
   bool any_staged = false;
@@ -201,14 +296,7 @@ struct ArenaBatch::Impl {
       return;
     }
 #endif
-    const rsc::ArenaStatic &view = st->view();
-    for (uint32_t i = 0; i < num_arenas; ++i) {
-      rsc::Arena &a = host[i];
-      a.counters = rsc::ArenaEventCounters{};
-      for (uint32_t t = 0; t < ticks; ++t) {
-        rsc::arena_step_tick(view, a, *scratch);
-      }
-    }
+    cpu_pool->step(ticks);
   }
 
   void wait_idle() {
@@ -311,7 +399,10 @@ ArenaBatch::ArenaBatch(Backend backend, std::shared_ptr<const MeshSet> meshes,
       rsc::create_arena(*im.st, mutators, config.rng_seeds[i], cars,
                         im.host[i]);
     }
-    im.scratch = std::make_unique<rsc::StepScratch>();
+    uint32_t threads = config.cpu_threads != 0
+                           ? config.cpu_threads
+                           : std::max(1u, std::thread::hardware_concurrency());
+    im.cpu_pool = std::make_unique<CpuStepPool>(view, im.host, threads);
   }
 }
 

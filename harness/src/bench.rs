@@ -8,6 +8,7 @@ use crate::scenario::{Backend, SplitMix, mode_code, to_ffi_controls, to_ffi_muta
 pub enum Target {
     Upstream,
     Ours(Backend),
+    CpuThreads,
 }
 
 impl Target {
@@ -15,6 +16,7 @@ impl Target {
         match self {
             Target::Upstream => "upstream-rust",
             Target::Ours(b) => b.name(),
+            Target::CpuThreads => "cpu-all-cores",
         }
     }
 }
@@ -124,7 +126,13 @@ pub fn run(
                 }
             }
         }
-        Target::Ours(backend) => {
+        Target::Ours(_) | Target::CpuThreads => {
+            let (backend, cpu_threads) = match target {
+                Target::Ours(Backend::Cuda) => (Backend::Cuda, 0),
+                Target::Ours(Backend::Cpu) => (Backend::Cpu, 1),
+                _ => (Backend::Cpu, 0),
+            };
+            let backend = &backend;
             let cars = teams
                 .iter()
                 .map(|&team| {
@@ -142,6 +150,7 @@ pub fn run(
                     mutators: to_ffi_mutators(&mutators),
                     cars,
                     rng_seeds: (0..arenas as u64).collect(),
+                    cpu_threads,
                 },
             )?;
             for a in 0..arenas as u32 {

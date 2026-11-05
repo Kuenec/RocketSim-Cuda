@@ -18,7 +18,7 @@ Results are only guaranteed against a reference built on a machine with the same
 - Full state get and set: car state (core or full snapshot), ball state, pad state, tile state, kickoff resets with or without seeds.
 - Arena copies within and across batches and backends, and raw snapshots that include hidden physics state.
 - Exact upstream per-tick event lists (goals via `is_ball_scored`, ball touches, bumps, demos, boost pickups, landings, world hits) plus per-step event counters.
-- Synchronous and asynchronous stepping of N ticks.
+- Synchronous and asynchronous stepping of N ticks; the CPU backend steps arenas on a thread pool (`BatchConfig::cpu_threads`, all hardware threads by default), which cannot change results because arenas are independent.
 - A device-resident CUDA backend: every tick, reset, state change, mutator change, and copy runs as a kernel on the GPU, and arena state never travels to the host unless you ask for it. Controls can be read from device memory, kickoff resets can be selected by a device-side mask, and the full observable state can be exported straight into device buffers, so a GPU policy can drive a batch with no host transfers.
 
 ## Build
@@ -92,7 +92,7 @@ All of these calls are queued on the batch's stream in order. Device inputs (act
 tools/run_gates.sh
 ```
 
-The script builds the library and the Rust harness, runs the quick libm check, and runs every gate scenario on both backends against the upstream crate. It prints one PASS or FAIL line per scenario and backend with event coverage, and ends with `ALL GATES PASS` or `GATES FAIL`. Arguments are passed to the harness, for example `--backend cuda`, `--filter hoops`, or `--quick`. Scenarios cover every mode with meshes, 1, 2, 3, 4, 6, and 8 cars, all bodies, all demo modes, 20,000-tick single-arena runs, 128-arena batches, seeded random controls, controls from the `rocketsim_test` recordings, kickoffs, scripted goals and head-on collisions, mid-run state sets, runtime mutator changes, pad state restores, clones, snapshots, and cross-batch and cross-backend copies. Dropshot scenarios report BLOCKED until Dropshot meshes are present.
+The script builds the library and the Rust harness, runs the quick libm check, and runs every gate scenario on both backends against the upstream crate. It prints one PASS or FAIL line per scenario and backend with event coverage, and ends with `ALL GATES PASS` or `GATES FAIL`. Arguments are passed to the harness, for example `--backend cuda`, `--filter hoops`, or `--quick`. Scenarios cover every mode, 0, 1, 2, 3, 4, 6, and 8 cars, all bodies, all demo modes, 20,000-tick single-arena runs, 128-arena batches, seeded random controls, controls from the `rocketsim_test` recordings, kickoffs, scripted goals and head-on collisions, mid-run state sets, runtime mutator changes, pad state restores, clones, snapshots, and cross-batch and cross-backend copies. Scenarios for a mode whose meshes are missing report BLOCKED.
 
 ## Benchmarks
 
@@ -100,15 +100,15 @@ The script builds the library and the Rust harness, runs the quick libm check, a
 build/harness-target/release/rsv3_harness bench --targets upstream,cpu,cuda --arenas 100,1000,10000
 ```
 
-Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after a 1,200-tick warm-up over 5 runs of 240 ticks (arena-ticks per second, median with min to max). Upstream and the CPU backend run on one pinned core of a Ryzen 7 7700X. The CUDA backend runs on an RTX 5070 in the device-resident loop: controls are read from device memory, steps are asynchronous, and the ball, car, arena-info, and event-count state of every arena is exported into device buffers after every 8-tick action, with one host synchronization per measured run.
+Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after a 1,200-tick warm-up over 5 runs of 240 ticks (arena-ticks per second, median with min to max). Upstream and the single-thread CPU backend run on one pinned core of a Ryzen 7 7700X (8 cores, 16 threads); the all-cores CPU column uses 16 threads. The CUDA backend runs on an RTX 5070 in the device-resident loop: controls are read from device memory, steps are asynchronous, and the ball, car, arena-info, and event-count state of every arena is exported into device buffers after every 8-tick action, with one host synchronization per measured run.
 
-| Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU backend, 1 thread | CUDA backend | CUDA vs upstream |
+| Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU, 1 thread | C++ CPU, all cores | CUDA |
 | --- | --- | --- | --- | --- |
-| 100 | 1.03M (0.98M to 1.12M) | 0.66M (0.64M to 0.73M) | 0.54M (0.48M to 0.59M) | 0.5x |
-| 1,000 | 0.85M (0.80M to 0.91M) | 0.62M (0.60M to 0.68M) | 2.25M (1.96M to 2.37M) | 2.7x |
-| 10,000 | 0.74M (0.73M to 0.77M) | 0.59M (0.59M to 0.62M) | 6.80M (6.45M to 6.86M) | 9.2x |
+| 100 | 1.02M (0.97M to 1.09M) | 0.66M (0.64M to 0.73M) | 4.43M (4.26M to 5.06M) | 0.58M (0.51M to 0.63M) |
+| 1,000 | 0.85M (0.83M to 0.93M) | 0.62M (0.61M to 0.68M) | 5.99M (5.78M to 6.31M) | 2.51M (2.18M to 2.64M) |
+| 10,000 | 0.74M (0.73M to 0.77M) | 0.59M (0.59M to 0.63M) | 5.75M (5.60M to 6.14M) | 7.39M (7.19M to 7.67M) |
 
-The CUDA backend runs one arena per thread and picks the block size from the batch size, so it needs thousands of arenas to fill the GPU. The C++ CPU backend runs at about 65 to 80 percent of the upstream Rust speed on one core. It uses portable scalar code where upstream uses SSE vector instructions, which is the likely cause; it has not been profiled in detail yet.
+The CUDA backend runs one arena per GPU thread and picks the block size from the batch size. Arenas that share a warp take different code paths, and that divergence dominates: a batch of identical arenas runs the same kernel at 10.1M (1,000 arenas) and 14.6M (10,000 arenas) arena-ticks per second. The CUDA backend therefore pays off with thousands of arenas and when the policy also runs on the GPU, since it avoids host transfers. The single-thread C++ CPU backend runs at about 65 to 80 percent of upstream speed; it uses portable scalar code where upstream uses SSE vector instructions, which is the likely cause.
 
 ## License
 

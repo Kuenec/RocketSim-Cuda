@@ -50,6 +50,9 @@ RS_HD int find_pair(const ArenaPhysics &a, uint16_t lo, uint16_t hi) {
 }
 
 RS_HD void pair_cache_add(World &w, uint16_t handle_a, uint16_t handle_b) {
+  if (handle_a <= w.num_static() && handle_b <= w.num_static()) {
+    return;
+  }
   if (!proxies_need_collision(w.proxy(handle_a), w.proxy(handle_b))) {
     return;
   }
