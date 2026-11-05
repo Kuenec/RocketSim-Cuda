@@ -1,14 +1,50 @@
-# Build output
-/build/
+# CMake
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps
 
-# Pristine upstream reference (ZealanL/RocketSim @ f80f9d9, v2.2.1).
-# Not versioned here - re-clone it if missing:
-#   git clone https://github.com/ZealanL/RocketSim RocketSim-ORIGINAL
-#   git -C RocketSim-ORIGINAL checkout f80f9d90f922315c5877a81987845d3242ff1780
-/RocketSim-ORIGINAL/
+# Ninja
+.ninja*
+build.ninja
 
-# Game-derived arena collision meshes (not redistributable, see Persistent_Memory.md)
-/collision_meshes/
+# Build-related
+RocketSim.Dir/
+build/
+x86/
+x64/
+Release/
+Debug
+out/
+*.obj
+*.lib
+*.exe
+*.pdb
+*.ilk
+*.tmp
+*.pyd
+*.whl
 
-# Machine-measured libm correction table (regenerate: cuda_math_test --emit-trig-table)
+# Arena collision mesh files
+*.cmf
 
+# Raw binary files
+*.bin
+
+# Visual Studio (not using anything VS-related)
+.vs/
+*.vcxproj
+*.sln
+*.filters
+*.user
+CMakeSettings.json
+
+# Anything starting with three underscores
+___*

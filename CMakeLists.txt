@@ -1,42 +1,31 @@
-cmake_minimum_required(VERSION 3.20)
-project(RocketSimCudaPort CXX)
+cmake_minimum_required (VERSION 3.20)
 
-if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-endif()
+project("RocketSim" LANGUAGES CXX)
 
-set(REF_DIR ${CMAKE_CURRENT_SOURCE_DIR}/RocketSim-ORIGINAL)
-set(WORK_DIR ${CMAKE_CURRENT_SOURCE_DIR}/RocketSim-CUDA)
+# RocketSim-CUDA work tree (v2.2.1 + the bit-exact CUDA port).
+# FP flags are part of the validated spec: the CPU reference is compiled with
+# -ffp-contract=off and the GPU with --fmad=false so both sides do plain IEEE
+# mul+add. Do not change them - the GPU/CPU bit-exactness gates depend on it.
 
-if(NOT EXISTS ${REF_DIR}/src/RocketSim.h)
-	message(FATAL_ERROR
-		"Pristine reference tree missing. Restore it with:\n"
-		"  git clone https://github.com/ZealanL/RocketSim RocketSim-ORIGINAL\n"
-		"  git -C RocketSim-ORIGINAL checkout f80f9d90f922315c5877a81987845d3242ff1780")
+file(GLOB_RECURSE FILES_ROCKETSIM "${PROJECT_SOURCE_DIR}/src/*.cpp" "${PROJECT_SOURCE_DIR}/src/*.h")
+file(GLOB_RECURSE FILES_BULLET "${PROJECT_SOURCE_DIR}/libsrc/bullet3-3.24/*.cpp" "${PROJECT_SOURCE_DIR}/libsrc/bullet3-3.24/*.h")
+
+add_library(RocketSim STATIC ${FILES_ROCKETSIM} ${FILES_BULLET})
+target_include_directories(RocketSim PUBLIC "${PROJECT_SOURCE_DIR}/src")
+
+set_target_properties(RocketSim PROPERTIES LINKER_LANGUAGE CXX)
+set_target_properties(RocketSim PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+# linked into the GigaLearnCPP shared library
+set_target_properties(RocketSim PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(NOT MSVC)
+	target_compile_options(RocketSim PRIVATE -ffp-contract=off)
 endif()
 
 find_package(Threads REQUIRED)
+target_link_libraries(RocketSim PUBLIC Threads::Threads)
 
-# Both trees define the same symbols; each bench links exactly one of them.
-function(add_rocketsim_lib name tree)
-	file(GLOB_RECURSE SRC CONFIGURE_DEPENDS
-		${tree}/src/*.cpp ${tree}/src/*.h
-		${tree}/libsrc/bullet3-3.24/*.cpp ${tree}/libsrc/bullet3-3.24/*.h)
-	add_library(${name} STATIC ${SRC})
-	target_include_directories(${name} PUBLIC ${tree}/src)
-	target_link_libraries(${name} PUBLIC Threads::Threads)
-endfunction()
-
-add_rocketsim_lib(rocketsim_ref ${REF_DIR})
-add_rocketsim_lib(rocketsim_work ${WORK_DIR})
-
-# GPU path: work copy only. Detected, never assumed - CPU-only builds stay valid
-# (--gpu-step then reports it is unavailable). On this machine configure with:
-#   cmake -B build -G Ninja -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
-#         -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-15
-# (login shells get both via /etc/profile.d/cuda.sh, see Persistent_Memory.md)
+# GPU simulation path (detected, never assumed - CPU-only builds stay valid)
 include(CheckLanguage)
-# Must be set BEFORE enable_language(CUDA), which otherwise locks in a default arch
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 	set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
@@ -44,49 +33,21 @@ check_language(CUDA)
 if(CMAKE_CUDA_COMPILER)
 	enable_language(CUDA)
 	find_package(CUDAToolkit REQUIRED)
-	file(GLOB_RECURSE WORK_CUDA_SRC CONFIGURE_DEPENDS ${WORK_DIR}/src/Cuda/*.cu)
-	target_sources(rocketsim_work PRIVATE ${WORK_CUDA_SRC})
+	file(GLOB_RECURSE FILES_CUDA "${PROJECT_SOURCE_DIR}/src/Cuda/*.cu")
+	target_sources(RocketSim PRIVATE ${FILES_CUDA})
 	# the target predates enable_language(CUDA), so set the arch on it explicitly
-	set_target_properties(rocketsim_work PROPERTIES
+	set_target_properties(RocketSim PROPERTIES
 		CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
 		CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-	target_compile_definitions(rocketsim_work PUBLIC RS_CUDA=1)
-	# -fmad=false: GPU math must be plain IEEE mul+add to match the -ffp-contract=off CPU reference
-	target_compile_options(rocketsim_work PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
-	# In-kernel phase profiler (bench --phase-prof): its accumulators cost
-	# registers in the 255-register step kernel, so it is compiled in only on request
+	target_compile_definitions(RocketSim PUBLIC RS_CUDA=1)
+	target_compile_options(RocketSim PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+	# in-kernel per-phase cycle profiler (GPUSIM_PROF at runtime); its
+	# accumulators cost registers in the 255-register step kernel, so it is
+	# compiled in only on request
 	option(RS_GPU_PHASE_PROF "Compile the GPU step kernel's phase profiler" OFF)
-	target_compile_definitions(rocketsim_work PRIVATE $<$<BOOL:${RS_GPU_PHASE_PROF}>:RS_GPU_PHASE_PROF>)
-	target_link_libraries(rocketsim_work PUBLIC CUDA::cudart_static)
-
-	# Bit-exactness regression guard for the device math layer (see CudaMath.cuh)
-	add_executable(cuda_math_test tools/cuda_math_test/main.cu tools/cuda_math_test/host_ref.cpp)
-	target_include_directories(cuda_math_test PRIVATE ${WORK_DIR}/src)
-	target_link_libraries(cuda_math_test PRIVATE rocketsim_work)
-	set_target_properties(cuda_math_test PROPERTIES
-		CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON
-		CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
-	target_compile_options(cuda_math_test PRIVATE
-		$<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>
-		$<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
-
-	message(STATUS "CUDA enabled (arch: ${CMAKE_CUDA_ARCHITECTURES})")
+	target_compile_definitions(RocketSim PRIVATE $<$<BOOL:${RS_GPU_PHASE_PROF}>:RS_GPU_PHASE_PROF>)
+	target_link_libraries(RocketSim PUBLIC CUDA::cudart_static)
+	message(STATUS "RocketSim: CUDA simulation enabled (arch: ${CMAKE_CUDA_ARCHITECTURES})")
 else()
-	message(STATUS "CUDA toolkit not found - GPU path disabled, --gpu-step unavailable")
+	message(STATUS "RocketSim: CUDA toolkit not found - GPU simulation disabled")
 endif()
-
-add_executable(rocketsim_reference_bench tools/bench/main.cpp)
-target_link_libraries(rocketsim_reference_bench PRIVATE rocketsim_ref)
-
-add_executable(rocketsim_bench tools/bench_work/main.cpp)
-target_link_libraries(rocketsim_bench PRIVATE rocketsim_work)
-
-foreach(t rocketsim_ref rocketsim_work rocketsim_reference_bench rocketsim_bench)
-	set_target_properties(${t} PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
-	if(NOT MSVC)
-		# 2026-06-10: no FMA contraction, so the CPU reference defines plain mul+add
-		# semantics that the GPU port can reproduce exactly (nvcc -fmad=false).
-		# MSVC /fp:precise already does not contract.
-		target_compile_options(${t} PRIVATE -ffp-contract=off)
-	endif()
-endforeach()
