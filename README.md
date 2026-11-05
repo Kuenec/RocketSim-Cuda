@@ -84,7 +84,7 @@ batch.reset_to_random_kickoff_masked(device_done_mask, device_seeds,
 cudaStream_t stream = static_cast<cudaStream_t>(batch.cuda_stream());
 ```
 
-All of these calls are queued on the batch's stream in order; synchronize with that stream (or call `batch.sync()`) before another stream reads the exported buffers.
+All of these calls are queued on the batch's stream in order. Device inputs (actions, masks, seeds) must be fully written before the call that reads them, so finish or order any copy or kernel that produces them against the batch's stream first; likewise, synchronize with that stream (or call `batch.sync()`) before another stream reads the exported buffers.
 
 ## Verification
 

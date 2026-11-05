@@ -197,6 +197,9 @@ int rsc_device_upload(void *device, const void *host, size_t size) {
   return guarded([&] {
 #ifdef RSC_HAS_CUDA
     cudaError_t err = cudaMemcpy(device, host, size, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) {
+      err = cudaDeviceSynchronize();
+    }
     if (err != cudaSuccess) {
       throw std::runtime_error(cudaGetErrorString(err));
     }
