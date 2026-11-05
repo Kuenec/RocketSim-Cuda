@@ -41,7 +41,6 @@ struct BroadphaseProxy {
   uint32_t client_obj_idx;
   uint8_t collision_filter_group;
   uint8_t collision_filter_mask;
-  uint32_t unique_id;
   Aabb aabb;
   uint32_t cell_idx;
   uint32_t indices[3];

@@ -18,7 +18,6 @@ public:
 
   void upload(uint32_t arena, const Arena &src);
   void download(uint32_t arena, Arena &dst);
-  void download_all(Arena *dst);
   void apply_controls(const CarControls *controls, const uint8_t *mask,
                       uint32_t cars_per_arena);
   void step(uint32_t ticks);

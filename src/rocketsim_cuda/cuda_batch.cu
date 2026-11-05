@@ -12,7 +12,8 @@ namespace rsc {
 
 namespace {
 
-constexpr uint32_t k_block_size = 64;
+constexpr uint32_t k_max_block_size = 32;
+constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_device_stack_bytes = 16384;
 
 void check(cudaError_t err, const char *what) {
@@ -113,6 +114,8 @@ struct CudaBatch::Impl {
   size_t copy_capacity = 0;
   ArenaStatic view;
   cudaStream_t stream = nullptr;
+  uint32_t block_size = 1;
+  uint32_t blocks = 0;
 
   Impl(const HostStatic &st, uint32_t n) : num_arenas(n) {
     size_t stack_bytes = 0;
@@ -166,6 +169,18 @@ struct CudaBatch::Impl {
     }
     arenas.allocate(n);
     scratch.allocate(n);
+    int device = 0;
+    check(cudaGetDevice(&device), "cudaGetDevice");
+    int sm_count = 0;
+    check(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                 device),
+          "cudaDeviceGetAttribute");
+    uint32_t per_block =
+        n / (k_target_blocks_per_sm * static_cast<uint32_t>(sm_count));
+    while (block_size * 2 <= per_block && block_size < k_max_block_size) {
+      block_size *= 2;
+    }
+    blocks = (n + block_size - 1) / block_size;
   }
 
   ~Impl() {
@@ -190,14 +205,6 @@ void CudaBatch::upload(uint32_t arena, const Arena &src) {
 
 void CudaBatch::download(uint32_t arena, Arena &dst) {
   check(cudaMemcpyAsync(&dst, impl_->arenas.get() + arena, sizeof(Arena),
-                        cudaMemcpyDeviceToHost, impl_->stream),
-        "arena download");
-  sync();
-}
-
-void CudaBatch::download_all(Arena *dst) {
-  check(cudaMemcpyAsync(dst, impl_->arenas.get(),
-                        sizeof(Arena) * impl_->num_arenas,
                         cudaMemcpyDeviceToHost, impl_->stream),
         "arena download");
   sync();
@@ -229,8 +236,7 @@ void CudaBatch::apply_controls(const CarControls *controls, const uint8_t *mask,
 }
 
 void CudaBatch::step(uint32_t ticks) {
-  uint32_t blocks = (impl_->num_arenas + k_block_size - 1) / k_block_size;
-  step_kernel<<<blocks, k_block_size, 0, impl_->stream>>>(
+  step_kernel<<<impl_->blocks, impl_->block_size, 0, impl_->stream>>>(
       impl_->view, impl_->arenas.get(), impl_->scratch.get(), impl_->num_arenas,
       ticks);
   check(cudaGetLastError(), "step kernel launch");

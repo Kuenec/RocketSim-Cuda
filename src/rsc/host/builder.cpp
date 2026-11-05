@@ -705,7 +705,6 @@ uint32_t world_add_dynamic_body(World &w, RigidBody body, uint8_t group,
   proxy.client_obj_idx = body_idx;
   proxy.collision_filter_group = group;
   proxy.collision_filter_mask = mask;
-  proxy.unique_id = handle;
   proxy.aabb = aabb;
   proxy.cell_idx = grid_cell_index(*w.s, idx);
   proxy.indices[0] = idx[0];
@@ -953,7 +952,6 @@ void HostStatic::build_statics(const MeshLibrary &library) {
       proxy.collision_filter_mask =
           static_cast<uint8_t>(k_group_all ^ k_group_static);
     }
-    proxy.unique_id = idx + 1;
     proxy.aabb = rb.shape.get_aabb(rb.world_trans);
     static_bodies.push_back(rb);
     static_proxies.push_back(proxy);
@@ -997,7 +995,7 @@ void HostStatic::build_grid() {
   for (uint32_t s = 0; s < sw.num_static_bodies; ++s) {
     const BroadphaseProxy &proxy = static_proxies[s];
     const RigidBody &body = static_bodies[s];
-    uint16_t handle = static_cast<uint16_t>(proxy.unique_id);
+    uint16_t handle = static_cast<uint16_t>(s + 1);
     uint32_t lo[3];
     uint32_t hi[3];
     grid_cell_indices(sw, proxy.aabb.min.max(sw.grid_min), lo);

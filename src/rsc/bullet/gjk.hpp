@@ -126,7 +126,7 @@ struct VoronoiSimplexSolver {
     }
   }
 
-  RS_HD bool update_closest_vector_and_points() {
+  RS_HDN bool update_closest_vector_and_points() {
     if (!needs_update) {
       return cached_valid_closest;
     }
@@ -209,9 +209,9 @@ struct VoronoiSimplexSolver {
     return cached_valid_closest;
   }
 
-  RS_HD static bool closest_pt_point_triangle(Vec3A pt, Vec3A a, Vec3A b,
-                                              Vec3A c,
-                                              SubSimplexClosestResult &result) {
+  RS_HDN static bool
+  closest_pt_point_triangle(Vec3A pt, Vec3A a, Vec3A b, Vec3A c,
+                            SubSimplexClosestResult &result) {
     result.used.reset();
     Vec3A ab = b - a;
     Vec3A ac = c - a;
@@ -291,7 +291,7 @@ struct VoronoiSimplexSolver {
     return signp * signd < 0.0f ? 1 : 0;
   }
 
-  RS_HD static bool
+  RS_HDN static bool
   closest_pt_point_tetrahedron(Vec3A pt, Vec3A a, Vec3A b, Vec3A c, Vec3A d,
                                SubSimplexClosestResult &final_result) {
     final_result.closest_point_on_simplex = pt;
@@ -614,7 +614,7 @@ struct Gjk {
     return -1.0f;
   }
 
-  template <bool Margin> RS_HD GjkStatus evaluate(Vec3A guess) {
+  template <bool Margin> RS_HDN GjkStatus evaluate(Vec3A guess) {
     GjkStatus status = GjkStatus::Valid;
     int iterations = 0;
     float alpha = 0.0f;
@@ -1103,7 +1103,7 @@ struct Epa2 {
     return EpaStatus::FallBack;
   }
 
-  template <bool Margin> RS_HD EpaStatus evaluate(Gjk &gjk, Vec3A guess) {
+  template <bool Margin> RS_HDN EpaStatus evaluate(Gjk &gjk, Vec3A guess) {
     GjkSimplex simplex_before = gjk.simplex();
     if (simplex_before.rank <= 1 || !gjk.enclose_origin<Margin>()) {
       sv_store[0].w = gjk.store[simplex_before.c[0]].w;

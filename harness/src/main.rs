@@ -25,6 +25,7 @@ struct Options {
     bench_arenas: Vec<usize>,
     bench_reps: usize,
     bench_ticks: u32,
+    bench_warmup: u32,
     backends: Vec<Backend>,
     filter: Vec<String>,
     quick: bool,
@@ -44,6 +45,7 @@ fn parse_args() -> Result<Options, String> {
         bench_arenas: vec![100, 1000, 10000],
         bench_reps: 5,
         bench_ticks: 240,
+        bench_warmup: 1200,
         backends: vec![Backend::Cpu, Backend::Cuda],
         filter: Vec::new(),
         quick: false,
@@ -56,7 +58,7 @@ fn parse_args() -> Result<Options, String> {
         Some("bench") => Command::Bench,
         other => {
             return Err(format!(
-                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|both] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cuda] [--arenas 100,1000,10000] [--reps N] [--ticks N]"
+                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|both] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cuda] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N]"
             ));
         }
     };
@@ -105,6 +107,12 @@ fn parse_args() -> Result<Options, String> {
             "--reps" => {
                 let v = args.next().ok_or("--reps needs a value")?;
                 opts.bench_reps = v.parse().map_err(|e| format!("invalid --reps {v}: {e}"))?;
+            }
+            "--warmup" => {
+                let v = args.next().ok_or("--warmup needs a value")?;
+                opts.bench_warmup = v
+                    .parse()
+                    .map_err(|e| format!("invalid --warmup {v}: {e}"))?;
             }
             "--ticks" => {
                 let v = args.next().ok_or("--ticks needs a value")?;
@@ -360,7 +368,14 @@ fn run_bench(opts: &Options, meshes: &ffi::MeshSet) -> ExitCode {
     let mut ok = true;
     for &arenas in &opts.bench_arenas {
         for target in &opts.bench_targets {
-            match bench::run(meshes, target, arenas, opts.bench_reps, opts.bench_ticks) {
+            match bench::run(
+                meshes,
+                target,
+                arenas,
+                opts.bench_reps,
+                opts.bench_ticks,
+                opts.bench_warmup,
+            ) {
                 Ok(s) => println!(
                     "bench soccar_1v1 {:<14} arenas {:>6}  median {:>12.0}  min {:>12.0}  max {:>12.0} arena-ticks/s  samples {:?}",
                     target.name(),

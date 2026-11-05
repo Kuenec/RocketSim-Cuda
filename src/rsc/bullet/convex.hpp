@@ -13,7 +13,7 @@ struct HullView {
   const Vec3A *points;
   uint32_t count;
 
-  RS_HD Vec3A max_dot(Vec3A direction) const {
+  RS_HDN Vec3A max_dot(Vec3A direction) const {
     float best = u32_to_f32(0xff800000u);
     Vec3A support_vertex = Vec3A::zero();
     uint32_t chunks = count / 4;

@@ -151,10 +151,10 @@ RS_HD bool box_face_axis(SweepResult &out, float tri_min, float tri_max,
   return false;
 }
 
-RS_HD bool sat_sweep(Vec3A half, const Vec3A *q, Vec3A tri_min, Vec3A tri_max,
-                     const Vec3A *edges, Vec3A face_axis, bool has_face_axis,
-                     Vec3A centroid, float margin, float maximum_distance,
-                     SweepResult &out) {
+RS_HDN bool sat_sweep(Vec3A half, const Vec3A *q, Vec3A tri_min, Vec3A tri_max,
+                      const Vec3A *edges, Vec3A face_axis, bool has_face_axis,
+                      Vec3A centroid, float margin, float maximum_distance,
+                      SweepResult &out) {
   out.has_sep = false;
   out.best_gap = 0.0f;
   out.best_sep_axis = Vec3A::zero();
@@ -250,8 +250,8 @@ RS_HD int clip_halfspace(const Vec3A *input, int input_len, Vec3A *output,
   return out;
 }
 
-RS_HD bool clipped_tri_box_centroid(Vec3A half, const Vec3A *q, Vec3A shift,
-                                    Vec3A &result) {
+RS_HDN bool clipped_tri_box_centroid(Vec3A half, const Vec3A *q, Vec3A shift,
+                                     Vec3A &result) {
   Vec3A poly[9];
   Vec3A scratch[9];
   for (int i = 0; i < 9; ++i) {
@@ -313,8 +313,8 @@ RS_HD Vec3A closest_point_on_degenerate_triangle(Vec3A p, const Vec3A *q) {
   return c2;
 }
 
-RS_HD void segment_segment_closest(Vec3A p1, Vec3A q1, Vec3A p2, Vec3A q2,
-                                   Vec3A &out1, Vec3A &out2) {
+RS_HDN void segment_segment_closest(Vec3A p1, Vec3A q1, Vec3A p2, Vec3A q2,
+                                    Vec3A &out1, Vec3A &out2) {
   Vec3A d1 = q1 - p1;
   Vec3A d2 = q2 - p2;
   Vec3A r = p1 - p2;
@@ -435,8 +435,8 @@ RS_HD bool clip_segment_to_box(Vec3A a, Vec3A b, Vec3A half, Vec3A shift,
   return true;
 }
 
-RS_HD bool pen_witness_by_kind(Vec3A half, const Vec3A *q, AxisKind kind,
-                               Vec3A n_local, float overlap, Vec3A &out) {
+RS_HDN bool pen_witness_by_kind(Vec3A half, const Vec3A *q, AxisKind kind,
+                                Vec3A n_local, float overlap, Vec3A &out) {
   Vec3A shift = n_local * overlap;
   switch (kind.tag) {
   case AxisKindTag::None:
@@ -495,8 +495,8 @@ RS_HD bool pen_witness_by_kind(Vec3A half, const Vec3A *q, AxisKind kind,
   return false;
 }
 
-RS_HD Vec3A closest_point_on_triangle_precomp(Vec3A p, const Vec3A *q, Vec3A ab,
-                                              Vec3A ac) {
+RS_HDN Vec3A closest_point_on_triangle_precomp(Vec3A p, const Vec3A *q,
+                                               Vec3A ab, Vec3A ac) {
   Vec3A ap = p - q[0];
   float d1 = ab.dot(ap);
   float d2 = ac.dot(ap);
@@ -539,9 +539,9 @@ RS_HD Vec3A closest_point_on_triangle_precomp(Vec3A p, const Vec3A *q, Vec3A ab,
   return q[0] + ab * v + ac * w;
 }
 
-RS_HD void tri_edge_vs_box_edge_precomp(Vec3A tri_p, Vec3A tri_d, float tri_a,
-                                        Vec3A box_p0, Vec3A box_p1,
-                                        Vec3A &point_tri, Vec3A &point_box) {
+RS_HDN void tri_edge_vs_box_edge_precomp(Vec3A tri_p, Vec3A tri_d, float tri_a,
+                                         Vec3A box_p0, Vec3A box_p1,
+                                         Vec3A &point_tri, Vec3A &point_box) {
   Vec3A d2 = box_p1 - box_p0;
   Vec3A r = tri_p - box_p0;
   float e = d2.dot(d2);
@@ -595,8 +595,8 @@ RS_HD void tri_edge_vs_box_edge_precomp(Vec3A tri_p, Vec3A tri_d, float tri_a,
   point_box = box_p0 + d2 * t;
 }
 
-RS_HD void enum_aabb_triangle_pairs(Vec3A half, const Vec3A *q,
-                                    const Vec3A *edges, CandidatePair *pairs) {
+RS_HDN void enum_aabb_triangle_pairs(Vec3A half, const Vec3A *q,
+                                     const Vec3A *edges, CandidatePair *pairs) {
   int idx = 0;
   for (int i = 0; i < 3; ++i) {
     Vec3A point_box = clamp_point_to_aabb(q[i], half);
@@ -638,8 +638,8 @@ RS_HD void enum_aabb_triangle_pairs(Vec3A half, const Vec3A *q,
   }
 }
 
-RS_HD bool flat_tie_segment(Vec3A half, const CandidatePair *pairs, Vec3A &out0,
-                            Vec3A &out1) {
+RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
+                             Vec3A &out0, Vec3A &out1) {
   constexpr int n = 47;
   float flat_link = 0.5f * half.max_element();
   if (flat_link <= 0.0f || !is_finite_f32(flat_link)) {
@@ -742,9 +742,9 @@ struct BoxTriangleSatContact {
 };
 
 RS_HDN bool box_triangle_sat(const Affine3A &box_trans, Vec3A half_unmargined,
-                            float margin, const Vec3A *q,
-                            float maximum_distance,
-                            BoxTriangleSatContact &out) {
+                             float margin, const Vec3A *q,
+                             float maximum_distance,
+                             BoxTriangleSatContact &out) {
   using namespace sat;
   Vec3A tri_min = q[0].min(q[1]).min(q[2]);
   Vec3A tri_max = q[0].max(q[1]).max(q[2]);

@@ -75,12 +75,14 @@ pub fn run(
     arenas: usize,
     reps: usize,
     ticks: u32,
+    warmup_ticks: u32,
 ) -> Result<Stats, String> {
     let mode = GameMode::Soccar;
     let mutators = MutatorConfig::new(mode);
     let teams = [Team::Blue, Team::Orange];
     let pool = control_pool(arenas, teams.len());
     let chunks = ticks / TICKS_PER_ACTION;
+    let warmup_chunks = warmup_ticks / TICKS_PER_ACTION;
     let mut samples = Vec::new();
     match target {
         Target::Upstream => {
@@ -97,9 +99,13 @@ pub fn run(
                     arena
                 })
                 .collect();
+            let mut next_chunk = 0usize;
             for rep in 0..=reps {
                 let start = Instant::now();
-                for chunk in 0..chunks as usize {
+                let count = if rep == 0 { warmup_chunks } else { chunks } as usize;
+                for _ in 0..count {
+                    let chunk = next_chunk;
+                    next_chunk += 1;
                     let controls = &pool[chunk % CONTROL_POOL];
                     for (a, arena) in sims.iter_mut().enumerate() {
                         for c in 0..teams.len() {
@@ -110,10 +116,11 @@ pub fn run(
                         }
                     }
                 }
-                let rate = (arenas as f64 * (chunks * TICKS_PER_ACTION) as f64)
-                    / start.elapsed().as_secs_f64();
                 if rep > 0 {
-                    samples.push(rate);
+                    samples.push(
+                        (arenas as f64 * (chunks * TICKS_PER_ACTION) as f64)
+                            / start.elapsed().as_secs_f64(),
+                    );
                 }
             }
         }
@@ -144,16 +151,20 @@ pub fn run(
                 .iter()
                 .map(|set| set.iter().map(to_ffi_controls).collect())
                 .collect();
+            let mut next_chunk = 0usize;
             for rep in 0..=reps {
                 let start = Instant::now();
-                for chunk in 0..chunks as usize {
-                    batch.set_all_controls(&ffi_pool[chunk % CONTROL_POOL])?;
+                let count = if rep == 0 { warmup_chunks } else { chunks } as usize;
+                for _ in 0..count {
+                    batch.set_all_controls(&ffi_pool[next_chunk % CONTROL_POOL])?;
+                    next_chunk += 1;
                     batch.step(TICKS_PER_ACTION)?;
                 }
-                let rate = (arenas as f64 * (chunks * TICKS_PER_ACTION) as f64)
-                    / start.elapsed().as_secs_f64();
                 if rep > 0 {
-                    samples.push(rate);
+                    samples.push(
+                        (arenas as f64 * (chunks * TICKS_PER_ACTION) as f64)
+                            / start.elapsed().as_secs_f64(),
+                    );
                 }
             }
             let errors = batch.snapshot(0)?.scalars.error_flags;

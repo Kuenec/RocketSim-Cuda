@@ -40,14 +40,9 @@ RS_HDI bool proxies_need_collision(const BroadphaseProxy &p0,
          (p1.collision_filter_group & p0.collision_filter_mask) != 0;
 }
 
-RS_HD int find_pair(const ArenaPhysics &a, uint32_t id_lo, uint32_t id_hi,
-                    const World &w) {
+RS_HD int find_pair(const ArenaPhysics &a, uint16_t lo, uint16_t hi) {
   for (uint32_t i = 0; i < a.num_pairs; ++i) {
-    uint32_t u0 = w.proxy(a.pairs[i].proxy0).unique_id;
-    uint32_t u1 = w.proxy(a.pairs[i].proxy1).unique_id;
-    uint32_t lo = u0 < u1 ? u0 : u1;
-    uint32_t hi = u0 < u1 ? u1 : u0;
-    if (lo == id_lo && hi == id_hi) {
+    if (a.pairs[i].proxy0 == lo && a.pairs[i].proxy1 == hi) {
       return static_cast<int>(i);
     }
   }
@@ -55,42 +50,28 @@ RS_HD int find_pair(const ArenaPhysics &a, uint32_t id_lo, uint32_t id_hi,
 }
 
 RS_HD void pair_cache_add(World &w, uint16_t handle_a, uint16_t handle_b) {
-  const BroadphaseProxy &p0 = w.proxy(handle_a);
-  const BroadphaseProxy &p1 = w.proxy(handle_b);
-  if (!proxies_need_collision(p0, p1)) {
+  if (!proxies_need_collision(w.proxy(handle_a), w.proxy(handle_b))) {
     return;
   }
-  uint16_t h0 = handle_a;
-  uint16_t h1 = handle_b;
-  uint32_t id0 = p0.unique_id;
-  uint32_t id1 = p1.unique_id;
-  if (!(p0.unique_id <= p1.unique_id)) {
-    h0 = handle_b;
-    h1 = handle_a;
-    id0 = p1.unique_id;
-    id1 = p0.unique_id;
-  }
-  uint32_t lo = id0 < id1 ? id0 : id1;
-  uint32_t hi = id0 < id1 ? id1 : id0;
-  if (find_pair(*w.a, lo, hi, w) >= 0) {
+  uint16_t lo = handle_a <= handle_b ? handle_a : handle_b;
+  uint16_t hi = handle_a <= handle_b ? handle_b : handle_a;
+  if (find_pair(*w.a, lo, hi) >= 0) {
     return;
   }
   if (w.a->num_pairs >= static_cast<uint32_t>(k_max_pairs)) {
     w.flag_error(k_error_pairs_overflow);
     return;
   }
-  w.a->pairs[w.a->num_pairs++] = {h0, h1};
+  w.a->pairs[w.a->num_pairs++] = {lo, hi};
 }
 
 RS_HD void dispatcher_release_manifold(World &w, uint32_t body0,
                                        uint32_t body1);
 
 RS_HD void pair_cache_remove(World &w, uint16_t handle_a, uint16_t handle_b) {
-  uint32_t ua = w.proxy(handle_a).unique_id;
-  uint32_t ub = w.proxy(handle_b).unique_id;
-  uint32_t lo = ua < ub ? ua : ub;
-  uint32_t hi = ua < ub ? ub : ua;
-  int index = find_pair(*w.a, lo, hi, w);
+  uint16_t lo = handle_a < handle_b ? handle_a : handle_b;
+  uint16_t hi = handle_a < handle_b ? handle_b : handle_a;
+  int index = find_pair(*w.a, lo, hi);
   if (index < 0) {
     return;
   }
