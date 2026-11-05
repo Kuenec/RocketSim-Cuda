@@ -1,71 +1,72 @@
-![image](https://user-images.githubusercontent.com/36944229/219303954-7267bce1-b7c5-4f15-881c-b9545512e65b.png)
+# RocketSim-CUDA
 
-**A C++ library for simulating Rocket League games at maximum efficiency**
+A CUDA port of [RocketSim](https://github.com/ZealanL/RocketSim) 2.2.1 that is bit-exact with the CPU simulation.
 
-RocketSim is a complete simulation of Rocket League's gameplay logic and physics that is completely standalone.
-RocketSim supports the game modes: Soccar, Hoops, Heatseeker, and Snowday.
+A single kernel launch simulates every tick of every arena in a batch. That covers the broadphase, the narrowphase (GJK/EPA, sphere, box, convex hull, triangle mesh, plane), the sequential-impulse solver, vehicle suspension and wheel raycasts, and all game logic. The CPU does no physics.
 
-# Speed
-RocketSim is designed to run extremely fast, even when complex collisions and suspension calculations are happening every tick.
-On an average PC running a single thread of RocketSim with two cars, RocketSim can simulate around 20 minutes of game time every second.
-This means that with 12 threads running RocketSim, you can simulate around 10 days of game time every minute!
+## Features
 
-# Accuracy
-RocketSim is not a perfectly accurate replication of Rocket League, but is close enough for most applications (such as training ML bots).
-Perceivable differences between the simulation and the real game usually take at least a second to accumulate from an initial state.
-This means RocketSim is accurate enough to:
-- *Train machine learning bots*
-- *Simulate different shots on the ball at different angles to find the best input combination*
-- *Simulate air control to find the optimal orientation input*
-- *Simulate ground and floor pinches*
+- Game modes: Soccar, Hoops, Heatseeker, Snowday and Dropshot.
+- Demolitions and respawns, with deterministic on-device RNG.
+- Boost pads, bumps, supersonic, jumps, flips, dodges and autoflip.
+- Asynchronous stepping, so the CPU can work while the GPU simulates.
+- CPU-only builds still work when no CUDA toolkit is found.
 
-However, RocketSim is NOT accurate enough to:
-- *Accurately re-create entire games from inputs alone*
-- *Perfectly simulate long sequences of jumps and landings*
+## Exactness
 
-## Installation
-- Clone this repo and build it
-- Use https://github.com/ZealanL/RLArenaCollisionDumper to dump all of Rocket League's arena collision meshes
-- Move those assets into RocketSim's executing directory
+GPU results match the CPU build bit for bit. Each validation gate hashes the complete serialized end state of every arena, including the cars, the ball, boost pads and Dropshot tiles. The gates cover every game mode and include 20,000-tick runs, where a single ulp of drift would change the final hash.
 
-## Documentation
-Documentation is available at: https://zealanl.github.io/RocketSimDocs/
+Matching the CPU required reproducing:
 
-## Bindings
-If you don't want to work in C++, here are some (unofficial) bindings written in other languages:
-- **Python**: https://github.com/mtheall/RocketSim by `mtheall`
-- **Python**: https://github.com/uservar/pyrocketsim by `uservar`
-- **Rust**: https://github.com/VirxEC/rocketsim-rs by `VirxEC`
+- glibc's `sinf`, `cosf`, `atan2f` and `asinf`.
+- `RSQRTSS` and Bullet's SSE evaluation order.
+- Signed-zero propagation and the tie-breaking order in BVH and convex-hull queries.
 
-Official Python bindings are currently in the works.
+The CPU side is compiled with `-ffp-contract=off` and the GPU side with `--fmad=false`, so both sides use plain IEEE multiply and add. Do not change these flags. The reference is the Linux x86-64 glibc build; other compilers or math libraries produce a different, but equally self-consistent, reference.
 
-## Performance Details
-RocketSim already heavily outperforms the speed of Rocket League's physics tick step without optimization.
+## Building
 
-Version performance comparison:
-```
-OS: Windows 10 (Process Priority = Normal)
-CPU: Intel i5-11400 @ 2.60GHz
-Ram Speed: 3200MZ
-Compiler: MSVC 14.16
-=================================
-Arena: Default (Soccar)
-Cars: 2 on each team (2v2)
-Inputs: Randomly pre-generated, changed every 2-60 ticks for each car
-=================================
-Single-thread performance (calculated using average CPU cycles per tick on the RocketSim thread) (1M ticks simulated):
-v1.0.0 = 30,334tps
-v1.1.0 = 48,191tps
-v1.2.0 = 50,763tps
-v2.0.0 = ~50,000tps
-v2.1.0 = 114,481tps
+Requires CMake 3.20+, a C++20 compiler and, for the GPU path, the CUDA toolkit. The CUDA architecture defaults to `native`.
+
+```sh
+cmake -B build -G Ninja
+cmake --build build
 ```
 
-## Issues & PRs
-Feel free to make issues and pull requests if you encounter any issues!
+When CUDA is found, the `RocketSim` static library defines `RS_CUDA=1` and includes the GPU path. Set `-DRS_GPU_PHASE_PROF=ON` to compile in the kernel's per-phase profiler.
 
-You can also contact me on Discord if you have questions: `Zealan#5987`
+## Usage
 
-## Legal Notice
-RocketSim was written to replicate Rocket League's game logic, but does not actually contain any code from the game.
-To Epic Games/Psyonix: If any of you guys have an issue with this, let me know on Discord and we can resolve it.
+`rscuda::GpuArenaBatch` (`src/Cuda/GpuArenaBridge.h`) steps a group of regular `Arena` objects on the GPU. The arenas must share a game mode, car count and tick count, and use the default car config.
+
+```cpp
+RocketSim::Init("collision_meshes");
+
+std::vector<RocketSim::Arena*> arenas;
+for (int i = 0; i < 1000; i++) {
+	auto arena = RocketSim::Arena::Create(RocketSim::GameMode::SOCCAR);
+	arena->AddCar(RocketSim::Team::BLUE);
+	arena->AddCar(RocketSim::Team::ORANGE);
+	arenas.push_back(arena);
+}
+
+rscuda::GpuArenaBatch batch(arenas, 1337);
+batch.Step(8);
+batch.Writeback();
+```
+
+`Step` reads each car's controls and holds them for the given number of ticks. `Writeback` copies the results back into the arenas. After a reset or state change, call `UploadArena(i)`.
+
+## Layout
+
+| Path | Contents |
+| --- | --- |
+| `src/` | RocketSim 2.2.1 |
+| `src/Cuda/` | GPU port: `CudaStep.cu` kernel, collision, solver, vehicle, raycast and game-logic headers, `GpuArenaBridge` host API |
+| `libsrc/bullet3-3.24/` | Bullet subset used by RocketSim |
+
+Collision meshes are not included. Dump them from your own copy of Rocket League.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Based on RocketSim by ZealanL.
