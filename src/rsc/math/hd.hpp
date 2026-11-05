@@ -56,6 +56,14 @@ RS_HDI double u64_to_f64(uint64_t u) {
 #endif
 }
 
+RS_HDI float round_half_away_f32(float x) {
+#ifdef __CUDA_ARCH__
+  return ::roundf(x);
+#else
+  return std::round(x);
+#endif
+}
+
 RS_HDI double fma_f64(double a, double b, double c) { return ::fma(a, b, c); }
 
 RS_HDI float sqrt_f32(float x) { return ::sqrtf(x); }

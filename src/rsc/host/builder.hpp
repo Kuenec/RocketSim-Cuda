@@ -104,11 +104,10 @@ void create_arena(const HostStatic &st, const MutatorConfig &mutators,
 
 uint32_t arena_add_car(const HostStatic &st, Arena &a, const CarSpec &spec);
 
-void arena_set_mutator_config(const HostStatic &st, Arena &a,
-                              const MutatorConfig &mutators);
+MutatorOp make_mutator_op(const MutatorConfig &current,
+                          const MutatorConfig &mutators);
 
-void arena_set_boost_pad_state(const HostStatic &st, Arena &a, uint32_t idx,
-                               float cooldown,
-                               const std::vector<uint32_t> &touching);
+PadOp make_pad_op(const HostStatic &st, uint32_t num_cars, uint32_t idx,
+                  float cooldown, const std::vector<uint32_t> &touching);
 
 }

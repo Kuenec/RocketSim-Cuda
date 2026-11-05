@@ -131,4 +131,213 @@ RS_HD void arena_reset_to_random_kickoff(const ArenaStatic &st, Arena &a,
   }
 }
 
+RS_HD void world_update_body_properties(World &w, uint32_t body_idx,
+                                        const RigidBodyUpdateInfo &props) {
+  rigid_body_update_physical_properties(w.dyn_body(body_idx), props);
+  if (props.invalidate_contacts) {
+    dispatcher_clear(*w.a);
+  }
+  collision_update_aabbs(w);
+}
+
+RS_HD void make_ball_collision_shape(GameMode mode,
+                                     const MutatorConfig &mutators,
+                                     ArenaPhysics &phys, Shape &shape,
+                                     Vec3A &inertia) {
+  using namespace consts;
+  if (mode == GameMode::Snowday) {
+    float ang_step =
+        k_tau / static_cast<float>(snowday::puck_circle_point_amount);
+    float cur_ang = 0.0f;
+    const Vec3A neg_z{1.0f, 1.0f, -1.0f};
+    uint32_t n = 0;
+    for (int i = 0; i < snowday::puck_circle_point_amount; ++i) {
+      Vec3A point = Vec3A{cosf_glibc(cur_ang) * mutators.ball_radius,
+                          sinf_glibc(cur_ang) * mutators.ball_radius,
+                          snowday::puck_height / 2.0f} *
+                    uu_to_bt;
+      cur_ang += ang_step;
+      phys.puck_hull_points[n++] = point;
+      phys.puck_hull_points[n++] = point * neg_z;
+    }
+    phys.puck_hull_count = n;
+    HullView view{phys.puck_hull_points, n};
+    ConvexHullShape hull = ConvexHullShape::make(HullSource::Arena, 0, view);
+    inertia = ConvexHullShape::calculate_local_inertia(view, hull.margin,
+                                                       mutators.ball_mass);
+    shape = Shape::make_hull(hull);
+    return;
+  }
+  SphereShape sphere{mutators.ball_radius * uu_to_bt};
+  inertia = sphere.calculate_local_inertia(mutators.ball_mass);
+  shape = Shape::make_sphere(sphere.radius);
+}
+
+RS_HD Shape make_car_shape(const CarBodyConfig &config, float car_mass,
+                           Vec3A &inertia) {
+  BoxShape child = BoxShape::make(config.hitbox_size * consts::uu_to_bt * 0.5f);
+  inertia = child.calculate_local_inertia(car_mass);
+  Affine3A offset{Mat3A::identity(),
+                  config.hitbox_pos_offset * consts::uu_to_bt};
+  return Shape::make_compound(CompoundShape::make(child, offset));
+}
+
+RS_HD void apply_suspension_strengths(Car &car, float inv_mass) {
+  const CarBodyConfig &config = car.info.config;
+  float strengths[4];
+  car_suspension_strengths(
+      inv_mass,
+      config.front_wheels.connection_point_offset.x * consts::uu_to_bt,
+      config.back_wheels.connection_point_offset.x * consts::uu_to_bt,
+      strengths);
+  for (int i = 0; i < k_num_wheels; ++i) {
+    car.vehicle.wheels[i].suspension_force_scale = strengths[i];
+  }
+}
+
+struct MutatorOp {
+  MutatorConfig mutators;
+  float ball_damping_factor;
+  float car_damping_factor;
+};
+
+struct PadOp {
+  float cooldown;
+  uint32_t num_touching;
+  uint8_t touching[k_max_cars];
+};
+
+struct KickoffOp {
+  bool has_seed;
+  uint64_t seed;
+};
+
+enum class ArenaOpKind : uint8_t {
+  SetCarCore,
+  SetCarFull,
+  SetBall,
+  SetPad,
+  SetTiles,
+  SetMutators,
+  Kickoff,
+  SetControls
+};
+
+struct ArenaOp {
+  ArenaOpKind kind;
+  uint32_t index;
+  union {
+    CarState car;
+    BallState ball;
+    PadOp pad;
+    TileStates tiles;
+    MutatorOp mutators;
+    KickoffOp kickoff;
+    CarControls controls;
+  };
+};
+
+RS_HD void arena_set_mutator_config(const ArenaStatic &st, Arena &a,
+                                    const MutatorOp &op) {
+  using namespace consts;
+  const MutatorConfig &mutators = op.mutators;
+  const MutatorConfig old = a.mutators;
+  bool car_mass_changed = old.car_mass != mutators.car_mass;
+  bool ball_properties_changed = old.ball_radius != mutators.ball_radius ||
+                                 old.ball_mass != mutators.ball_mass ||
+                                 old.ball_drag != mutators.ball_drag;
+  bool geometry_changed = old.ball_radius != mutators.ball_radius ||
+                          old.ball_mass != mutators.ball_mass ||
+                          car_mass_changed;
+  World w = arena_world(st, a);
+  if (old.gravity != mutators.gravity) {
+    a.phys.gravity = mutators.gravity * uu_to_bt;
+  }
+  if (car_mass_changed) {
+    for (uint32_t c = 0; c < a.num_cars; ++c) {
+      Car &car = a.cars[c];
+      RigidBodyUpdateInfo props;
+      props.shape = make_car_shape(car.info.config, mutators.car_mass,
+                                   props.local_inertia);
+      props.mass = mutators.car_mass;
+      props.friction = car::base_coefs.friction;
+      props.restitution = car::base_coefs.restitution;
+      props.linear_damping = 0.0f;
+      props.damping_factor = op.car_damping_factor;
+      props.invalidate_contacts = geometry_changed;
+      world_update_body_properties(w, car.rigid_body_idx, props);
+      apply_suspension_strengths(car, 1.0f / mutators.car_mass);
+      car.vel_impulse_cache = Vec3A::zero();
+    }
+  }
+  if (ball_properties_changed) {
+    RigidBodyUpdateInfo props;
+    make_ball_collision_shape(st.mode, mutators, a.phys, props.shape,
+                              props.local_inertia);
+    props.mass = mutators.ball_mass;
+    if (st.mode == GameMode::Snowday) {
+      props.friction = snowday::puck_coefs.friction;
+      props.restitution = snowday::puck_coefs.restitution;
+    } else {
+      props.friction = ball::coefs.friction;
+      props.restitution = ball::coefs.restitution;
+    }
+    props.linear_damping = mutators.ball_drag;
+    props.damping_factor = op.ball_damping_factor;
+    props.invalidate_contacts = geometry_changed;
+    world_update_body_properties(w, a.ball.rigid_body_idx, props);
+  }
+  a.mutators = mutators;
+}
+
+RS_HD void arena_set_pad_state(const ArenaStatic &st, Arena &a, uint32_t idx,
+                               const PadOp &op) {
+  PadState &pad = a.pads[idx];
+  pad.num_touching = op.num_touching;
+  for (uint32_t i = 0; i < op.num_touching; ++i) {
+    pad.touching[i] = op.touching[i];
+  }
+  if (op.cooldown > 0.0f) {
+    float max_cooldown =
+        pad_max_cooldown(st.pads.configs[idx].is_big, a.mutators);
+    float since = max_f32_c(max_cooldown - op.cooldown, 0.0f);
+    int64_t ticks =
+        sat_f32_to_i64(round_half_away_f32(since * consts::tick_rate));
+    pad.has_gave_tick = true;
+    pad.gave_tick = static_cast<int64_t>(a.tick_count) - ticks;
+  } else {
+    pad.has_gave_tick = false;
+    pad.gave_tick = 0;
+  }
+}
+
+RS_HD void arena_apply_op(const ArenaStatic &st, Arena &a, const ArenaOp &op) {
+  switch (op.kind) {
+  case ArenaOpKind::SetCarCore:
+    arena_set_car_state(st, a, op.index, op.car);
+    break;
+  case ArenaOpKind::SetCarFull:
+    arena_set_car_state_full(st, a, op.index, op.car);
+    break;
+  case ArenaOpKind::SetBall:
+    arena_set_ball_state(st, a, op.ball);
+    break;
+  case ArenaOpKind::SetPad:
+    arena_set_pad_state(st, a, op.index, op.pad);
+    break;
+  case ArenaOpKind::SetTiles:
+    arena_set_tile_states(a, op.tiles);
+    break;
+  case ArenaOpKind::SetMutators:
+    arena_set_mutator_config(st, a, op.mutators);
+    break;
+  case ArenaOpKind::Kickoff:
+    arena_reset_to_random_kickoff(st, a, op.kickoff.has_seed, op.kickoff.seed);
+    break;
+  case ArenaOpKind::SetControls:
+    a.cars[op.index].state.controls = op.controls;
+    break;
+  }
+}
+
 }

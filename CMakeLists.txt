@@ -48,7 +48,7 @@ set_target_properties(rocketsim_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
 rsc_set_host_options(rocketsim_cuda)
 if(RSC_ENABLE_CUDA)
   target_sources(rocketsim_cuda PRIVATE src/rocketsim_cuda/cuda_batch.cu)
-  target_compile_definitions(rocketsim_cuda PRIVATE RSC_HAS_CUDA)
+  target_compile_definitions(rocketsim_cuda PUBLIC RSC_HAS_CUDA)
   target_link_libraries(rocketsim_cuda PUBLIC CUDA::cudart)
 endif()
 

@@ -4,6 +4,10 @@
 #include <exception>
 #include <string>
 
+#ifdef RSC_HAS_CUDA
+#include <cuda_runtime.h>
+#endif
+
 using namespace rocketsim_cuda;
 
 struct RscMeshSet {
@@ -101,14 +105,28 @@ int rsc_batch_set_controls(RscBatch *batch, uint32_t arena, uint32_t car,
 
 int rsc_abi_sizes(uint32_t *out, uint32_t count) {
   return guarded([&] {
-    const uint32_t sizes[] = {
-        sizeof(Vec3),           sizeof(PhysState),      sizeof(CarControls),
-        sizeof(RaycastHitInfo), sizeof(CarCache),       sizeof(CarState),
-        sizeof(CarCore),        sizeof(CarBodyConfig),  sizeof(CarInfo),
-        sizeof(BallState),      sizeof(BoostPadConfig), sizeof(TileStates),
-        sizeof(MutatorConfig),  sizeof(ArenaEvent),     sizeof(EventCounts),
-        sizeof(CarSpec),        sizeof(RscBatchDesc),   sizeof(RscPadState),
-        sizeof(RscArenaScalars)};
+    const uint32_t sizes[] = {sizeof(Vec3),
+                              sizeof(PhysState),
+                              sizeof(CarControls),
+                              sizeof(RaycastHitInfo),
+                              sizeof(CarCache),
+                              sizeof(CarState),
+                              sizeof(CarCore),
+                              sizeof(CarBodyConfig),
+                              sizeof(CarInfo),
+                              sizeof(BallState),
+                              sizeof(BoostPadConfig),
+                              sizeof(TileStates),
+                              sizeof(MutatorConfig),
+                              sizeof(ArenaEvent),
+                              sizeof(EventCounts),
+                              sizeof(CarSpec),
+                              sizeof(RscBatchDesc),
+                              sizeof(RscPadState),
+                              sizeof(RscArenaScalars),
+                              sizeof(ArenaInfo),
+                              sizeof(PadStateView),
+                              sizeof(StateBuffers)};
     if (count != sizeof(sizes) / sizeof(sizes[0])) {
       throw std::invalid_argument("ABI size table length mismatch");
     }
@@ -123,6 +141,92 @@ int rsc_batch_set_all_controls(RscBatch *batch, const CarControls *controls,
   return guarded([&] { batch->batch->set_all_controls({controls, count}); });
 }
 
+int rsc_batch_export(RscBatch *batch, uint8_t space, const StateBuffers *out) {
+  return guarded([&] {
+    batch->batch->export_state(*out, static_cast<MemorySpace>(space));
+  });
+}
+
+int rsc_batch_set_all_controls_device(RscBatch *batch,
+                                      const CarControls *device_controls) {
+  return guarded(
+      [&] { batch->batch->set_all_controls_device(device_controls); });
+}
+
+int rsc_batch_reset_kickoff_masked(RscBatch *batch, uint8_t space,
+                                   const uint8_t *mask, const uint64_t *seeds) {
+  return guarded([&] {
+    batch->batch->reset_to_random_kickoff_masked(
+        mask, seeds, static_cast<MemorySpace>(space));
+  });
+}
+
+int rsc_device_alloc(size_t size, void **out) {
+  return guarded([&] {
+#ifdef RSC_HAS_CUDA
+    cudaError_t err = cudaMalloc(out, size);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(cudaGetErrorString(err));
+    }
+#else
+    *out = nullptr;
+    throw std::runtime_error(
+        "this build of rocketsim_cuda has no CUDA backend for " +
+        std::to_string(size) + " device bytes");
+#endif
+  });
+}
+
+int rsc_device_free(void *pointer) {
+  return guarded([&] {
+#ifdef RSC_HAS_CUDA
+    cudaError_t err = cudaFree(pointer);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(cudaGetErrorString(err));
+    }
+#else
+    if (pointer != nullptr) {
+      throw std::runtime_error(
+          "this build of rocketsim_cuda has no CUDA backend");
+    }
+#endif
+  });
+}
+
+int rsc_device_upload(void *device, const void *host, size_t size) {
+  return guarded([&] {
+#ifdef RSC_HAS_CUDA
+    cudaError_t err = cudaMemcpy(device, host, size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(cudaGetErrorString(err));
+    }
+#else
+    throw std::runtime_error(
+        "this build of rocketsim_cuda has no CUDA backend to copy " +
+        std::to_string(size) + " bytes from " +
+        std::to_string(reinterpret_cast<uintptr_t>(host)) + " to " +
+        std::to_string(reinterpret_cast<uintptr_t>(device)));
+#endif
+  });
+}
+
+int rsc_device_download(void *host, const void *device, size_t size) {
+  return guarded([&] {
+#ifdef RSC_HAS_CUDA
+    cudaError_t err = cudaMemcpy(host, device, size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+      throw std::runtime_error(cudaGetErrorString(err));
+    }
+#else
+    throw std::runtime_error(
+        "this build of rocketsim_cuda has no CUDA backend to copy " +
+        std::to_string(size) + " bytes from " +
+        std::to_string(reinterpret_cast<uintptr_t>(device)) + " to " +
+        std::to_string(reinterpret_cast<uintptr_t>(host)));
+#endif
+  });
+}
+
 int rsc_batch_get_state(RscBatch *batch, uint32_t arena,
                         RscArenaScalars *scalars, BallState *ball,
                         TileStates *tiles, CarInfo *car_infos, CarState *cars,
@@ -133,10 +237,11 @@ int rsc_batch_get_state(RscBatch *batch, uint32_t arena,
     if (s.cars.size() > car_capacity || s.boost_pads.size() > pad_capacity) {
       throw std::length_error("state buffers are too small");
     }
-    scalars->tick_count = s.tick_count;
-    scalars->rng_state = batch->batch->get_rng_state(arena);
-    scalars->error_flags = batch->batch->get_error_flags(arena);
-    scalars->ball_scored = batch->batch->is_ball_scored(arena);
+    ArenaInfo info = batch->batch->get_arena_info(arena);
+    scalars->tick_count = info.tick_count;
+    scalars->rng_state = info.rng_state;
+    scalars->error_flags = info.error_flags;
+    scalars->ball_scored = info.ball_scored;
     scalars->has_tiles = s.tile_states.has_value();
     scalars->num_cars = static_cast<uint32_t>(s.cars.size());
     scalars->num_pads = static_cast<uint32_t>(s.boost_pads.size());

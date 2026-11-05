@@ -151,15 +151,39 @@ pub fn run(
                 .iter()
                 .map(|set| set.iter().map(to_ffi_controls).collect())
                 .collect();
+            let device = match backend {
+                Backend::Cuda => {
+                    let mut buffers = Vec::new();
+                    for set in &ffi_pool {
+                        let mut b = ffi::DeviceBuffer::new(std::mem::size_of_val(&set[..]))?;
+                        b.upload(set)?;
+                        buffers.push(b);
+                    }
+                    let export = ffi::DeviceExport::new(arenas, teams.len(), 0)?;
+                    Some((buffers, export))
+                }
+                Backend::Cpu => None,
+            };
             let mut next_chunk = 0usize;
             for rep in 0..=reps {
                 let start = Instant::now();
                 let count = if rep == 0 { warmup_chunks } else { chunks } as usize;
                 for _ in 0..count {
-                    batch.set_all_controls(&ffi_pool[next_chunk % CONTROL_POOL])?;
+                    let slot = next_chunk % CONTROL_POOL;
                     next_chunk += 1;
-                    batch.step(TICKS_PER_ACTION)?;
+                    match &device {
+                        Some((buffers, export)) => {
+                            batch.set_all_controls_device(&buffers[slot])?;
+                            batch.step_async(TICKS_PER_ACTION)?;
+                            batch.export_device_async(export, teams.len())?;
+                        }
+                        None => {
+                            batch.set_all_controls(&ffi_pool[slot])?;
+                            batch.step(TICKS_PER_ACTION)?;
+                        }
+                    }
                 }
+                batch.sync()?;
                 if rep > 0 {
                     samples.push(
                         (arenas as f64 * (chunks * TICKS_PER_ACTION) as f64)

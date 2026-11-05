@@ -301,6 +301,31 @@ struct EventCounts {
   CarEventCounts cars[k_max_cars];
 };
 
+struct ArenaInfo {
+  uint64_t tick_count;
+  uint64_t rng_state;
+  uint32_t error_flags;
+  uint32_t num_events;
+  bool ball_scored;
+};
+
+struct PadStateView {
+  float cooldown;
+  uint32_t num_touching;
+  uint32_t touching[k_max_cars];
+};
+
+enum class MemorySpace : uint8_t { Host, Device };
+
+struct StateBuffers {
+  ArenaInfo *infos = nullptr;
+  BallState *balls = nullptr;
+  CarState *cars = nullptr;
+  PadStateView *pads = nullptr;
+  TileStates *tiles = nullptr;
+  EventCounts *event_counts = nullptr;
+};
+
 struct CarSpec {
   Team team;
   CarBodyConfig config;
@@ -358,23 +383,25 @@ public:
   void set_car_controls(uint32_t arena, uint32_t car,
                         const CarControls &controls);
   void set_all_controls(std::span<const CarControls> controls);
+  void set_all_controls_device(const CarControls *device_controls);
+  void reset_to_random_kickoff_masked(const uint8_t *mask,
+                                      const uint64_t *seeds, MemorySpace space);
+  void export_state(const StateBuffers &out, MemorySpace space);
+  void *cuda_stream() const;
 
   void step(uint32_t ticks);
   void step_async(uint32_t ticks);
   void sync();
 
   ArenaState get_arena_state(uint32_t arena);
+  ArenaInfo get_arena_info(uint32_t arena);
   CarState get_car_state(uint32_t arena, uint32_t car);
   BallState get_ball_state(uint32_t arena);
   BoostPadState get_boost_pad_state(uint32_t arena, uint32_t pad);
   TileStates get_tile_states(uint32_t arena);
   MutatorConfig get_mutator_config(uint32_t arena);
-  uint64_t get_tick_count(uint32_t arena);
-  uint64_t get_rng_state(uint32_t arena);
-  bool is_ball_scored(uint32_t arena);
   std::vector<ArenaEvent> get_last_step_events(uint32_t arena);
   EventCounts get_event_counts(uint32_t arena);
-  uint32_t get_error_flags(uint32_t arena);
 
   void set_car_state(uint32_t arena, uint32_t car, const CarCore &core);
   void set_car_state_full(uint32_t arena, uint32_t car, const CarState &state);

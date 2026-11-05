@@ -329,6 +329,34 @@ pub struct RscPadState {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ArenaInfo {
+    pub tick_count: u64,
+    pub rng_state: u64,
+    pub error_flags: u32,
+    pub num_events: u32,
+    pub ball_scored: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PadStateView {
+    pub cooldown: f32,
+    pub num_touching: u32,
+    pub touching: [u32; 8],
+}
+
+#[repr(C)]
+pub struct StateBuffers {
+    pub infos: *mut ArenaInfo,
+    pub balls: *mut BallState,
+    pub cars: *mut CarState,
+    pub pads: *mut PadStateView,
+    pub tiles: *mut TileStates,
+    pub event_counts: *mut EventCounts,
+}
+
+#[repr(C)]
 pub struct RscMeshSet {
     _private: [u8; 0],
 }
@@ -341,6 +369,27 @@ pub struct RscBatch {
 unsafe extern "C" {
     fn rsc_last_error() -> *const c_char;
     fn rsc_abi_sizes(out: *mut u32, count: u32) -> i32;
+    fn rsc_batch_export(batch: *mut RscBatch, space: u8, out: *const StateBuffers) -> i32;
+    fn rsc_batch_set_all_controls_device(batch: *mut RscBatch, controls: *const CarControls)
+    -> i32;
+    fn rsc_batch_reset_kickoff_masked(
+        batch: *mut RscBatch,
+        space: u8,
+        mask: *const u8,
+        seeds: *const u64,
+    ) -> i32;
+    fn rsc_device_alloc(size: usize, out: *mut *mut std::ffi::c_void) -> i32;
+    fn rsc_device_free(pointer: *mut std::ffi::c_void) -> i32;
+    fn rsc_device_upload(
+        device: *mut std::ffi::c_void,
+        host: *const std::ffi::c_void,
+        size: usize,
+    ) -> i32;
+    fn rsc_device_download(
+        host: *mut std::ffi::c_void,
+        device: *const std::ffi::c_void,
+        size: usize,
+    ) -> i32;
     fn rsc_meshes_load(path: *const c_char) -> *mut RscMeshSet;
     fn rsc_meshes_free(meshes: *mut RscMeshSet);
     fn rsc_car_body_config(body: u8, out: *mut CarBodyConfig) -> i32;
@@ -478,8 +527,11 @@ pub fn check_abi() -> Result<(), String> {
         size_of::<RscBatchDesc>(),
         size_of::<RscPadState>(),
         size_of::<RscArenaScalars>(),
+        size_of::<ArenaInfo>(),
+        size_of::<PadStateView>(),
+        size_of::<StateBuffers>(),
     ];
-    let mut actual = [0u32; 19];
+    let mut actual = [0u32; 22];
     check(
         unsafe { rsc_abi_sizes(actual.as_mut_ptr(), actual.len() as u32) },
         "rsc_abi_sizes",
@@ -490,6 +542,84 @@ pub fn check_abi() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+pub struct DeviceBuffer {
+    ptr: *mut std::ffi::c_void,
+    size: usize,
+}
+
+impl DeviceBuffer {
+    pub fn new(size: usize) -> Result<Self, String> {
+        let mut ptr = std::ptr::null_mut();
+        check(
+            unsafe { rsc_device_alloc(size.max(1), &mut ptr) },
+            "rsc_device_alloc",
+        )?;
+        Ok(Self { ptr, size })
+    }
+
+    pub fn upload<T: Copy>(&mut self, data: &[T]) -> Result<(), String> {
+        let bytes = std::mem::size_of_val(data);
+        if bytes > self.size {
+            return Err(format!(
+                "device buffer of {} bytes cannot hold {bytes}",
+                self.size
+            ));
+        }
+        check(
+            unsafe { rsc_device_upload(self.ptr, data.as_ptr() as *const std::ffi::c_void, bytes) },
+            "rsc_device_upload",
+        )
+    }
+
+    pub fn download<T: Copy>(&self, out: &mut [T]) -> Result<(), String> {
+        let bytes = std::mem::size_of_val(out);
+        if bytes > self.size {
+            return Err(format!(
+                "device buffer of {} bytes cannot fill {bytes}",
+                self.size
+            ));
+        }
+        check(
+            unsafe {
+                rsc_device_download(out.as_mut_ptr() as *mut std::ffi::c_void, self.ptr, bytes)
+            },
+            "rsc_device_download",
+        )
+    }
+
+    pub fn ptr<T>(&self) -> *mut T {
+        self.ptr as *mut T
+    }
+}
+
+impl Drop for DeviceBuffer {
+    fn drop(&mut self) {
+        unsafe { rsc_device_free(self.ptr) };
+    }
+}
+
+pub struct Exported {
+    pub infos: Vec<ArenaInfo>,
+    pub balls: Vec<BallState>,
+    pub cars: Vec<CarState>,
+    pub pads: Vec<PadStateView>,
+    pub tiles: Vec<TileStates>,
+    pub counts: Vec<EventCounts>,
+}
+
+impl Exported {
+    pub fn new(arenas: usize, cars: usize, pads: usize, tiles: bool) -> Self {
+        Self {
+            infos: vec![ArenaInfo::default(); arenas],
+            balls: vec![BallState::default(); arenas],
+            cars: vec![CarState::default(); arenas * cars],
+            pads: vec![PadStateView::default(); arenas * pads],
+            tiles: vec![TileStates::default(); if tiles { arenas } else { 0 }],
+            counts: vec![EventCounts::default(); arenas],
+        }
+    }
 }
 
 pub struct MeshSet(*mut RscMeshSet);
@@ -527,6 +657,29 @@ pub struct BatchDesc {
     pub mutators: MutatorConfig,
     pub cars: Vec<CarSpec>,
     pub rng_seeds: Vec<u64>,
+}
+
+pub struct DeviceExport {
+    pub infos: DeviceBuffer,
+    pub balls: DeviceBuffer,
+    pub cars: DeviceBuffer,
+    pub pads: DeviceBuffer,
+    pub tiles: DeviceBuffer,
+    pub counts: DeviceBuffer,
+}
+
+impl DeviceExport {
+    pub fn new(arenas: usize, cars: usize, pads: usize) -> Result<Self, String> {
+        use std::mem::size_of;
+        Ok(Self {
+            infos: DeviceBuffer::new(arenas * size_of::<ArenaInfo>())?,
+            balls: DeviceBuffer::new(arenas * size_of::<BallState>())?,
+            cars: DeviceBuffer::new(arenas * cars * size_of::<CarState>())?,
+            pads: DeviceBuffer::new(arenas * pads * size_of::<PadStateView>())?,
+            tiles: DeviceBuffer::new(arenas * size_of::<TileStates>())?,
+            counts: DeviceBuffer::new(arenas * size_of::<EventCounts>())?,
+        })
+    }
 }
 
 pub struct ArenaSnapshot {
@@ -578,6 +731,126 @@ impl Batch {
 
     pub fn step(&mut self, ticks: u32) -> Result<(), String> {
         check(unsafe { rsc_batch_step(self.0, ticks) }, "rsc_batch_step")
+    }
+
+    pub fn export_host(&mut self, out: &mut Exported) -> Result<(), String> {
+        let buffers = StateBuffers {
+            infos: out.infos.as_mut_ptr(),
+            balls: out.balls.as_mut_ptr(),
+            cars: if out.cars.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                out.cars.as_mut_ptr()
+            },
+            pads: if out.pads.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                out.pads.as_mut_ptr()
+            },
+            tiles: if out.tiles.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                out.tiles.as_mut_ptr()
+            },
+            event_counts: out.counts.as_mut_ptr(),
+        };
+        check(
+            unsafe { rsc_batch_export(self.0, 0, &buffers) },
+            "rsc_batch_export",
+        )
+    }
+
+    pub fn export_device(
+        &mut self,
+        device: &DeviceExport,
+        out: &mut Exported,
+    ) -> Result<(), String> {
+        let buffers = StateBuffers {
+            infos: device.infos.ptr(),
+            balls: device.balls.ptr(),
+            cars: if out.cars.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                device.cars.ptr()
+            },
+            pads: if out.pads.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                device.pads.ptr()
+            },
+            tiles: if out.tiles.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                device.tiles.ptr()
+            },
+            event_counts: device.counts.ptr(),
+        };
+        check(
+            unsafe { rsc_batch_export(self.0, 1, &buffers) },
+            "rsc_batch_export",
+        )?;
+        self.sync()?;
+        device.infos.download(&mut out.infos)?;
+        device.balls.download(&mut out.balls)?;
+        device.cars.download(&mut out.cars)?;
+        device.pads.download(&mut out.pads)?;
+        device.tiles.download(&mut out.tiles)?;
+        device.counts.download(&mut out.counts)
+    }
+
+    pub fn export_device_async(
+        &mut self,
+        device: &DeviceExport,
+        cars: usize,
+    ) -> Result<(), String> {
+        let buffers = StateBuffers {
+            infos: device.infos.ptr(),
+            balls: device.balls.ptr(),
+            cars: if cars == 0 {
+                std::ptr::null_mut()
+            } else {
+                device.cars.ptr()
+            },
+            pads: std::ptr::null_mut(),
+            tiles: std::ptr::null_mut(),
+            event_counts: device.counts.ptr(),
+        };
+        check(
+            unsafe { rsc_batch_export(self.0, 1, &buffers) },
+            "rsc_batch_export",
+        )
+    }
+
+    pub fn set_all_controls_device(&mut self, controls: &DeviceBuffer) -> Result<(), String> {
+        check(
+            unsafe { rsc_batch_set_all_controls_device(self.0, controls.ptr()) },
+            "rsc_batch_set_all_controls_device",
+        )
+    }
+
+    pub fn reset_kickoff_masked_host(
+        &mut self,
+        mask: &[u8],
+        seeds: Option<&[u64]>,
+    ) -> Result<(), String> {
+        let seeds_ptr = seeds.map_or(std::ptr::null(), |s| s.as_ptr());
+        check(
+            unsafe { rsc_batch_reset_kickoff_masked(self.0, 0, mask.as_ptr(), seeds_ptr) },
+            "rsc_batch_reset_kickoff_masked",
+        )
+    }
+
+    pub fn reset_kickoff_masked_device(
+        &mut self,
+        mask: &DeviceBuffer,
+        seeds: Option<&DeviceBuffer>,
+    ) -> Result<(), String> {
+        let seeds_ptr = seeds.map_or(std::ptr::null(), |s| s.ptr::<u64>() as *const u64);
+        check(
+            unsafe { rsc_batch_reset_kickoff_masked(self.0, 1, mask.ptr::<u8>(), seeds_ptr) },
+            "rsc_batch_reset_kickoff_masked",
+        )?;
+        self.sync()
     }
 
     pub fn step_async(&mut self, ticks: u32) -> Result<(), String> {

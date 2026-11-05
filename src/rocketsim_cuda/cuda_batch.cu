@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 
+#include "rocketsim_cuda/convert.hpp"
 #include "rsc/host/builder.hpp"
 
 namespace rsc {
@@ -79,17 +80,64 @@ __global__ void step_kernel(ArenaStatic st, Arena *arenas, StepScratch *scratch,
   }
 }
 
-__global__ void controls_kernel(Arena *arenas, const CarControls *controls,
+__global__ void controls_kernel(Arena *arenas,
+                                const rocketsim_cuda::CarControls *controls,
                                 const uint8_t *mask, uint32_t cars_per_arena,
                                 uint32_t total) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total || mask[i] == 0) {
+  if (i >= total || (mask && mask[i] == 0)) {
     return;
   }
   arenas[i / cars_per_arena].cars[i % cars_per_arena].state.controls =
-      controls[i];
+      rocketsim_cuda::convert::to_internal(controls[i]);
 }
 
+__global__ void op_kernel(ArenaStatic st, Arena *arena, ArenaOp op) {
+  arena_apply_op(st, *arena, op);
+}
+
+__global__ void kickoff_kernel(ArenaStatic st, Arena *arenas,
+                               uint32_t num_arenas, const uint8_t *mask,
+                               const uint64_t *seeds) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_arenas || mask[i] == 0) {
+    return;
+  }
+  arena_reset_to_random_kickoff(st, arenas[i], seeds != nullptr,
+                                seeds ? seeds[i] : 0);
+}
+
+__global__ void export_kernel(ArenaStatic st, const Arena *arenas,
+                              uint32_t first, uint32_t count,
+                              rocketsim_cuda::StateBuffers out) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+  rocketsim_cuda::convert::export_arena(st, arenas[first + i], i, out);
+}
+
+uint32_t grid_for(uint32_t count, uint32_t block) {
+  return (count + block - 1) / block;
+}
+
+template <typename T>
+T *staged(DeviceArray<T> &array, size_t &capacity, size_t count) {
+  if (count > capacity) {
+    array.allocate(count);
+    capacity = count;
+  }
+  return array.get();
+}
+
+template <typename T>
+void copy_out(T *host, const T *device, size_t count, cudaStream_t stream) {
+  if (host && count != 0) {
+    check(cudaMemcpyAsync(host, device, sizeof(T) * count,
+                          cudaMemcpyDeviceToHost, stream),
+          "state download");
+  }
+}
 }
 
 struct CudaBatch::Impl {
@@ -108,8 +156,24 @@ struct CudaBatch::Impl {
   DeviceArray<BvhWideLeaf> pad_leaves;
   DeviceArray<Arena> arenas;
   DeviceArray<StepScratch> scratch;
-  DeviceArray<CarControls> controls;
-  DeviceArray<uint8_t> controls_mask;
+  DeviceArray<rocketsim_cuda::CarControls> controls;
+  size_t controls_capacity = 0;
+  DeviceArray<uint8_t> mask;
+  size_t mask_capacity = 0;
+  DeviceArray<uint64_t> seeds;
+  size_t seeds_capacity = 0;
+  DeviceArray<rocketsim_cuda::ArenaInfo> out_infos;
+  size_t out_infos_capacity = 0;
+  DeviceArray<rocketsim_cuda::BallState> out_balls;
+  size_t out_balls_capacity = 0;
+  DeviceArray<rocketsim_cuda::CarState> out_cars;
+  size_t out_cars_capacity = 0;
+  DeviceArray<rocketsim_cuda::PadStateView> out_pads;
+  size_t out_pads_capacity = 0;
+  DeviceArray<rocketsim_cuda::TileStates> out_tiles;
+  size_t out_tiles_capacity = 0;
+  DeviceArray<rocketsim_cuda::EventCounts> out_counts;
+  size_t out_counts_capacity = 0;
   DeviceArray<Arena> copy_staging;
   size_t copy_capacity = 0;
   ArenaStatic view;
@@ -196,42 +260,130 @@ CudaBatch::CudaBatch(const HostStatic &st, uint32_t num_arenas)
 
 CudaBatch::~CudaBatch() = default;
 
-void CudaBatch::upload(uint32_t arena, const Arena &src) {
-  check(cudaMemcpyAsync(impl_->arenas.get() + arena, &src, sizeof(Arena),
+void CudaBatch::upload(uint32_t first, uint32_t count, const Arena *src) {
+  check(cudaMemcpyAsync(impl_->arenas.get() + first, src, sizeof(Arena) * count,
                         cudaMemcpyHostToDevice, impl_->stream),
         "arena upload");
-  sync();
 }
 
 void CudaBatch::download(uint32_t arena, Arena &dst) {
-  check(cudaMemcpyAsync(&dst, impl_->arenas.get() + arena, sizeof(Arena),
-                        cudaMemcpyDeviceToHost, impl_->stream),
-        "arena download");
+  read(arena, 0, sizeof(Arena), &dst);
+}
+
+void CudaBatch::read(uint32_t arena, size_t offset, size_t size, void *dst) {
+  const char *src =
+      reinterpret_cast<const char *>(impl_->arenas.get() + arena) + offset;
+  check(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToHost, impl_->stream),
+        "arena read");
   sync();
 }
 
-void CudaBatch::apply_controls(const CarControls *controls, const uint8_t *mask,
-                               uint32_t cars_per_arena) {
+void CudaBatch::apply_op(uint32_t arena, const ArenaOp &op) {
+  op_kernel<<<1, 1, 0, impl_->stream>>>(impl_->view,
+                                        impl_->arenas.get() + arena, op);
+  check(cudaGetLastError(), "arena op kernel launch");
+}
+
+void CudaBatch::apply_staged_controls(
+    const rocketsim_cuda::CarControls *controls, const uint8_t *mask,
+    uint32_t cars_per_arena) {
   uint32_t total = impl_->num_arenas * cars_per_arena;
   if (total == 0) {
     return;
   }
-  if (!impl_->controls.get()) {
-    impl_->controls.allocate(total);
-    impl_->controls_mask.allocate(total);
-  }
-  check(cudaMemcpyAsync(impl_->controls.get(), controls,
-                        sizeof(CarControls) * total, cudaMemcpyHostToDevice,
-                        impl_->stream),
-        "controls upload");
-  check(cudaMemcpyAsync(impl_->controls_mask.get(), mask, total,
+  rocketsim_cuda::CarControls *d_controls =
+      staged(impl_->controls, impl_->controls_capacity, total);
+  uint8_t *d_mask = staged(impl_->mask, impl_->mask_capacity, total);
+  check(cudaMemcpyAsync(d_controls, controls,
+                        sizeof(rocketsim_cuda::CarControls) * total,
                         cudaMemcpyHostToDevice, impl_->stream),
+        "controls upload");
+  check(cudaMemcpyAsync(d_mask, mask, total, cudaMemcpyHostToDevice,
+                        impl_->stream),
         "controls mask upload");
-  uint32_t blocks = (total + 255) / 256;
-  controls_kernel<<<blocks, 256, 0, impl_->stream>>>(
-      impl_->arenas.get(), impl_->controls.get(), impl_->controls_mask.get(),
-      cars_per_arena, total);
+  controls_kernel<<<grid_for(total, 256), 256, 0, impl_->stream>>>(
+      impl_->arenas.get(), d_controls, d_mask, cars_per_arena, total);
   check(cudaGetLastError(), "controls kernel launch");
+}
+
+void CudaBatch::set_controls_device(const rocketsim_cuda::CarControls *controls,
+                                    uint32_t cars_per_arena) {
+  uint32_t total = impl_->num_arenas * cars_per_arena;
+  if (total == 0) {
+    return;
+  }
+  controls_kernel<<<grid_for(total, 256), 256, 0, impl_->stream>>>(
+      impl_->arenas.get(), controls, nullptr, cars_per_arena, total);
+  check(cudaGetLastError(), "controls kernel launch");
+}
+
+void CudaBatch::reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
+                                     rocketsim_cuda::MemorySpace space) {
+  uint32_t n = impl_->num_arenas;
+  const uint8_t *d_mask = mask;
+  const uint64_t *d_seeds = seeds;
+  if (space == rocketsim_cuda::MemorySpace::Host) {
+    uint8_t *m = staged(impl_->mask, impl_->mask_capacity, n);
+    check(cudaMemcpyAsync(m, mask, n, cudaMemcpyHostToDevice, impl_->stream),
+          "reset mask upload");
+    d_mask = m;
+    if (seeds) {
+      uint64_t *sd = staged(impl_->seeds, impl_->seeds_capacity, n);
+      check(cudaMemcpyAsync(sd, seeds, sizeof(uint64_t) * n,
+                            cudaMemcpyHostToDevice, impl_->stream),
+            "reset seed upload");
+      d_seeds = sd;
+    }
+  }
+  kickoff_kernel<<<grid_for(n, 64), 64, 0, impl_->stream>>>(
+      impl_->view, impl_->arenas.get(), n, d_mask, d_seeds);
+  check(cudaGetLastError(), "kickoff kernel launch");
+}
+
+void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
+                             uint32_t first, uint32_t count,
+                             uint32_t cars_per_arena, uint32_t pads_per_arena,
+                             rocketsim_cuda::MemorySpace space) {
+  if (count == 0) {
+    return;
+  }
+  Impl &im = *impl_;
+  rocketsim_cuda::StateBuffers target = out;
+  bool host = space == rocketsim_cuda::MemorySpace::Host;
+  size_t num_cars = static_cast<size_t>(count) * cars_per_arena;
+  size_t num_pads = static_cast<size_t>(count) * pads_per_arena;
+  if (host) {
+    target.infos = out.infos
+                       ? staged(im.out_infos, im.out_infos_capacity, count)
+                       : nullptr;
+    target.balls = out.balls
+                       ? staged(im.out_balls, im.out_balls_capacity, count)
+                       : nullptr;
+    target.cars = out.cars && num_cars
+                      ? staged(im.out_cars, im.out_cars_capacity, num_cars)
+                      : nullptr;
+    target.pads = out.pads && num_pads
+                      ? staged(im.out_pads, im.out_pads_capacity, num_pads)
+                      : nullptr;
+    target.tiles = out.tiles
+                       ? staged(im.out_tiles, im.out_tiles_capacity, count)
+                       : nullptr;
+    target.event_counts =
+        out.event_counts ? staged(im.out_counts, im.out_counts_capacity, count)
+                         : nullptr;
+  }
+  export_kernel<<<grid_for(count, 64), 64, 0, im.stream>>>(
+      im.view, im.arenas.get(), first, count, target);
+  check(cudaGetLastError(), "export kernel launch");
+  if (!host) {
+    return;
+  }
+  copy_out(out.infos, target.infos, count, im.stream);
+  copy_out(out.balls, target.balls, count, im.stream);
+  copy_out(out.cars, target.cars, num_cars, im.stream);
+  copy_out(out.pads, target.pads, num_pads, im.stream);
+  copy_out(out.tiles, target.tiles, count, im.stream);
+  copy_out(out.event_counts, target.event_counts, count, im.stream);
   sync();
 }
 
@@ -245,6 +397,8 @@ void CudaBatch::step(uint32_t ticks) {
 void CudaBatch::sync() {
   check(cudaStreamSynchronize(impl_->stream), "stream synchronize");
 }
+
+void *CudaBatch::stream() const { return impl_->stream; }
 
 void CudaBatch::copy_from(const CudaBatch &src, const uint32_t *src_arenas,
                           const uint32_t *dst_arenas, uint32_t count) {

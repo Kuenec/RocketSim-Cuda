@@ -99,6 +99,8 @@ pub enum Action {
     PadStates,
     Tiles,
     BallIntoGoal,
+    KickoffMaskedSeeded,
+    KickoffMaskedRng,
     CarsCollide,
     SnapshotRoundTrip,
     CrossBatchCopy,
@@ -356,6 +358,34 @@ pub fn run(
     let mut ours = ffi::Batch::new(meshes, &batch_desc(scenario, backend, &seeds)?)?;
 
     let num_cars = scenario.cars.len();
+    let num_pads = upstream[0].num_boost_pads();
+    let has_tiles = mode == GameMode::Dropshot;
+    let mut exported = ffi::Exported::new(scenario.arenas, num_cars, num_pads, has_tiles);
+    let device_export = match backend {
+        Backend::Cuda => Some(ffi::DeviceExport::new(scenario.arenas, num_cars, num_pads)?),
+        Backend::Cpu => None,
+    };
+    let mut device_controls = match backend {
+        Backend::Cuda => Some(ffi::DeviceBuffer::new(
+            scenario.arenas * num_cars.max(1) * std::mem::size_of::<ffi::CarControls>(),
+        )?),
+        Backend::Cpu => None,
+    };
+    let mut check_exports = |upstream: &[Arena],
+                             ours: &mut ffi::Batch,
+                             tick: u32,
+                             counts: Option<&[ffi::EventCounts]>|
+     -> Result<(), String> {
+        ours.export_host(&mut exported)?;
+        check_export(upstream, &exported, num_cars, num_pads, counts)
+            .map_err(|e| format!("host export after tick {tick}: {e}"))?;
+        if let Some(device) = &device_export {
+            ours.export_device(device, &mut exported)?;
+            check_export(upstream, &exported, num_cars, num_pads, counts)
+                .map_err(|e| format!("device export after tick {tick}: {e}"))?;
+        }
+        Ok(())
+    };
     let mut rng = SplitMix::new(scenario.seed ^ 0x5eed_0f_c0ffee);
     let mut control_states: Vec<ControlState> = (0..scenario.arenas * num_cars)
         .map(|_| ControlState {
@@ -403,8 +433,10 @@ pub fn run(
         ours.reset_kickoff(i as u32, Some(seeds[i]))?;
     }
     comparisons += compare(&upstream, &mut ours, 0, "initial kickoff", None)?;
+    check_exports(&upstream, &mut ours, 0, None)?;
 
     let mut coverage = Coverage::default();
+    let mut step_compares = 0u64;
     let mut tick = 0u32;
     while tick < scenario.ticks {
         for &(at, action) in &scenario.actions {
@@ -423,8 +455,11 @@ pub fn run(
                     tick,
                 )?;
                 comparisons += compare(&upstream, &mut ours, tick, "after action", None)?;
+                check_exports(&upstream, &mut ours, tick, None)?;
             }
         }
+        let bulk_controls = scenario.ticks_per_step > 1;
+        let mut all_controls = Vec::with_capacity(scenario.arenas * num_cars);
         for a in 0..scenario.arenas {
             for c in 0..num_cars {
                 let controls = match &scenario.controls {
@@ -453,7 +488,20 @@ pub fn run(
                     }
                 };
                 upstream[a].set_car_controls(c, controls);
-                ours.set_controls(a as u32, c as u32, &to_ffi_controls(&controls))?;
+                if bulk_controls {
+                    all_controls.push(to_ffi_controls(&controls));
+                } else {
+                    ours.set_controls(a as u32, c as u32, &to_ffi_controls(&controls))?;
+                }
+            }
+        }
+        if bulk_controls {
+            match device_controls.as_mut() {
+                Some(buffer) => {
+                    buffer.upload(&all_controls)?;
+                    ours.set_all_controls_device(buffer)?;
+                }
+                None => ours.set_all_controls(&all_controls)?,
             }
         }
         let next_action = scenario
@@ -489,6 +537,10 @@ pub fn run(
             || tick == scenario.ticks
         {
             comparisons += compare(&upstream, &mut ours, tick, "step", Some(&expected_counts))?;
+            step_compares += 1;
+            if step_compares % 4 == 0 || tick == scenario.ticks {
+                check_exports(&upstream, &mut ours, tick, Some(&expected_counts))?;
+            }
         }
     }
     Ok(Outcome {
@@ -496,6 +548,60 @@ pub fn run(
         comparisons,
         coverage,
     })
+}
+
+fn check_export(
+    upstream: &[Arena],
+    ex: &ffi::Exported,
+    num_cars: usize,
+    num_pads: usize,
+    counts: Option<&[ffi::EventCounts]>,
+) -> Result<(), String> {
+    for (i, arena) in upstream.iter().enumerate() {
+        let info = &ex.infos[i];
+        if info.tick_count != arena.tick_count()
+            || info.rng_state != arena.rng.get_seed()
+            || info.error_flags != 0
+            || info.ball_scored != arena.is_ball_scored()
+            || info.num_events as usize != arena.get_last_step_events().len()
+        {
+            return Err(format!("arena {i} info {info:?}"));
+        }
+        if flatten(arena.get_ball_state()) != mirror::ball_flat(&ex.balls[i]) {
+            return Err(format!("arena {i} ball state"));
+        }
+        for c in 0..num_cars {
+            if flatten(arena.get_car_state(c)) != mirror::car_flat(&ex.cars[i * num_cars + c]) {
+                return Err(format!("arena {i} car {c} state"));
+            }
+        }
+        for p in 0..num_pads {
+            let up = arena.get_boost_pad_state(p);
+            let pad = &ex.pads[i * num_pads + p];
+            let touching: Vec<usize> = pad.touching[..pad.num_touching as usize]
+                .iter()
+                .map(|&t| t as usize)
+                .collect();
+            if up.cooldown.to_bits() != pad.cooldown.to_bits() || up.touching_car_idxs != touching {
+                return Err(format!("arena {i} pad {p} state"));
+            }
+        }
+        if !ex.tiles.is_empty() {
+            let up = arena.get_tile_states();
+            for team in 0..2 {
+                for t in 0..70 {
+                    if up.states[team][t] as u8 != ex.tiles[i].states[team][t] {
+                        return Err(format!("arena {i} tile {team}/{t}"));
+                    }
+                }
+            }
+        }
+        if let Some(counts) = counts {
+            check_counts(&counts[i], &ex.counts[i])
+                .map_err(|e| format!("arena {i} event counts {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn check_getters(
@@ -511,7 +617,17 @@ fn check_getters(
             return Err(format!("car {c} state"));
         }
     }
-    for (p, pad) in snap.pads.iter().enumerate() {
+    let spot = if snap.pads.is_empty() {
+        None
+    } else {
+        Some((snap.scalars.tick_count as usize + arena as usize) % snap.pads.len())
+    };
+    for (p, pad) in snap
+        .pads
+        .iter()
+        .enumerate()
+        .filter(|&(p, _)| Some(p) == spot)
+    {
         let (cooldown, touching) = ours.pad_state(arena, p as u32)?;
         if cooldown.to_bits() != pad.cooldown.to_bits()
             || touching[..] != pad.touching[..pad.num_touching as usize]
@@ -794,6 +910,32 @@ fn apply_action(
                     };
                     upstream[i].set_car_state(c, core);
                     ours.set_car_state(i as u32, c as u32, &ffi_core(&core))?;
+                }
+            }
+        }
+        Action::KickoffMaskedSeeded | Action::KickoffMaskedRng => {
+            let mask: Vec<u8> = (0..n)
+                .map(|i| ((i + tick as usize) % 3 != 1) as u8)
+                .collect();
+            let reset_seeds: Vec<u64> = (0..n)
+                .map(|i| seeds[i] ^ (tick as u64).wrapping_mul(7919))
+                .collect();
+            let seeded = matches!(action, Action::KickoffMaskedSeeded);
+            for i in 0..n {
+                if mask[i] != 0 {
+                    upstream[i].reset_to_random_kickoff(seeded.then_some(reset_seeds[i]));
+                }
+            }
+            match ctx.backend {
+                Backend::Cuda => {
+                    let mut mask_buffer = ffi::DeviceBuffer::new(n)?;
+                    mask_buffer.upload(&mask)?;
+                    let mut seed_buffer = ffi::DeviceBuffer::new(n * 8)?;
+                    seed_buffer.upload(&reset_seeds)?;
+                    ours.reset_kickoff_masked_device(&mask_buffer, seeded.then_some(&seed_buffer))?;
+                }
+                Backend::Cpu => {
+                    ours.reset_kickoff_masked_host(&mask, seeded.then_some(&reset_seeds[..]))?;
                 }
             }
         }

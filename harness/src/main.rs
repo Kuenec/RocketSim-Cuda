@@ -201,6 +201,7 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
         (scale(10000), Action::CarsCollide),
         (scale(18000), Action::BallIntoGoal),
         (scale(19000), Action::SnapshotRoundTrip),
+        (scale(6000), Action::KickoffMaskedSeeded),
     ];
     out.push(long);
 
@@ -222,6 +223,8 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
         (scale(1000), Action::KickoffUnseeded),
         (scale(200), Action::CarsCollide),
         (scale(1200), Action::CarsCollide),
+        (scale(900), Action::KickoffMaskedRng),
+        (scale(1100), Action::KickoffMaskedSeeded),
     ];
     out.push(batch);
 
@@ -257,6 +260,7 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
                 (scale(300), Action::CarsCollide),
                 (scale(2000), Action::CarsCollide),
             ];
+            s.actions.push((scale(2700), Action::KickoffMaskedRng));
             if mode == GameMode::Dropshot {
                 s.actions.push((scale(1500), Action::Tiles));
             } else if mode != GameMode::TheVoid {
@@ -325,6 +329,8 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
         (scale(1600), Action::KickoffUnseeded),
         (scale(2000), Action::CrossBackendCopy),
         (scale(3000), Action::SnapshotRoundTrip),
+        (scale(3400), Action::KickoffMaskedSeeded),
+        (scale(3600), Action::KickoffMaskedRng),
         (scale(2400), Action::Mutators(MutatorChange::Mixed)),
     ];
     out.push(multi);
