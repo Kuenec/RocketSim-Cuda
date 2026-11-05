@@ -761,7 +761,8 @@ RS_HD void car_apply_flip_zdamp_prepass(Car &car, World &w) {
 }
 
 RS_HDN void car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
-                               const MutatorConfig &mut) {
+                                const MutatorConfig &mut,
+                                const VehicleHit *precomputed_hits) {
   using namespace consts;
   RigidBody &rb = w.dyn_body(car.rigid_body_idx);
   CarState &s = car.state;
@@ -815,7 +816,7 @@ RS_HDN void car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
   float real_throttle =
       (s.controls.boost && s.boost > 0.0f) ? 1.0f : quant_throttle;
   car.vehicle.update(w, tick_time, s.handbrake_val, real_throttle,
-                     car.info.config.three_wheels);
+                     car.info.config.three_wheels, precomputed_hits);
   car_update_contact_state(car, w);
 }
 

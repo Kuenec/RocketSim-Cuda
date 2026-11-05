@@ -42,7 +42,7 @@ private:
 
 class CudaBatch {
 public:
-  CudaBatch(const HostStatic &st, uint32_t num_arenas);
+  CudaBatch(const HostStatic &st, uint32_t num_arenas, uint32_t num_cars);
   ~CudaBatch();
   CudaBatch(const CudaBatch &) = delete;
   CudaBatch &operator=(const CudaBatch &) = delete;

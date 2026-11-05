@@ -15,6 +15,7 @@ struct QuadRayResult {
   int ignore_obj_world_idx;
   uint8_t collision_filter_group;
   uint8_t collision_filter_mask;
+  uint8_t active_rays;
   float min_hit_dist_sq;
   const Vec3A *ray_from_world;
   const Vec3A *ray_to_world;
@@ -33,6 +34,7 @@ struct QuadRayResult {
     r.ignore_obj_world_idx = ignore_idx;
     r.collision_filter_group = k_group_default;
     r.collision_filter_mask = k_group_all;
+    r.active_rays = 0xf;
     r.min_hit_dist_sq = 0.0f;
     r.ray_from_world = from;
     r.ray_to_world = to;
@@ -134,8 +136,9 @@ struct BridgeTriQuadRay {
   }
 
   RS_HD void process_node(uint32_t tri_idx, uint32_t mask, Vec4 &lambda_max) {
+    uint32_t active = mask & result->active_rays;
     for (int i = 0; i < 4; ++i) {
-      if (mask & (1u << i)) {
+      if (active & (1u << i)) {
         process_triangle(tris[tri_idx], lambda_max[i], i);
       }
     }
@@ -338,7 +341,7 @@ struct SphereClosest {
 };
 
 RS_HDN void shape_quad_raycast(const World &w, const Shape &shape,
-                              BridgeTriQuadRay &cb, QuadRayInfo &ray_info) {
+                               BridgeTriQuadRay &cb, QuadRayInfo &ray_info) {
   switch (shape.kind) {
   case ShapeKind::Compound: {
     const CompoundShape &cs = shape.compound;
@@ -346,8 +349,10 @@ RS_HDN void shape_quad_raycast(const World &w, const Shape &shape,
       return;
     }
     QuadRayPack pack = ray_info.calc_pos_dir();
-    uint32_t mask = QuadRayInfo::intersect_quad_ray_aabb(
-        pack.origins, pack.inv_dirs, cs.local_aabb, cb.hit_fraction);
+    uint32_t mask =
+        QuadRayInfo::intersect_quad_ray_aabb(pack.origins, pack.inv_dirs,
+                                             cs.local_aabb, cb.hit_fraction) &
+        cb.result->active_rays;
     for (int i = 0; i < 4; ++i) {
       if (mask & (1u << i)) {
         compound_ray(cs, cb, ray_info.ray_sources[i], ray_info.ray_targets[i],
@@ -379,7 +384,7 @@ RS_HDN void shape_quad_raycast(const World &w, const Shape &shape,
     const bool w4[4] = {within.x, within.y, within.z, within.w};
     SphereClosest closest{&shape.sphere};
     for (int i = 0; i < 4; ++i) {
-      if (!w4[i]) {
+      if (!w4[i] || !(cb.result->active_rays & (1u << i))) {
         continue;
       }
       ConvexCastResult r;
@@ -428,7 +433,8 @@ RS_HDN void shape_quad_raycast(const World &w, const Shape &shape,
     Vec4 normal_start = sx * n.x + sy * n.y + sz * n.z;
     Vec4 tt = -normal_start / dir_align;
     BVec4 t_mask = tt.cmpge(Vec4::splat(0.0f)) & tt.cmplt(dist);
-    uint32_t hit_mask = ray_mask & (align_mask & t_mask).bitmask();
+    uint32_t hit_mask =
+        ray_mask & (align_mask & t_mask).bitmask() & cb.result->active_rays;
     if (hit_mask == 0) {
       return;
     }
@@ -452,8 +458,10 @@ RS_HDN void shape_quad_raycast(const World &w, const Shape &shape,
       return;
     }
     QuadRayPack pack = ray_info.calc_pos_dir();
-    uint32_t mask = QuadRayInfo::intersect_quad_ray_aabb(
-        pack.origins, pack.inv_dirs, hull.local_aabb, cb.hit_fraction);
+    uint32_t mask =
+        QuadRayInfo::intersect_quad_ray_aabb(pack.origins, pack.inv_dirs,
+                                             hull.local_aabb, cb.hit_fraction) &
+        cb.result->active_rays;
     ConvexShape cs = ConvexShape::hull_shape(w.hull_view(hull));
     for (int i = 0; i < 4; ++i) {
       if (!(mask & (1u << i))) {
@@ -502,7 +510,7 @@ RS_HD void quad_ray_test_body(const World &w, const Vec3A *ray_from,
 }
 
 RS_HDN void grid_ray_test(const World &w, const Vec3A *ray_from,
-                         const Vec3A *ray_to, QuadRayResult &result) {
+                          const Vec3A *ray_to, QuadRayResult &result) {
   const StaticWorldData &s = *w.s;
   Aabb ray_aabb{ray_from[0].min(ray_to[0]), ray_from[0].max(ray_to[0])};
   for (int i = 1; i < 4; ++i) {

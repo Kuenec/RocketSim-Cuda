@@ -16,6 +16,16 @@ namespace {
 constexpr uint32_t k_max_block_size = 32;
 constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_device_stack_bytes = 16384;
+constexpr uint32_t k_max_lanes_per_arena = 32;
+constexpr uint32_t k_lanes_per_car = 4;
+
+uint32_t lanes_for_cars(uint32_t cars) {
+  uint32_t lanes = 1;
+  while (lanes < cars * k_lanes_per_car && lanes < k_max_lanes_per_arena) {
+    lanes *= 2;
+  }
+  return lanes;
+}
 
 void check(cudaError_t err, const char *what) {
   if (err != cudaSuccess) {
@@ -68,15 +78,24 @@ struct DeviceMesh {
 };
 
 __global__ void step_kernel(ArenaStatic st, Arena *arenas, StepScratch *scratch,
-                            uint32_t num_arenas, uint32_t ticks) {
-  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+                            uint32_t num_arenas, uint32_t lanes_per_arena,
+                            uint32_t ticks) {
+  uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+  uint32_t i = thread / lanes_per_arena;
   if (i >= num_arenas) {
     return;
   }
+  uint32_t lane = thread % lanes_per_arena;
+  uint32_t first_in_warp = (threadIdx.x % 32) - lane;
+  uint32_t group_bits =
+      lanes_per_arena == 32 ? 0xffffffffu : (1u << lanes_per_arena) - 1u;
+  LaneGroup lanes{lane, lanes_per_arena, group_bits << first_in_warp};
   Arena &a = arenas[i];
-  a.counters = ArenaEventCounters{};
+  if (lanes.leader()) {
+    a.counters = ArenaEventCounters{};
+  }
   for (uint32_t t = 0; t < ticks; ++t) {
-    arena_step_tick(st, a, scratch[i]);
+    arena_step_tick(st, a, scratch[i], lanes);
   }
 }
 
@@ -142,6 +161,7 @@ void copy_out(T *host, const T *device, size_t count, cudaStream_t stream) {
 
 struct CudaBatch::Impl {
   uint32_t num_arenas;
+  uint32_t lanes_per_arena;
   std::unique_ptr<DeviceMesh[]> meshes;
   DeviceArray<MeshView> mesh_views;
   DeviceArray<RigidBody> static_bodies;
@@ -181,7 +201,8 @@ struct CudaBatch::Impl {
   uint32_t block_size = 1;
   uint32_t blocks = 0;
 
-  Impl(const HostStatic &st, uint32_t n) : num_arenas(n) {
+  Impl(const HostStatic &st, uint32_t n, uint32_t cars)
+      : num_arenas(n), lanes_per_arena(1) {
     size_t stack_bytes = 0;
     check(cudaDeviceGetLimit(&stack_bytes, cudaLimitStackSize),
           "cudaDeviceGetLimit");
@@ -239,12 +260,26 @@ struct CudaBatch::Impl {
     check(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
                                  device),
           "cudaDeviceGetAttribute");
+    int blocks_per_sm = 0;
+    check(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &blocks_per_sm, step_kernel, static_cast<int>(k_max_block_size), 0),
+        "cudaOccupancyMaxActiveBlocksPerMultiprocessor");
+    uint32_t resident_threads = static_cast<uint32_t>(blocks_per_sm) *
+                                k_max_block_size *
+                                static_cast<uint32_t>(sm_count);
+    uint32_t car_lanes = lanes_for_cars(cars);
+    if (n * car_lanes <= resident_threads) {
+      lanes_per_arena = car_lanes;
+    }
+    uint32_t threads = n * lanes_per_arena;
     uint32_t per_block =
-        n / (k_target_blocks_per_sm * static_cast<uint32_t>(sm_count));
+        threads / (k_target_blocks_per_sm * static_cast<uint32_t>(sm_count));
+    block_size = lanes_per_arena;
     while (block_size * 2 <= per_block && block_size < k_max_block_size) {
       block_size *= 2;
     }
-    blocks = (n + block_size - 1) / block_size;
+    blocks = (threads + block_size - 1) / block_size;
   }
 
   ~Impl() {
@@ -273,8 +308,9 @@ void release_pinned(void *pointer) noexcept {
   }
 }
 
-CudaBatch::CudaBatch(const HostStatic &st, uint32_t num_arenas)
-    : impl_(std::make_unique<Impl>(st, num_arenas)) {}
+CudaBatch::CudaBatch(const HostStatic &st, uint32_t num_arenas,
+                     uint32_t num_cars)
+    : impl_(std::make_unique<Impl>(st, num_arenas, num_cars)) {}
 
 CudaBatch::~CudaBatch() = default;
 
@@ -414,7 +450,7 @@ void CudaBatch::step(uint32_t ticks) {
   }
   step_kernel<<<impl_->blocks, impl_->block_size, 0, impl_->stream>>>(
       impl_->view, impl_->arenas.get(), impl_->scratch.get(), impl_->num_arenas,
-      ticks);
+      impl_->lanes_per_arena, ticks);
   check(cudaGetLastError(), "step kernel launch");
 }
 

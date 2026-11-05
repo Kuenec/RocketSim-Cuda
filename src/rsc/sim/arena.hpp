@@ -108,7 +108,26 @@ struct WorldNormalGroup {
   Vec3A sum;
 };
 
+enum class CarPhasePlan : uint8_t { Sequential, Precast, Parallel };
+
+struct LaneGroup {
+  uint32_t lane;
+  uint32_t size;
+  uint32_t mask;
+
+  RS_HDI static LaneGroup single() { return {0, 1, 1}; }
+  RS_HDI bool leader() const { return lane == 0; }
+  RS_HDI void sync() const {
+#ifdef __CUDA_ARCH__
+    __syncwarp(mask);
+#endif
+  }
+};
+
 struct StepScratch {
+  CarPhasePlan car_plan;
+  bool was_on_ground[k_max_cars];
+  VehicleHit rays[k_max_cars][k_num_wheels];
   SolverScratch solver;
   PadUpdateScratch pads;
   int num_records;
@@ -312,7 +331,7 @@ RS_HD void arena_update_tile_flags(Arena &a) {
 }
 
 RS_HDN void arena_on_car_car(Arena &a, uint32_t car_1, uint32_t car_2,
-                            const ManifoldPoint &point) {
+                             const ManifoldPoint &point) {
   using namespace consts;
   for (int pass = 0; pass < 2; ++pass) {
     bool is_swapped = pass == 1;
@@ -435,7 +454,7 @@ RS_HD void arena_update_world_contact_normal(Arena &a, const StepScratch &sc) {
   }
 }
 
-RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc) {
+RS_HD void arena_step_tick_front(const ArenaStatic &st, Arena &a) {
   using namespace consts;
   World w = arena_world(st, a);
   a.num_events = 0;
@@ -460,20 +479,120 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc) {
     for (uint32_t c = 0; c < a.num_cars; ++c) {
       car_apply_flip_zdamp_prepass(a.cars[c], w);
     }
-    for (uint32_t c = 0; c < a.num_cars; ++c) {
-      bool was_on_ground = a.cars[c].state.cache.is_on_ground;
-      car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators);
-      if (!was_on_ground && a.cars[c].state.cache.is_on_ground) {
-        for (int i = 0; i < 4; ++i) {
-          a.landed[c].has_contact[i] =
-              a.cars[c].state.cache.wheel_has_contact[i];
-          a.landed[c].wheels[i] = a.cars[c].state.cache.wheels_with_contact[i];
-        }
-        arena_push_event(a, ArenaEventKind::CarLanded, c, 0, false,
-                         Vec3A::zero(), Vec3A::zero());
+  }
+}
+
+RS_HD void arena_push_car_landed(Arena &a, uint32_t c) {
+  for (int i = 0; i < 4; ++i) {
+    a.landed[c].has_contact[i] = a.cars[c].state.cache.wheel_has_contact[i];
+    a.landed[c].wheels[i] = a.cars[c].state.cache.wheels_with_contact[i];
+  }
+  arena_push_event(a, ArenaEventKind::CarLanded, c, 0, false, Vec3A::zero(),
+                   Vec3A::zero());
+}
+
+RS_HD void arena_car_pre_ticks_in_order(const ArenaStatic &st, Arena &a,
+                                        const StepScratch *precast) {
+  World w = arena_world(st, a);
+  for (uint32_t c = 0; c < a.num_cars; ++c) {
+    bool was_on_ground = a.cars[c].state.cache.is_on_ground;
+    car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators,
+                        precast ? precast->rays[c] : nullptr);
+    if (!was_on_ground && a.cars[c].state.cache.is_on_ground) {
+      arena_push_car_landed(a, c);
+    }
+  }
+}
+
+RS_HD bool arena_rays_precomputable(const ArenaStatic &st, Arena &a) {
+  World w = arena_world(st, a);
+  for (uint32_t c = 0; c < a.num_cars; ++c) {
+    const RigidBody &rb = w.dyn_body(a.cars[c].rigid_body_idx);
+    if (a.cars[c].state.is_demoed ||
+        (rb.collision_flags & k_flag_no_contact_response) != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+RS_HD bool arena_rays_hit_static_only(const ArenaStatic &st, Arena &a,
+                                      const StepScratch &sc) {
+  World w = arena_world(st, a);
+  for (uint32_t c = 0; c < a.num_cars; ++c) {
+    for (int i = 0; i < k_num_wheels; ++i) {
+      const VehicleHit &hit = sc.rays[c][i];
+      if (hit.valid && hit.body_idx >= w.num_static()) {
+        return false;
       }
     }
   }
+  return true;
+}
+
+RS_HD void arena_step_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
+                           const LaneGroup &lanes) {
+  if (a.ball_only) {
+    return;
+  }
+  if (lanes.size == 1) {
+    arena_car_pre_ticks_in_order(st, a, nullptr);
+    return;
+  }
+  if (lanes.leader()) {
+    sc.car_plan = arena_rays_precomputable(st, a) ? CarPhasePlan::Precast
+                                                  : CarPhasePlan::Sequential;
+  }
+  lanes.sync();
+  if (sc.car_plan == CarPhasePlan::Sequential) {
+    if (lanes.leader()) {
+      arena_car_pre_ticks_in_order(st, a, nullptr);
+    }
+    return;
+  }
+  World w = arena_world(st, a);
+  if (lanes.size >= k_num_wheels * a.num_cars) {
+    for (uint32_t item = lanes.lane; item < k_num_wheels * a.num_cars;
+         item += lanes.size) {
+      uint32_t c = item / k_num_wheels;
+      int wheel = static_cast<int>(item % k_num_wheels);
+      a.cars[c].vehicle.cast_wheel_ray(w, wheel, sc.rays[c][wheel]);
+    }
+  } else {
+    for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
+      a.cars[c].vehicle.cast_wheel_rays(w, sc.rays[c]);
+    }
+  }
+  lanes.sync();
+  if (lanes.leader() && arena_rays_hit_static_only(st, a, sc)) {
+    sc.car_plan = CarPhasePlan::Parallel;
+  }
+  lanes.sync();
+  if (sc.car_plan == CarPhasePlan::Precast) {
+    if (lanes.leader()) {
+      arena_car_pre_ticks_in_order(st, a, &sc);
+    }
+    return;
+  }
+  for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
+    sc.was_on_ground[c] = a.cars[c].state.cache.is_on_ground;
+    car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators, sc.rays[c]);
+  }
+  lanes.sync();
+  if (!lanes.leader()) {
+    return;
+  }
+  for (uint32_t c = 0; c < a.num_cars; ++c) {
+    if (!sc.was_on_ground[c] && a.cars[c].state.cache.is_on_ground) {
+      arena_push_car_landed(a, c);
+    }
+  }
+}
+
+RS_HD void arena_step_tick_back(const ArenaStatic &st, Arena &a,
+                                StepScratch &sc) {
+  using namespace consts;
+  World w = arena_world(st, a);
   ball_pre_tick_update(a.ball, w.dyn_body(a.ball.rigid_body_idx), st.mode);
   sc.num_records = 0;
   sc.num_ball_world = 0;
@@ -571,6 +690,19 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc) {
   if (!a.counters.goal_scored && arena_is_ball_scored(st, a)) {
     a.counters.goal_scored = true;
     a.counters.goal_tick = a.tick_count;
+  }
+}
+
+RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
+                           const LaneGroup &lanes) {
+  if (lanes.leader()) {
+    arena_step_tick_front(st, a);
+  }
+  lanes.sync();
+  arena_step_cars(st, a, sc, lanes);
+  lanes.sync();
+  if (lanes.leader()) {
+    arena_step_tick_back(st, a, sc);
   }
 }
 

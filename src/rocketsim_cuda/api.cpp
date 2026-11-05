@@ -194,7 +194,8 @@ private:
         rsc::Arena &a = pool.arenas_[i];
         a.counters = rsc::ArenaEventCounters{};
         for (uint32_t t = 0; t < job.ticks; ++t) {
-          rsc::arena_step_tick(pool.view_, a, *pool.scratch_[worker]);
+          rsc::arena_step_tick(pool.view_, a, *pool.scratch_[worker],
+                               rsc::LaneGroup::single());
         }
       }
     }
@@ -526,7 +527,8 @@ ArenaBatch::ArenaBatch(Backend backend, std::shared_ptr<const MeshSet> meshes,
   im.staged_mask.assign(num_slots, 0);
   if (backend != Backend::Cpu) {
 #ifdef RSC_HAS_CUDA
-    im.cuda = std::make_unique<rsc::CudaBatch>(*im.st, im.num_device_arenas);
+    im.cuda = std::make_unique<rsc::CudaBatch>(*im.st, im.num_device_arenas,
+                                               im.num_cars);
     constexpr uint32_t chunk = 64;
     std::vector<rsc::Arena> staging(chunk);
     for (uint32_t first = 0; first < im.num_device_arenas; first += chunk) {

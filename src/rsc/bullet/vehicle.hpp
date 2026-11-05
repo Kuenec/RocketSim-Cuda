@@ -155,11 +155,16 @@ struct WheelInfo {
     real_ray_length = suspension_rest_length_1 + travel + wheels_radius;
   }
 
+  RS_HD void ray_endpoints(const Affine3A &trans, Vec3A &source,
+                           Vec3A &target) const {
+    source = trans.transform_point3a(chassis_connection_point_cs);
+    target = source - (trans.matrix3.z_axis * real_ray_length);
+  }
+
   RS_HD void prepare_for_raycast(const Affine3A &trans, Vec3A &source,
                                  Vec3A &target) {
-    hard_point = trans.transform_point3a(chassis_connection_point_cs);
-    target = hard_point - (trans.matrix3.z_axis * real_ray_length);
-    source = hard_point;
+    ray_endpoints(trans, source, target);
+    hard_point = source;
   }
 
   RS_HD void reset_wheel_suspension() {
@@ -346,22 +351,36 @@ struct VehicleRL {
   uint32_t chassis_body_idx;
   WheelInfo wheels[k_num_wheels];
 
-  RS_HDN void cast_rays(const World &w, const Vec3A *from, const Vec3A *to,
-                       VehicleHit *hits) const {
+  RS_HD QuadRayResult cast_quad(const World &w, const Vec3A *from,
+                                const Vec3A *to, uint8_t active_rays) const {
     QuadRayResult r =
         QuadRayResult::make(from, to, static_cast<int>(chassis_body_idx));
     r.collision_filter_group |= k_group_dropshot_floor;
     r.min_hit_dist_sq = min_hit_dist_sq;
+    r.active_rays = active_rays;
     grid_ray_test(w, from, to, r);
+    return r;
+  }
+
+  RS_HD static VehicleHit ray_hit(const World &w, const QuadRayResult &r,
+                                  int i) {
+    VehicleHit hit;
+    hit.valid = false;
+    int idx = r.collision_obj_idx[i];
+    if (idx >= 0 && w.has_contact_response(static_cast<uint32_t>(idx))) {
+      hit.valid = true;
+      hit.body_idx = static_cast<uint32_t>(idx);
+      hit.point = r.hit_point_world[i];
+      hit.normal = r.hit_normal_world[i].normalize_or_zero();
+    }
+    return hit;
+  }
+
+  RS_HDN void cast_rays(const World &w, const Vec3A *from, const Vec3A *to,
+                        VehicleHit *hits) const {
+    QuadRayResult r = cast_quad(w, from, to, 0xf);
     for (int i = 0; i < k_num_wheels; ++i) {
-      hits[i].valid = false;
-      int idx = r.collision_obj_idx[i];
-      if (idx >= 0 && w.has_contact_response(static_cast<uint32_t>(idx))) {
-        hits[i].valid = true;
-        hits[i].body_idx = static_cast<uint32_t>(idx);
-        hits[i].point = r.hit_point_world[i];
-        hits[i].normal = r.hit_normal_world[i].normalize_or_zero();
-      }
+      hits[i] = ray_hit(w, r, i);
     }
   }
 
@@ -481,8 +500,31 @@ struct VehicleRL {
                                       false);
   }
 
+  RS_HD void cast_wheel_rays(const World &w, VehicleHit *hits) const {
+    const Affine3A &trans = w.body(chassis_body_idx).world_trans;
+    Vec3A sources[k_num_wheels];
+    Vec3A targets[k_num_wheels];
+    for (int i = 0; i < k_num_wheels; ++i) {
+      wheels[i].ray_endpoints(trans, sources[i], targets[i]);
+    }
+    cast_rays(w, sources, targets, hits);
+  }
+
+  RS_HDN void cast_wheel_ray(const World &w, int wheel, VehicleHit &hit) const {
+    const Affine3A &trans = w.body(chassis_body_idx).world_trans;
+    Vec3A sources[k_num_wheels];
+    Vec3A targets[k_num_wheels];
+    for (int i = 0; i < k_num_wheels; ++i) {
+      wheels[i].ray_endpoints(trans, sources[i], targets[i]);
+    }
+    QuadRayResult r =
+        cast_quad(w, sources, targets, static_cast<uint8_t>(1u << wheel));
+    hit = ray_hit(w, r, wheel);
+  }
+
   RS_HDN void update(World &w, float time_step, float handbrake_val,
-                    float real_throttle, bool three_wheels) {
+                     float real_throttle, bool three_wheels,
+                     const VehicleHit *precomputed_hits) {
     Affine3A trans = w.body(chassis_body_idx).world_trans;
     Vec3A chassis_translation = trans.translation;
     float friction_scale = w.body(chassis_body_idx).get_mass() / 3.0f;
@@ -492,7 +534,13 @@ struct VehicleRL {
       wheels[i].prepare_for_raycast(trans, sources[i], targets[i]);
     }
     VehicleHit hits[k_num_wheels];
-    cast_rays(w, sources, targets, hits);
+    if (precomputed_hits) {
+      for (int i = 0; i < k_num_wheels; ++i) {
+        hits[i] = precomputed_hits[i];
+      }
+    } else {
+      cast_rays(w, sources, targets, hits);
+    }
     bool cached = false;
     float cached_angle = 0.0f;
     Vec3A cached_axle = Vec3A::zero();
