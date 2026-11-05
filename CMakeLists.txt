@@ -4,6 +4,7 @@ project(RocketSimCuda VERSION 3.0.0 LANGUAGES CXX)
 
 option(RSC_ENABLE_CUDA "Build the CUDA backend" ON)
 option(RSC_BUILD_TOOLS "Build verification and benchmark tools" ON)
+option(RSC_NATIVE_ARCH "Optimize host code for the CPU of the build machine" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,6 +16,9 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(RSC_HOST_FLAGS -ffp-contract=off -fno-fast-math -fno-finite-math-only)
+if(RSC_NATIVE_ARCH)
+  list(APPEND RSC_HOST_FLAGS -march=native)
+endif()
 set(RSC_WARNING_FLAGS -Wall -Wextra)
 
 if(RSC_ENABLE_CUDA)

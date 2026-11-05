@@ -12,6 +12,34 @@ struct Arena;
 struct ArenaOp;
 class HostStatic;
 
+void *alloc_pinned(size_t bytes);
+void free_pinned(void *pointer);
+void release_pinned(void *pointer) noexcept;
+
+template <typename T> class PinnedRows {
+public:
+  PinnedRows() = default;
+  ~PinnedRows() { release_pinned(data_); }
+  PinnedRows(const PinnedRows &) = delete;
+  PinnedRows &operator=(const PinnedRows &) = delete;
+
+  T *reserve(size_t count) {
+    if (count > capacity_) {
+      free_pinned(data_);
+      data_ = nullptr;
+      capacity_ = 0;
+      data_ = static_cast<T *>(alloc_pinned(sizeof(T) * count));
+      std::uninitialized_default_construct_n(data_, count);
+      capacity_ = count;
+    }
+    return data_;
+  }
+
+private:
+  T *data_ = nullptr;
+  size_t capacity_ = 0;
+};
+
 class CudaBatch {
 public:
   CudaBatch(const HostStatic &st, uint32_t num_arenas);
@@ -33,6 +61,7 @@ public:
                     uint32_t count, uint32_t cars_per_arena,
                     uint32_t pads_per_arena, rocketsim_cuda::MemorySpace space);
   void step(uint32_t ticks);
+  void transfer(void *dst, const void *src, size_t bytes);
   void sync();
   void *stream() const;
   void copy_from(const CudaBatch &src, const uint32_t *src_arenas,

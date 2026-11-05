@@ -20,6 +20,16 @@ struct BvhWideNode {
   uint32_t valid_mask;
 
   RS_HD uint32_t intersection_mask(const Aabb &aabb) const {
+#if defined(__SSE2__) && !defined(__CUDACC__)
+    __m128 x = _mm_and_ps(_mm_cmple_ps(to_sse(min_x), _mm_set1_ps(aabb.max.x)),
+                          _mm_cmpge_ps(to_sse(max_x), _mm_set1_ps(aabb.min.x)));
+    __m128 y = _mm_and_ps(_mm_cmple_ps(to_sse(min_y), _mm_set1_ps(aabb.max.y)),
+                          _mm_cmpge_ps(to_sse(max_y), _mm_set1_ps(aabb.min.y)));
+    __m128 z = _mm_and_ps(_mm_cmple_ps(to_sse(min_z), _mm_set1_ps(aabb.max.z)),
+                          _mm_cmpge_ps(to_sse(max_z), _mm_set1_ps(aabb.min.z)));
+    __m128 overlap = _mm_and_ps(_mm_and_ps(x, y), z);
+    return static_cast<uint32_t>(_mm_movemask_ps(overlap)) & valid_mask;
+#else
     BVec4 overlap = min_x.cmple(Vec4::splat(aabb.max.x)) &
                     max_x.cmpge(Vec4::splat(aabb.min.x)) &
                     min_y.cmple(Vec4::splat(aabb.max.y)) &
@@ -27,6 +37,7 @@ struct BvhWideNode {
                     min_z.cmple(Vec4::splat(aabb.max.z)) &
                     max_z.cmpge(Vec4::splat(aabb.min.z));
     return overlap.bitmask() & valid_mask;
+#endif
   }
 };
 

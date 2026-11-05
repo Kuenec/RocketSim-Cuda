@@ -1,6 +1,6 @@
 # RocketSim-CUDA V3
 
-RocketSim-CUDA V3 is a C++ and CUDA port of [RocketSim](https://github.com/ZealanL/RocketSim) v0.3.5, the Rust Rocket League physics simulator by ZealanL and VirxEC. It runs batches of arenas on either a C++ CPU backend or a CUDA GPU backend behind one C++ API, and both backends produce results that are bit-identical to the unmodified upstream Rust simulator.
+RocketSim-CUDA V3 is a C++ and CUDA port of [RocketSim](https://github.com/ZealanL/RocketSim) v0.3.5, the Rust Rocket League physics simulator by ZealanL and VirxEC. It runs batches of arenas on a C++ CPU backend, a CUDA GPU backend, or a hybrid backend that splits one batch across both, behind one C++ API, and every backend produces results that are bit-identical to the unmodified upstream Rust simulator.
 
 ## Exactness guarantee
 
@@ -20,6 +20,7 @@ Results are only guaranteed against a reference built on a machine with the same
 - Exact upstream per-tick event lists (goals via `is_ball_scored`, ball touches, bumps, demos, boost pickups, landings, world hits) plus per-step event counters.
 - Synchronous and asynchronous stepping of N ticks; the CPU backend steps arenas on a thread pool (`BatchConfig::cpu_threads`, all hardware threads by default), which cannot change results because arenas are independent.
 - A device-resident CUDA backend: every tick, reset, state change, mutator change, and copy runs as a kernel on the GPU, and arena state never travels to the host unless you ask for it. Controls can be read from device memory, kickoff resets can be selected by a device-side mask, and the full observable state can be exported straight into device buffers, so a GPU policy can drive a batch with no host transfers.
+- A hybrid backend for the highest total throughput on large batches: the GPU steps the first arenas while the CPU thread pool steps the last `BatchConfig::hybrid_cpu_arenas` arenas at the same time. It has the same API as the CUDA backend, including device-memory controls, masks, and exports; only the CPU arenas' rows cross the PCIe bus, through pinned staging buffers.
 
 ## Build
 
@@ -33,7 +34,7 @@ cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHI
 cmake --build build/cmake
 ```
 
-`-DRSC_ENABLE_CUDA=OFF` builds the CPU backend only. The library target is `rocketsim_cuda` (static); `rocketsim_cuda_c` is a shared C ABI used by the verification harness.
+`-DRSC_ENABLE_CUDA=OFF` builds the CPU backend only. `-DRSC_NATIVE_ARCH=ON` compiles host code for the build machine's CPU (`-march=native`), which makes the CPU backend about 6 percent faster on the reference machine without changing results, but produces binaries that may not run on older CPUs. The library target is `rocketsim_cuda` (static); `rocketsim_cuda_c` is a shared C ABI used by the verification harness.
 
 Collision meshes are not included. Place the `.cmf` files dumped from Rocket League in `collision_meshes/soccar`, `collision_meshes/hoops`, and `collision_meshes/dropshot`, as for upstream RocketSim.
 
@@ -86,29 +87,42 @@ cudaStream_t stream = static_cast<cudaStream_t>(batch.cuda_stream());
 
 All of these calls are queued on the batch's stream in order. Device inputs (actions, masks, seeds) must be fully written before the call that reads them, so finish or order any copy or kernel that produces them against the batch's stream first; likewise, synchronize with that stream (or call `batch.sync()`) before another stream reads the exported buffers.
 
+The hybrid backend takes the same calls. Set the number of arenas the CPU steps, then construct the batch with `Backend::Hybrid`:
+
+```cpp
+config.hybrid_cpu_arenas =
+    static_cast<uint32_t>(config.rng_seeds.size() * 45 / 100);
+ArenaBatch batch(Backend::Hybrid, meshes, config);
+```
+
+Arenas `0` to `num_arenas - hybrid_cpu_arenas - 1` run on the GPU and the rest on the CPU thread pool (`BatchConfig::cpu_threads`). `step_async` launches the GPU arenas, steps the CPU arenas on the calling thread and the pool, and returns while the GPU may still be running. Calls that move CPU arenas' rows between host and device memory (device controls, device masks and seeds, device exports) wait for the batch's stream before they return.
+
 ## Verification
 
 ```bash
 tools/run_gates.sh
 ```
 
-The script builds the library and the Rust harness, runs the quick libm check, and runs every gate scenario on both backends against the upstream crate. It prints one PASS or FAIL line per scenario and backend with event coverage, and ends with `ALL GATES PASS` or `GATES FAIL`. Arguments are passed to the harness, for example `--backend cuda`, `--filter hoops`, or `--quick`. Scenarios cover every mode, 0, 1, 2, 3, 4, 6, and 8 cars, all bodies, all demo modes, 20,000-tick single-arena runs, 128-arena batches, seeded random controls, controls from the `rocketsim_test` recordings, kickoffs, scripted goals and head-on collisions, mid-run state sets, runtime mutator changes, pad state restores, clones, snapshots, and cross-batch and cross-backend copies. Scenarios for a mode whose meshes are missing report BLOCKED.
+The script builds the library and the Rust harness, runs the quick libm check, and runs every gate scenario on every backend against the upstream crate. It prints one PASS or FAIL line per scenario and backend with event coverage, and ends with `ALL GATES PASS` or `GATES FAIL`. Arguments are passed to the harness, for example `--backend cuda`, `--backend hybrid`, `--filter hoops`, or `--quick`; by default every scenario runs on the CPU, CUDA, and hybrid backends, and the hybrid runs put the last half of each batch (rounded up) on the CPU. Scenarios cover every mode, 0, 1, 2, 3, 4, 6, and 8 cars, all bodies, all demo modes, 20,000-tick single-arena runs, 128-arena batches, seeded random controls, controls from the `rocketsim_test` recordings, kickoffs, scripted goals and head-on collisions, mid-run state sets, runtime mutator changes, pad state restores, clones, snapshots, and cross-batch and cross-backend copies. Scenarios for a mode whose meshes are missing report BLOCKED.
 
 ## Benchmarks
 
 ```bash
-build/harness-target/release/rsv3_harness bench --targets upstream,cpu,cuda --arenas 100,1000,10000
+build/harness-target/release/rsv3_harness bench --targets upstream,cpu,cpu-mt,cuda,hybrid --arenas 100,1000,10000 --hybrid-cpu-share 0.45
 ```
 
-Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after a 1,200-tick warm-up over 5 runs of 240 ticks (arena-ticks per second, median with min to max). Upstream and the single-thread CPU backend run on one pinned core of a Ryzen 7 7700X (8 cores, 16 threads); the all-cores CPU column uses 16 threads. The CUDA backend runs on an RTX 5070 in the device-resident loop: controls are read from device memory, steps are asynchronous, and the ball, car, arena-info, and event-count state of every arena is exported into device buffers after every 8-tick action, with one host synchronization per measured run.
+Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after a 1,200-tick warm-up over 5 runs of 240 ticks (arena-ticks per second, median with min to max). Upstream and the single-thread CPU backend run on one core of a Ryzen 7 7700X (8 cores, 16 threads); the all-cores CPU column uses 16 threads and varies by about 10 percent between runs with normal desktop load. The CUDA backend runs on an RTX 5070 in the device-resident loop: controls are read from device memory, steps are asynchronous, and the ball, car, arena-info, and event-count state of every arena is exported into device buffers after every 8-tick action, with one host synchronization per measured run. The hybrid column runs the same loop with 45 percent of the arenas on the CPU thread pool.
 
-| Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU, 1 thread | C++ CPU, all cores | CUDA |
-| --- | --- | --- | --- | --- |
-| 100 | 1.02M (0.97M to 1.09M) | 0.66M (0.64M to 0.73M) | 4.43M (4.26M to 5.06M) | 0.58M (0.51M to 0.63M) |
-| 1,000 | 0.85M (0.83M to 0.93M) | 0.62M (0.61M to 0.68M) | 5.99M (5.78M to 6.31M) | 2.51M (2.18M to 2.64M) |
-| 10,000 | 0.74M (0.73M to 0.77M) | 0.59M (0.59M to 0.63M) | 5.75M (5.60M to 6.14M) | 7.39M (7.19M to 7.67M) |
+| Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU, 1 thread | C++ CPU, all cores | CUDA | Hybrid |
+| --- | --- | --- | --- | --- | --- |
+| 100 | 1.02M (0.97M to 1.11M) | 0.73M (0.70M to 0.79M) | 5.03M (4.85M to 5.41M) | 0.54M (0.48M to 0.60M) | |
+| 1,000 | 0.80M (0.73M to 0.84M) | 0.68M (0.56M to 0.70M) | 6.32M (5.53M to 6.65M) | 2.35M (2.09M to 2.48M) | |
+| 10,000 | 0.73M (0.72M to 0.76M) | 0.63M (0.62M to 0.67M) | 6.13M (5.97M to 6.37M) | 6.80M (6.51M to 7.38M) | 10.15M (9.78M to 11.07M) |
+| 20,000 | | | 5.49M (5.37M to 5.78M) | 7.55M (7.23M to 7.86M) | 11.72M (11.42M to 13.04M) |
 
-The CUDA backend runs one arena per GPU thread and picks the block size from the batch size. Arenas that share a warp take different code paths, and that divergence dominates: a batch of identical arenas runs the same kernel at 10.1M (1,000 arenas) and 14.6M (10,000 arenas) arena-ticks per second. The CUDA backend therefore pays off with thousands of arenas and when the policy also runs on the GPU, since it avoids host transfers. The single-thread C++ CPU backend runs at about 65 to 80 percent of upstream speed; it uses portable scalar code where upstream uses SSE vector instructions, which is the likely cause.
+With `-DRSC_NATIVE_ARCH=ON` the single-thread CPU backend measures 0.78M, 0.70M, and 0.68M at 100, 1,000, and 10,000 arenas, and the all-cores CPU backend 4.46M, 6.78M, and 6.59M.
+
+The CUDA backend runs one arena per GPU thread and picks the block size from the batch size. Arenas that share a warp take different code paths, and that divergence dominates: a batch of identical arenas runs the same kernel at 10.1M (1,000 arenas) and 14.6M (10,000 arenas) arena-ticks per second. The CUDA backend therefore pays off with thousands of arenas and when the policy also runs on the GPU, since it avoids host transfers; the hybrid backend adds the CPU cores on top for the highest total throughput at 10,000 arenas and more, while below a few thousand arenas the CPU backend alone is fastest. The single-thread C++ CPU backend runs at about 70 to 87 percent of upstream speed; it uses portable scalar code for most vector math where upstream uses SSE vector instructions.
 
 ## License
 

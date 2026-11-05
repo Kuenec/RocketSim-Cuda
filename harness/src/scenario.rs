@@ -122,9 +122,11 @@ pub struct Scenario {
     pub seed: u64,
 }
 
+#[derive(Clone, Copy)]
 pub enum Backend {
     Cpu,
     Cuda,
+    Hybrid,
 }
 
 impl Backend {
@@ -132,6 +134,7 @@ impl Backend {
         match self {
             Backend::Cpu => 0,
             Backend::Cuda => 1,
+            Backend::Hybrid => 2,
         }
     }
 
@@ -139,6 +142,14 @@ impl Backend {
         match self {
             Backend::Cpu => "cpu",
             Backend::Cuda => "cuda",
+            Backend::Hybrid => "hybrid",
+        }
+    }
+
+    pub fn has_device_io(&self) -> bool {
+        match self {
+            Backend::Cpu => false,
+            Backend::Cuda | Backend::Hybrid => true,
         }
     }
 }
@@ -327,6 +338,10 @@ fn batch_desc(
         cars,
         rng_seeds: seeds.to_vec(),
         cpu_threads: 0,
+        hybrid_cpu_arenas: match backend {
+            Backend::Hybrid => seeds.len().div_ceil(2) as u32,
+            Backend::Cpu | Backend::Cuda => 0,
+        },
     })
 }
 
@@ -362,15 +377,17 @@ pub fn run(
     let num_pads = upstream[0].num_boost_pads();
     let has_tiles = mode == GameMode::Dropshot;
     let mut exported = ffi::Exported::new(scenario.arenas, num_cars, num_pads, has_tiles);
-    let device_export = match backend {
-        Backend::Cuda => Some(ffi::DeviceExport::new(scenario.arenas, num_cars, num_pads)?),
-        Backend::Cpu => None,
+    let device_export = if backend.has_device_io() {
+        Some(ffi::DeviceExport::new(scenario.arenas, num_cars, num_pads)?)
+    } else {
+        None
     };
-    let mut device_controls = match backend {
-        Backend::Cuda => Some(ffi::DeviceBuffer::new(
+    let mut device_controls = if backend.has_device_io() {
+        Some(ffi::DeviceBuffer::new(
             scenario.arenas * num_cars.max(1) * std::mem::size_of::<ffi::CarControls>(),
-        )?),
-        Backend::Cpu => None,
+        )?)
+    } else {
+        None
     };
     let mut check_exports = |upstream: &[Arena],
                              ours: &mut ffi::Batch,
@@ -387,7 +404,7 @@ pub fn run(
         }
         Ok(())
     };
-    let mut rng = SplitMix::new(scenario.seed ^ 0x5eed_0f_c0ffee);
+    let mut rng = SplitMix::new(scenario.seed ^ 0x5eed_0fc0_ffee);
     let mut control_states: Vec<ControlState> = (0..scenario.arenas * num_cars)
         .map(|_| ControlState {
             current: CarControls::DEFAULT,
@@ -539,7 +556,7 @@ pub fn run(
         {
             comparisons += compare(&upstream, &mut ours, tick, "step", Some(&expected_counts))?;
             step_compares += 1;
-            if step_compares % 4 == 0 || tick == scenario.ticks {
+            if step_compares.is_multiple_of(4) || tick == scenario.ticks {
                 check_exports(&upstream, &mut ours, tick, Some(&expected_counts))?;
             }
         }
@@ -745,16 +762,16 @@ fn apply_action(
             }
         }
         Action::KickoffUnseeded => {
-            for i in 0..n {
-                upstream[i].reset_to_random_kickoff(None);
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                arena.reset_to_random_kickoff(None);
                 ours.reset_kickoff(i as u32, None)?;
             }
         }
         Action::RandomBall => {
-            for i in 0..n {
+            for (i, arena) in upstream.iter_mut().enumerate() {
                 let mut ball = BallState::DEFAULT;
                 ball.phys = random_phys(rng, mode);
-                upstream[i].set_ball_state(ball);
+                arena.set_ball_state(ball);
                 let mut ours_ball = ours.snapshot(i as u32)?.ball;
                 ours_ball.phys = to_ffi_phys(&ball.phys);
                 ours_ball.hs_info = ffi::HeatseekerInfo {
@@ -774,7 +791,7 @@ fn apply_action(
             }
         }
         Action::RandomCars => {
-            for i in 0..n {
+            for (i, arena) in upstream.iter_mut().enumerate() {
                 for c in 0..scenario.cars.len() {
                     let phys = random_phys(rng, mode);
                     let boost = rng.range(0.0, 100.0);
@@ -783,7 +800,7 @@ fn apply_action(
                         boost,
                         ..CarCore::DEFAULT
                     };
-                    upstream[i].set_car_state(c, core);
+                    arena.set_car_state(c, core);
                     ours.set_car_state(i as u32, c as u32, &ffi_core(&core))?;
                 }
             }
@@ -801,10 +818,10 @@ fn apply_action(
             for i in 0..n {
                 our_states.push(ours.snapshot(i as u32)?.cars);
             }
-            for i in 0..n {
+            for (i, arena) in upstream.iter_mut().enumerate() {
                 let src = (i + 1) % n;
                 for c in 0..scenario.cars.len() {
-                    upstream[i].set_car_state_full(c, up_states[src][c]);
+                    arena.set_car_state_full(c, up_states[src][c]);
                     ours.set_car_state_full(i as u32, c as u32, &our_states[src][c])?;
                 }
             }
@@ -819,8 +836,8 @@ fn apply_action(
             }
         }
         Action::Mutators(change) => {
-            for i in 0..n {
-                let mut m = *upstream[i].mutator_config();
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                let mut m = *arena.mutator_config();
                 match change {
                     MutatorChange::Gravity => {
                         m.gravity =
@@ -848,13 +865,13 @@ fn apply_action(
                         m.respawn_delay = rng.range(0.5, 4.0);
                     }
                 }
-                upstream[i].set_mutator_config(m);
+                arena.set_mutator_config(m);
                 ours.set_mutators(i as u32, &to_ffi_mutators(&m))?;
             }
         }
         Action::PadStates => {
-            for i in 0..n {
-                let num_pads = upstream[i].num_boost_pads();
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                let num_pads = arena.num_boost_pads();
                 for p in 0..num_pads {
                     let cooldown = if rng.below(3) == 0 {
                         0.0
@@ -864,7 +881,7 @@ fn apply_action(
                     let touching: Vec<usize> = (0..scenario.cars.len())
                         .filter(|_| rng.below(6) == 0)
                         .collect();
-                    upstream[i].set_boost_pad_state(
+                    arena.set_boost_pad_state(
                         p,
                         BoostPadState {
                             touching_car_idxs: touching.clone(),
@@ -879,7 +896,7 @@ fn apply_action(
         Action::CarsCollide => {
             let num_cars = scenario.cars.len();
             let half = num_cars.div_ceil(2);
-            for i in 0..n {
+            for (i, arena) in upstream.iter_mut().enumerate() {
                 for c in 0..num_cars {
                     let (pair, side) = if c < half { (c, 0) } else { (c - half, 1) };
                     let dir = if side == 0 { 1.0 } else { -1.0 };
@@ -909,7 +926,7 @@ fn apply_action(
                         },
                         ..CarCore::DEFAULT
                     };
-                    upstream[i].set_car_state(c, core);
+                    arena.set_car_state(c, core);
                     ours.set_car_state(i as u32, c as u32, &ffi_core(&core))?;
                 }
             }
@@ -927,17 +944,19 @@ fn apply_action(
                     upstream[i].reset_to_random_kickoff(seeded.then_some(reset_seeds[i]));
                 }
             }
-            match ctx.backend {
-                Backend::Cuda => {
-                    let mut mask_buffer = ffi::DeviceBuffer::new(n)?;
-                    mask_buffer.upload(&mask)?;
-                    let mut seed_buffer = ffi::DeviceBuffer::new(n * 8)?;
-                    seed_buffer.upload(&reset_seeds)?;
-                    ours.reset_kickoff_masked_device(&mask_buffer, seeded.then_some(&seed_buffer))?;
-                }
-                Backend::Cpu => {
-                    ours.reset_kickoff_masked_host(&mask, seeded.then_some(&reset_seeds[..]))?;
-                }
+            let use_device = match ctx.backend {
+                Backend::Cpu => false,
+                Backend::Cuda => true,
+                Backend::Hybrid => seeded,
+            };
+            if use_device {
+                let mut mask_buffer = ffi::DeviceBuffer::new(n)?;
+                mask_buffer.upload(&mask)?;
+                let mut seed_buffer = ffi::DeviceBuffer::new(n * 8)?;
+                seed_buffer.upload(&reset_seeds)?;
+                ours.reset_kickoff_masked_device(&mask_buffer, seeded.then_some(&seed_buffer))?;
+            } else {
+                ours.reset_kickoff_masked_host(&mask, seeded.then_some(&reset_seeds[..]))?;
             }
         }
         Action::SnapshotRoundTrip => {
@@ -945,10 +964,10 @@ fn apply_action(
                 let snapshots = (0..n)
                     .map(|i| ours.save(i as u32))
                     .collect::<Result<Vec<_>, _>>()?;
-                let clones: Vec<Arena> = upstream.iter().map(|a| a.clone()).collect();
-                for i in 0..n {
+                let clones: Vec<Arena> = upstream.to_vec();
+                for (i, arena) in upstream.iter_mut().enumerate() {
                     let src = (i + n - 1) % n;
-                    upstream[i] = clones[src].clone();
+                    *arena = clones[src].clone();
                     ours.load(i as u32, &snapshots[src])?;
                 }
             }
@@ -956,12 +975,10 @@ fn apply_action(
         Action::CrossBatchCopy | Action::CrossBackendCopy => {
             if n >= 2 {
                 let other = match (action, ctx.backend) {
-                    (Action::CrossBatchCopy, b) => match b {
-                        Backend::Cpu => Backend::Cpu,
-                        Backend::Cuda => Backend::Cuda,
-                    },
+                    (Action::CrossBatchCopy, b) => *b,
                     (_, Backend::Cpu) => Backend::Cuda,
                     (_, Backend::Cuda) => Backend::Cpu,
+                    (_, Backend::Hybrid) => Backend::Cuda,
                 };
                 let mut temp =
                     ffi::Batch::new(ctx.meshes, &batch_desc(scenario, &other, &seeds[..2])?)?;
@@ -973,7 +990,7 @@ fn apply_action(
         }
         Action::BallIntoGoal => {
             for (i, arena) in upstream.iter_mut().enumerate() {
-                let side = if (i + tick as usize) % 2 == 0 {
+                let side = if (i + tick as usize).is_multiple_of(2) {
                     1.0
                 } else {
                     -1.0
@@ -1016,7 +1033,7 @@ fn apply_action(
             }
         }
         Action::Tiles => {
-            for i in 0..n {
+            for (i, arena) in upstream.iter_mut().enumerate() {
                 let mut tiles = TileStates::DEFAULT;
                 let mut ffi_tiles = ffi::TileStates::default();
                 for team in 0..2 {
@@ -1030,7 +1047,7 @@ fn apply_action(
                         ffi_tiles.states[team][t] = s as u8;
                     }
                 }
-                upstream[i].set_tile_states(tiles);
+                arena.set_tile_states(tiles);
                 ours.set_tiles(i as u32, &ffi_tiles)?;
             }
         }

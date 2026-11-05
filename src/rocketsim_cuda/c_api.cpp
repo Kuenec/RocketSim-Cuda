@@ -70,6 +70,7 @@ RscBatch *rsc_batch_create(const RscMeshSet *meshes, const RscBatchDesc *desc) {
     config.max_aabb_len = desc->max_aabb_len;
     config.no_ball_rot = desc->no_ball_rot;
     config.cpu_threads = desc->cpu_threads;
+    config.hybrid_cpu_arenas = desc->hybrid_cpu_arenas;
     config.mutators = desc->mutators;
     config.cars.assign(desc->cars, desc->cars + desc->num_cars);
     config.rng_seeds.assign(desc->rng_seeds,

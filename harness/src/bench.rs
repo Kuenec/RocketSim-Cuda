@@ -78,6 +78,7 @@ pub fn run(
     reps: usize,
     ticks: u32,
     warmup_ticks: u32,
+    hybrid_cpu_share: f64,
 ) -> Result<Stats, String> {
     let mode = GameMode::Soccar;
     let mutators = MutatorConfig::new(mode);
@@ -129,8 +130,13 @@ pub fn run(
         Target::Ours(_) | Target::CpuThreads => {
             let (backend, cpu_threads) = match target {
                 Target::Ours(Backend::Cuda) => (Backend::Cuda, 0),
+                Target::Ours(Backend::Hybrid) => (Backend::Hybrid, 0),
                 Target::Ours(Backend::Cpu) => (Backend::Cpu, 1),
                 _ => (Backend::Cpu, 0),
+            };
+            let hybrid_cpu_arenas = match backend {
+                Backend::Hybrid => (arenas as f64 * hybrid_cpu_share).round() as u32,
+                Backend::Cpu | Backend::Cuda => 0,
             };
             let backend = &backend;
             let cars = teams
@@ -151,6 +157,7 @@ pub fn run(
                     cars,
                     rng_seeds: (0..arenas as u64).collect(),
                     cpu_threads,
+                    hybrid_cpu_arenas,
                 },
             )?;
             for a in 0..arenas as u32 {
@@ -161,7 +168,7 @@ pub fn run(
                 .map(|set| set.iter().map(to_ffi_controls).collect())
                 .collect();
             let device = match backend {
-                Backend::Cuda => {
+                Backend::Cuda | Backend::Hybrid => {
                     let mut buffers = Vec::new();
                     for set in &ffi_pool {
                         let mut b = ffi::DeviceBuffer::new(std::mem::size_of_val(&set[..]))?;

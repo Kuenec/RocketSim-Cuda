@@ -26,6 +26,7 @@ struct RscBatchDesc {
   const rocketsim_cuda::BoostPadConfig *custom_pads;
   int32_t num_custom_pads;
   uint32_t cpu_threads;
+  uint32_t hybrid_cpu_arenas;
 };
 
 struct RscArenaScalars {

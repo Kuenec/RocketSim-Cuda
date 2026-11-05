@@ -9,7 +9,7 @@
 
 namespace rocketsim_cuda {
 
-enum class Backend : uint8_t { Cpu, Cuda };
+enum class Backend : uint8_t { Cpu, Cuda, Hybrid };
 
 enum class GameMode : uint8_t {
   Soccar,
@@ -343,6 +343,7 @@ struct BatchConfig {
   std::vector<CarSpec> cars;
   std::vector<uint64_t> rng_seeds;
   uint32_t cpu_threads = 0;
+  uint32_t hybrid_cpu_arenas = 0;
 };
 
 MutatorConfig default_mutators(GameMode mode);

@@ -206,10 +206,36 @@ struct QuadRayInfo {
     return pack;
   }
 
+#if defined(__SSE2__) && !defined(__CUDACC__)
+  struct SseSlab {
+    __m128 enter;
+    __m128 exit;
+  };
+
+  static SseSlab sse_slab(Vec4 origin, Vec4 inv_dir, float lo, float hi) {
+    __m128 o = to_sse(origin);
+    __m128 inv = to_sse(inv_dir);
+    __m128 t0 = _mm_mul_ps(_mm_sub_ps(_mm_set1_ps(lo), o), inv);
+    __m128 t1 = _mm_mul_ps(_mm_sub_ps(_mm_set1_ps(hi), o), inv);
+    return {_mm_min_ps(t0, t1), _mm_max_ps(t0, t1)};
+  }
+#endif
+
   RS_HD static uint32_t intersect_quad_ray_aabb(const Vec4 *origins,
                                                 const Vec4 *inv_dir,
                                                 const Aabb &bounds,
                                                 Vec4 lambda_max) {
+#if defined(__SSE2__) && !defined(__CUDACC__)
+    SseSlab x = sse_slab(origins[0], inv_dir[0], bounds.min.x, bounds.max.x);
+    SseSlab y = sse_slab(origins[1], inv_dir[1], bounds.min.y, bounds.max.y);
+    SseSlab z = sse_slab(origins[2], inv_dir[2], bounds.min.z, bounds.max.z);
+    __m128 t_enter = _mm_max_ps(_mm_max_ps(x.enter, y.enter), z.enter);
+    __m128 t_exit = _mm_min_ps(_mm_min_ps(x.exit, y.exit), z.exit);
+    __m128 hit = _mm_and_ps(_mm_and_ps(_mm_cmple_ps(t_enter, t_exit),
+                                       _mm_cmpge_ps(t_exit, _mm_set1_ps(0.0f))),
+                            _mm_cmple_ps(t_enter, to_sse(lambda_max)));
+    return static_cast<uint32_t>(_mm_movemask_ps(hit));
+#else
     Vec4 t0x = (Vec4::splat(bounds.min.x) - origins[0]) * inv_dir[0];
     Vec4 t1x = (Vec4::splat(bounds.max.x) - origins[0]) * inv_dir[0];
     Vec4 tminx = t0x.min(t1x);
@@ -228,6 +254,7 @@ struct QuadRayInfo {
     BVec4 cond2 = t_exit.cmpge(Vec4::splat(0.0f));
     BVec4 cond3 = t_enter.cmple(lambda_max);
     return (cond1 & cond2 & cond3).bitmask();
+#endif
   }
 };
 

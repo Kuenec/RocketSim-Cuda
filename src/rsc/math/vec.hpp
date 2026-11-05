@@ -5,6 +5,10 @@
 #include "rsc/math/hd.hpp"
 #include "rsc/math/libm.hpp"
 
+#if defined(__SSE2__) && !defined(__CUDACC__)
+#include <xmmintrin.h>
+#endif
+
 namespace rsc {
 
 RS_HDI float sse_min(float a, float b) { return a < b ? a : b; }
@@ -319,6 +323,10 @@ struct Vec4 {
     return {m.x ? t.x : f.x, m.y ? t.y : f.y, m.z ? t.z : f.z, m.w ? t.w : f.w};
   }
 };
+
+#if defined(__SSE2__) && !defined(__CUDACC__)
+inline __m128 to_sse(Vec4 v) { return _mm_setr_ps(v.x, v.y, v.z, v.w); }
+#endif
 
 RS_HDI Vec4 operator-(float s, Vec4 v) { return Vec4::splat(s) - v; }
 

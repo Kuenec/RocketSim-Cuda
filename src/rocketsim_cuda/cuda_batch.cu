@@ -255,6 +255,24 @@ struct CudaBatch::Impl {
   }
 };
 
+void *alloc_pinned(size_t bytes) {
+  void *pointer = nullptr;
+  check(cudaMallocHost(&pointer, bytes), "cudaMallocHost");
+  return pointer;
+}
+
+void free_pinned(void *pointer) {
+  if (pointer) {
+    check(cudaFreeHost(pointer), "cudaFreeHost");
+  }
+}
+
+void release_pinned(void *pointer) noexcept {
+  if (pointer) {
+    cudaFreeHost(pointer);
+  }
+}
+
 CudaBatch::CudaBatch(const HostStatic &st, uint32_t num_arenas)
     : impl_(std::make_unique<Impl>(st, num_arenas)) {}
 
@@ -320,6 +338,9 @@ void CudaBatch::set_controls_device(const rocketsim_cuda::CarControls *controls,
 void CudaBatch::reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
                                      rocketsim_cuda::MemorySpace space) {
   uint32_t n = impl_->num_arenas;
+  if (n == 0) {
+    return;
+  }
   const uint8_t *d_mask = mask;
   const uint64_t *d_seeds = seeds;
   if (space == rocketsim_cuda::MemorySpace::Host) {
@@ -388,10 +409,18 @@ void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
 }
 
 void CudaBatch::step(uint32_t ticks) {
+  if (impl_->num_arenas == 0) {
+    return;
+  }
   step_kernel<<<impl_->blocks, impl_->block_size, 0, impl_->stream>>>(
       impl_->view, impl_->arenas.get(), impl_->scratch.get(), impl_->num_arenas,
       ticks);
   check(cudaGetLastError(), "step kernel launch");
+}
+
+void CudaBatch::transfer(void *dst, const void *src, size_t bytes) {
+  check(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, impl_->stream),
+        "stream transfer");
 }
 
 void CudaBatch::sync() {

@@ -26,6 +26,7 @@ struct Options {
     bench_reps: usize,
     bench_ticks: u32,
     bench_warmup: u32,
+    bench_hybrid_cpu_share: f64,
     backends: Vec<Backend>,
     filter: Vec<String>,
     quick: bool,
@@ -46,7 +47,8 @@ fn parse_args() -> Result<Options, String> {
         bench_reps: 5,
         bench_ticks: 240,
         bench_warmup: 1200,
-        backends: vec![Backend::Cpu, Backend::Cuda],
+        bench_hybrid_cpu_share: 0.4,
+        backends: vec![Backend::Cpu, Backend::Cuda, Backend::Hybrid],
         filter: Vec::new(),
         quick: false,
         meshes: root.join("collision_meshes"),
@@ -58,7 +60,7 @@ fn parse_args() -> Result<Options, String> {
         Some("bench") => Command::Bench,
         other => {
             return Err(format!(
-                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|both] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cpu-mt,cuda] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N]"
+                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|hybrid|both|all] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cpu-mt,cuda,hybrid] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N] [--hybrid-cpu-share F]"
             ));
         }
     };
@@ -68,7 +70,9 @@ fn parse_args() -> Result<Options, String> {
                 opts.backends = match args.next().as_deref() {
                     Some("cpu") => vec![Backend::Cpu],
                     Some("cuda") => vec![Backend::Cuda],
+                    Some("hybrid") => vec![Backend::Hybrid],
                     Some("both") => vec![Backend::Cpu, Backend::Cuda],
+                    Some("all") => vec![Backend::Cpu, Backend::Cuda, Backend::Hybrid],
                     other => return Err(format!("invalid backend {other:?}")),
                 }
             }
@@ -89,6 +93,7 @@ fn parse_args() -> Result<Options, String> {
                         "upstream" => Ok(bench::Target::Upstream),
                         "cpu" => Ok(bench::Target::Ours(Backend::Cpu)),
                         "cuda" => Ok(bench::Target::Ours(Backend::Cuda)),
+                        "hybrid" => Ok(bench::Target::Ours(Backend::Hybrid)),
                         "cpu-mt" => Ok(bench::Target::CpuThreads),
                         other => Err(format!("invalid bench target {other}")),
                     })
@@ -114,6 +119,16 @@ fn parse_args() -> Result<Options, String> {
                 opts.bench_warmup = v
                     .parse()
                     .map_err(|e| format!("invalid --warmup {v}: {e}"))?;
+            }
+            "--hybrid-cpu-share" => {
+                let v = args.next().ok_or("--hybrid-cpu-share needs a value")?;
+                let share: f64 = v
+                    .parse()
+                    .map_err(|e| format!("invalid --hybrid-cpu-share {v}: {e}"))?;
+                if !(0.0..=1.0).contains(&share) {
+                    return Err(format!("--hybrid-cpu-share {v} is outside 0 to 1"));
+                }
+                opts.bench_hybrid_cpu_share = share;
             }
             "--ticks" => {
                 let v = args.next().ok_or("--ticks needs a value")?;
@@ -375,6 +390,12 @@ fn run_bench(opts: &Options, meshes: &ffi::MeshSet) -> ExitCode {
     let mut ok = true;
     for &arenas in &opts.bench_arenas {
         for target in &opts.bench_targets {
+            let label = match target {
+                bench::Target::Ours(Backend::Hybrid) => {
+                    format!("hybrid-cpu{:.2}", opts.bench_hybrid_cpu_share)
+                }
+                _ => target.name().to_string(),
+            };
             match bench::run(
                 meshes,
                 target,
@@ -382,10 +403,11 @@ fn run_bench(opts: &Options, meshes: &ffi::MeshSet) -> ExitCode {
                 opts.bench_reps,
                 opts.bench_ticks,
                 opts.bench_warmup,
+                opts.bench_hybrid_cpu_share,
             ) {
                 Ok(s) => println!(
                     "bench soccar_1v1 {:<14} arenas {:>6}  median {:>12.0}  min {:>12.0}  max {:>12.0} arena-ticks/s  samples {:?}",
-                    target.name(),
+                    label,
                     arenas,
                     s.median,
                     s.min,
@@ -399,8 +421,7 @@ fn run_bench(opts: &Options, meshes: &ffi::MeshSet) -> ExitCode {
                     ok = false;
                     println!(
                         "bench soccar_1v1 {:<14} arenas {:>6}  FAILED {e}",
-                        target.name(),
-                        arenas
+                        label, arenas
                     );
                 }
             }
