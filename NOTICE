@@ -1,0 +1,45 @@
+RocketSim-CUDA V3
+
+This project is a C++ and CUDA port of RocketSim v0.3.5 (Rust), created by
+ZealanL and ported to Rust by VirxEC (https://github.com/ZealanL/RocketSim,
+MIT License, see LICENSE). RocketSim's physics are derived from the Bullet
+Physics library.
+
+Third-party code and derived works included in this repository:
+
+1. Bullet Physics (zlib License)
+   Copyright (c) 2003-2014 Erwin Coumans, http://bulletphysics.org
+   The collision, constraint solver, and vehicle code under src/rsc/bullet is
+   ported from RocketSim, which derives it from Bullet Physics.
+
+   This software is provided 'as-is', without any express or implied
+   warranty. In no event will the authors be held liable for any damages
+   arising from the use of this software. Permission is granted to anyone to
+   use this software for any purpose, including commercial applications, and
+   to alter it and redistribute it freely, subject to the following
+   restrictions:
+   1. The origin of this software must not be misrepresented; you must not
+      claim that you wrote the original software. If you use this software in
+      a product, an acknowledgment in the product documentation would be
+      appreciated but is not required.
+   2. Altered source versions must be plainly marked as such, and must not be
+      misrepresented as being the original software.
+   3. This notice may not be removed or altered from any source distribution.
+
+2. GNU C Library (LGPL-2.1-or-later)
+   Copyright (C) 1991-2026 Free Software Foundation, Inc.
+   The following files are derived from glibc 2.44 math routines and are
+   distributed under the GNU Lesser General Public License, version 2.1 or
+   (at your option) any later version (https://www.gnu.org/licenses/):
+     src/rsc/math/glibc_atan2_hypot.hpp   (atan2, hypot)
+     src/rsc/math/glibc_atan_table.hpp    (atan2 tables)
+     src/rsc/math/libm.hpp                (sinf, cosf; see item 3 for atan2f, acosf)
+   They reproduce the results of the glibc build installed on the reference
+   machine bit for bit. The rest of this project remains under the MIT
+   License.
+
+3. CORE-MATH (MIT License)
+   Copyright (c) 2022-2024 Alexei Sibidanov and Paul Zimmermann.
+   The correctly rounded atan2f and acosf in src/rsc/math/libm.hpp are ported
+   from the CORE-MATH versions shipped in glibc
+   (https://core-math.gitlabpages.inria.fr/).

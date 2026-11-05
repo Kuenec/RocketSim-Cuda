@@ -1,0 +1,17 @@
+[package]
+name = "rsv3_harness"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+glam = "0.34"
+rocketsim = { git = "https://github.com/ZealanL/RocketSim", tag = "v0.3.5", features = ["serde"] }
+rocketsim_test = { git = "https://github.com/ZealanL/RocketSim", tag = "v0.3.5" }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+debug = true
+lto = true
+panic = "abort"
+codegen-units = 1

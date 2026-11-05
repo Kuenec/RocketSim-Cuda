@@ -1,0 +1,577 @@
+#pragma once
+
+#include <cstdint>
+
+#include "rsc/bullet/dynamics.hpp"
+#include "rsc/bullet/mesh_algorithms.hpp"
+#include "rsc/bullet/vehicle.hpp"
+#include "rsc/math/rng.hpp"
+#include "rsc/sim/ball.hpp"
+#include "rsc/sim/boost_pads.hpp"
+#include "rsc/sim/bump_demo.hpp"
+#include "rsc/sim/car.hpp"
+#include "rsc/sim/consts.hpp"
+#include "rsc/sim/dropshot.hpp"
+#include "rsc/sim/quantize.hpp"
+
+namespace rsc {
+
+inline constexpr int k_max_records = 160;
+inline constexpr int k_max_ball_world_records = 32;
+inline constexpr int k_max_normal_groups = 64;
+
+inline constexpr int k_max_events = 192;
+
+enum class ArenaEventKind : uint8_t {
+  BallHitWorld,
+  CarHitBall,
+  CarHitCar,
+  CarHitWorld,
+  CarPickupBoost,
+  CarLanded
+};
+
+struct ArenaEvent {
+  ArenaEventKind kind;
+  uint8_t car_idx;
+  uint8_t other_idx;
+  bool is_demo;
+  Vec3A point;
+  Vec3A vec;
+};
+
+struct LandedWheels {
+  bool has_contact[4];
+  RaycastHitInfo wheels[4];
+};
+
+struct CarEventCounters {
+  uint32_t hit_ball;
+  uint32_t hit_world;
+  uint32_t bumps_dealt;
+  uint32_t demos_dealt;
+  uint32_t bumps_received;
+  uint32_t demos_received;
+  uint32_t boost_pickups;
+  uint32_t landed;
+};
+
+struct ArenaEventCounters {
+  uint32_t ball_hit_world;
+  bool goal_scored;
+  uint64_t goal_tick;
+  CarEventCounters cars[k_max_cars];
+};
+
+struct Arena {
+  ArenaPhysics phys;
+  Ball ball;
+  uint32_t num_cars;
+  Car cars[k_max_cars];
+  uint64_t tick_count;
+  bool ball_only;
+  Rng rng;
+  MutatorConfig mutators;
+  uint32_t num_pads;
+  PadState pads[k_max_pads];
+  bool has_tiles;
+  TileStates tiles;
+  uint32_t num_events;
+  ArenaEvent events[k_max_events];
+  LandedWheels landed[k_max_cars];
+  ArenaEventCounters counters;
+};
+
+struct ArenaStatic {
+  StaticWorldData world;
+  GameMode mode;
+  PadLayoutView pads;
+  bool has_pads;
+};
+
+struct ContactRecord {
+  bool is_swap;
+  uint32_t a;
+  uint32_t b;
+  ManifoldPoint point;
+};
+
+struct BallWorldRecord {
+  uint32_t rb;
+  Vec3A point;
+  Vec3A normal;
+};
+
+struct WorldNormalGroup {
+  uint32_t car_idx;
+  uint32_t object_idx;
+  Vec3A sum;
+};
+
+struct StepScratch {
+  SolverScratch solver;
+  PadUpdateScratch pads;
+  int num_records;
+  ContactRecord records[k_max_records];
+  int num_ball_world;
+  BallWorldRecord ball_world[k_max_ball_world_records];
+  int num_groups;
+  WorldNormalGroup groups[k_max_normal_groups];
+};
+
+struct ContactTracker {
+  World *w;
+  StepScratch *sc;
+  bool ball_only;
+
+  RS_HD static bool should_swap(const RigidBody &a, const RigidBody &b) {
+    if (a.user_idx != UserInfoType::None && b.user_idx != UserInfoType::None) {
+      return a.user_idx > b.user_idx;
+    }
+    return b.user_idx != UserInfoType::None;
+  }
+
+  RS_HD void push_record(bool swap, uint32_t a, uint32_t b,
+                         const ManifoldPoint &p) {
+    if (sc->num_records >= k_max_records) {
+      w->flag_error(k_error_records_overflow);
+      return;
+    }
+    sc->records[sc->num_records++] = {swap, a, b, p};
+  }
+
+  RS_HD void callback(ManifoldPoint &cp, const RigidBody &body_a_in,
+                      const RigidBody &body_b_in, int idx) {
+    bool swap = should_swap(body_a_in, body_b_in);
+    const RigidBody &a = swap ? body_b_in : body_a_in;
+    const RigidBody &b = swap ? body_a_in : body_b_in;
+    if (a.user_idx == UserInfoType::Car) {
+      if (b.user_idx == UserInfoType::Ball) {
+        cp.combined_friction = consts::car::hit_ball_coefs.friction;
+        cp.combined_restitution = consts::car::hit_ball_coefs.restitution;
+      } else if (b.user_idx == UserInfoType::Car) {
+        cp.combined_friction = consts::car::hit_car_coefs.friction;
+        cp.combined_restitution = consts::car::hit_car_coefs.restitution;
+      } else {
+        cp.combined_friction = consts::car::hit_world_coefs.friction;
+        cp.combined_restitution = consts::car::hit_world_coefs.restitution;
+      }
+    } else if (a.user_idx == UserInfoType::Ball &&
+               b.user_idx == UserInfoType::None && b.is_static_obj()) {
+      cp.is_special = true;
+    }
+    if (ball_only && a.user_idx == UserInfoType::Ball &&
+        b.user_idx == UserInfoType::None && b.is_static_obj()) {
+      if (sc->num_ball_world >= k_max_ball_world_records) {
+        w->flag_error(k_error_records_overflow);
+      } else {
+        sc->ball_world[sc->num_ball_world++] = {
+            a.world_array_idx, cp.pos_world_on_b, cp.normal_world_on_b};
+      }
+    } else {
+      push_record(swap, a.world_array_idx, b.world_array_idx, cp);
+    }
+    if (idx >= 0) {
+      adjust_internal_edge_contacts(*w, cp, b, idx);
+    }
+  }
+
+  RS_HD void contact_processed(const ManifoldPoint &point,
+                               const RigidBody &body_a_in,
+                               const RigidBody &body_b_in) {
+    bool swap = should_swap(body_a_in, body_b_in);
+    const RigidBody &a = swap ? body_b_in : body_a_in;
+    const RigidBody &b = swap ? body_a_in : body_b_in;
+    if (a.user_idx != UserInfoType::Car || b.user_idx == UserInfoType::Ball ||
+        b.user_idx == UserInfoType::Car) {
+      return;
+    }
+    push_record(swap, a.world_array_idx, b.world_array_idx, point);
+  }
+
+  RS_HD void manifold_processed(const PersistentManifold &m,
+                                const RigidBody &body_a_in,
+                                const RigidBody &body_b_in) {
+    bool swap = should_swap(body_a_in, body_b_in);
+    const RigidBody &a = swap ? body_b_in : body_a_in;
+    const RigidBody &b = swap ? body_a_in : body_b_in;
+    if (a.user_idx != UserInfoType::Car || b.user_idx == UserInfoType::Ball ||
+        b.user_idx == UserInfoType::Car) {
+      return;
+    }
+    for (int i = 0; i < m.num_points; ++i) {
+      uint32_t car_idx = a.user_pointer;
+      uint32_t object_idx = b.world_array_idx;
+      Vec3A normal = m.points[i].normal_world_on_b;
+      bool found = false;
+      for (int g = 0; g < sc->num_groups; ++g) {
+        WorldNormalGroup &group = sc->groups[g];
+        if (group.car_idx == car_idx && group.object_idx == object_idx) {
+          group.sum += normal;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        if (sc->num_groups >= k_max_normal_groups) {
+          w->flag_error(k_error_records_overflow);
+        } else {
+          sc->groups[sc->num_groups++] = {car_idx, object_idx, normal};
+        }
+      }
+    }
+  }
+};
+
+RS_HDI World arena_world(const ArenaStatic &st, Arena &a) {
+  return {&st.world, &a.phys};
+}
+
+RS_HD bool arena_is_ball_scored(const ArenaStatic &st, const Arena &a) {
+  using namespace consts;
+  const RigidBody &rb =
+      a.phys.dyn_bodies[a.ball.rigid_body_idx - st.world.num_static_bodies];
+  Vec3A pos = rb.world_trans.translation * bt_to_uu;
+  switch (st.mode) {
+  case GameMode::Soccar:
+  case GameMode::Heatseeker:
+  case GameMode::Snowday:
+    return abs_f32(pos.y) >
+           a.mutators.goal_base_threshold_y + a.mutators.ball_radius;
+  case GameMode::Hoops: {
+    if (pos.z < goal::hoops_goal_score_threshold_z) {
+      float dy = abs_f32(pos.y) * 0.9f - 2770.0f;
+      float dist_sq = pos.x * pos.x + dy * dy;
+      return dist_sq - 716.0f * 716.0f < 0.0f;
+    }
+    return false;
+  }
+  case GameMode::Dropshot:
+    return pos.z < -a.mutators.ball_radius * 1.75f;
+  case GameMode::TheVoid:
+    return false;
+  }
+  return false;
+}
+
+RS_HD void arena_push_event(Arena &a, ArenaEventKind kind, uint32_t car_idx,
+                            uint32_t other_idx, bool is_demo, Vec3A point,
+                            Vec3A vec) {
+  if (a.num_events >= static_cast<uint32_t>(k_max_events)) {
+    a.phys.error_flags |= k_error_events_overflow;
+    return;
+  }
+  a.events[a.num_events++] = {kind,
+                              static_cast<uint8_t>(car_idx),
+                              static_cast<uint8_t>(other_idx),
+                              is_demo,
+                              point,
+                              vec};
+}
+
+RS_HD void arena_count_events(Arena &a) {
+  ArenaEventCounters &c = a.counters;
+  for (uint32_t i = 0; i < a.num_events; ++i) {
+    const ArenaEvent &e = a.events[i];
+    switch (e.kind) {
+    case ArenaEventKind::BallHitWorld:
+      c.ball_hit_world += 1;
+      break;
+    case ArenaEventKind::CarHitBall:
+      c.cars[e.car_idx].hit_ball += 1;
+      break;
+    case ArenaEventKind::CarHitCar:
+      if (e.is_demo) {
+        c.cars[e.car_idx].demos_dealt += 1;
+        c.cars[e.other_idx].demos_received += 1;
+      } else {
+        c.cars[e.car_idx].bumps_dealt += 1;
+        c.cars[e.other_idx].bumps_received += 1;
+      }
+      break;
+    case ArenaEventKind::CarHitWorld:
+      c.cars[e.car_idx].hit_world += 1;
+      break;
+    case ArenaEventKind::CarPickupBoost:
+      c.cars[e.car_idx].boost_pickups += 1;
+      break;
+    case ArenaEventKind::CarLanded:
+      c.cars[e.car_idx].landed += 1;
+      break;
+    }
+  }
+}
+
+RS_HD void arena_update_tile_flags(Arena &a) {
+  for (int team = 0; team < 2; ++team) {
+    for (int i = 0; i < consts::dropshot::num_tiles_per_team; ++i) {
+      a.phys.tile_broken[team * consts::dropshot::num_tiles_per_team + i] =
+          a.tiles.states[team][i] == k_tile_broken ? 1 : 0;
+    }
+  }
+}
+
+RS_HDN void arena_on_car_car(Arena &a, uint32_t car_1, uint32_t car_2,
+                            const ManifoldPoint &point) {
+  using namespace consts;
+  for (int pass = 0; pass < 2; ++pass) {
+    bool is_swapped = pass == 1;
+    uint32_t attacker_idx = is_swapped ? car_2 : car_1;
+    uint32_t victim_idx = is_swapped ? car_1 : car_2;
+    Car &attacker = a.cars[attacker_idx];
+    Car &victim = a.cars[victim_idx];
+    const CarState &as = attacker.state;
+    const CarState &vs = victim.state;
+    bool attacker_demoed_by_victim =
+        as.cache.demo_tick == a.tick_count &&
+        as.cache.demoer_idx == static_cast<int32_t>(victim_idx);
+    int gate;
+    if (!(as.is_demoed || vs.is_demoed)) {
+      gate = 0;
+    } else if (vs.is_demoed || !attacker_demoed_by_victim) {
+      gate = 1;
+    } else {
+      gate = 2;
+    }
+    if (gate == 1) {
+      continue;
+    }
+    Vec3A delta_pos = vs.phys.pos - as.phys.pos;
+    if (as.phys.vel.dot(delta_pos) < 0.0f) {
+      continue;
+    }
+    Vec3A vel_dir = as.phys.vel.normalize_or_zero();
+    Vec3A dir_to_victim = delta_pos.normalize_or_zero();
+    float speed_towards = as.phys.vel.dot(dir_to_victim);
+    float other_away = vs.phys.vel.dot(vel_dir);
+    if (speed_towards <= other_away) {
+      continue;
+    }
+    bool bumper = bump::is_within_forward_cone(
+        as, attacker.info.config, vs, victim.info.config, false,
+        car::bump::yaw_limit_deg, car::bump::pitch_limit_deg);
+    bool is_demo;
+    switch (a.mutators.demo_mode) {
+    case DemoMode::OnContact:
+      is_demo = true;
+      break;
+    case DemoMode::Disabled:
+      is_demo = false;
+      break;
+    default:
+      is_demo = bump::should_demolish(as, attacker.info.config, vs,
+                                      victim.info.config, tick_time);
+      break;
+    }
+    if (is_demo && !a.mutators.enable_team_demos) {
+      is_demo = attacker.info.team != victim.info.team;
+    }
+    Vec3A contact_point =
+        (is_swapped ? point.pos_world_on_b : point.pos_world_on_a) * bt_to_uu;
+    if (is_demo) {
+      victim.state.is_demoed = true;
+      victim.state.demo_respawn_timer = a.mutators.respawn_delay;
+      victim.state.cache.demo_tick = a.tick_count;
+      victim.state.cache.demoer_idx = static_cast<int32_t>(attacker_idx);
+      arena_push_event(a, ArenaEventKind::CarHitCar, attacker_idx, victim_idx,
+                       true, contact_point, Vec3A::zero());
+      continue;
+    }
+    if (gate != 0) {
+      continue;
+    }
+    if (as.bump_cooldown_timer > 0.0f &&
+        (as.bump_cooldown_victim < 0 ||
+         as.bump_cooldown_victim == static_cast<int32_t>(victim_idx))) {
+      continue;
+    }
+    if (bumper) {
+      bool ground_hit = vs.cache.is_on_ground;
+      float attacker_speed = min_f32_c(as.phys.vel.length(), 2200.0f);
+      Vec3A impulse;
+      if (ground_hit) {
+        float base =
+            curves::bump_vel_amount_ground().get_output(attacker_speed);
+        float upward =
+            curves::bump_upward_vel_amount().get_output(attacker_speed);
+        Vec3A hit_up = vs.phys.rot_mat.z_axis;
+        impulse = (vel_dir * base) + (hit_up * upward);
+      } else {
+        impulse =
+            vel_dir * curves::bump_vel_amount_air().get_output(attacker_speed);
+      }
+      victim.vel_impulse_cache +=
+          impulse * a.mutators.bump_force_scale * uu_to_bt;
+    }
+    attacker.state.bump_cooldown_timer =
+        a.mutators.bump_cooldown_time + tick_time * 0.5f;
+    attacker.state.bump_cooldown_victim = static_cast<int32_t>(victim_idx);
+    if (bumper) {
+      arena_push_event(a, ArenaEventKind::CarHitCar, attacker_idx, victim_idx,
+                       false, contact_point, Vec3A::zero());
+    }
+  }
+}
+
+RS_HD void arena_update_world_contact_normal(Arena &a, const StepScratch &sc) {
+  for (uint32_t car_idx = 0; car_idx < a.num_cars; ++car_idx) {
+    Vec3A total = Vec3A::zero();
+    for (int g = 0; g < sc.num_groups; ++g) {
+      if (sc.groups[g].car_idx != car_idx) {
+        continue;
+      }
+      Vec3A sum = sc.groups[g].sum;
+      float len_sq = sum.length_squared();
+      if (len_sq >= 1e-8f) {
+        total += sum / sqrt_f32(len_sq);
+      }
+    }
+    float len_sq = total.length_squared();
+    if (len_sq >= 1e-8f) {
+      a.cars[car_idx].state.cache.has_world_contact_normal = true;
+      a.cars[car_idx].state.cache.world_contact_normal =
+          total / sqrt_f32(len_sq);
+    }
+  }
+}
+
+RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc) {
+  using namespace consts;
+  World w = arena_world(st, a);
+  a.num_events = 0;
+  for (uint32_t i = 0; i < a.phys.num_dyn_bodies; ++i) {
+    a.phys.dyn_bodies[i].clear_accum_vels();
+  }
+  if (!a.ball_only) {
+    for (uint32_t c = 0; c < a.num_cars; ++c) {
+      RigidBody &rb = w.dyn_body(a.cars[c].rigid_body_idx);
+      rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
+      quantize_body(rb);
+      a.cars[c].state.phys.vel = rb.lin_vel * bt_to_uu;
+      a.cars[c].state.phys.ang_vel = rb.ang_vel;
+    }
+  }
+  RigidBody &ball_rb = w.dyn_body(a.ball.rigid_body_idx);
+  ball_rb.limit_vels(a.mutators.ball_max_speed * uu_to_bt, ball::max_ang_speed);
+  quantize_body(ball_rb);
+  a.ball.state.phys.vel = ball_rb.lin_vel * bt_to_uu;
+  a.ball.state.phys.ang_vel = ball_rb.ang_vel;
+  if (!a.ball_only) {
+    for (uint32_t c = 0; c < a.num_cars; ++c) {
+      car_apply_flip_zdamp_prepass(a.cars[c], w);
+    }
+    for (uint32_t c = 0; c < a.num_cars; ++c) {
+      bool was_on_ground = a.cars[c].state.cache.is_on_ground;
+      car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators);
+      if (!was_on_ground && a.cars[c].state.cache.is_on_ground) {
+        for (int i = 0; i < 4; ++i) {
+          a.landed[c].has_contact[i] =
+              a.cars[c].state.cache.wheel_has_contact[i];
+          a.landed[c].wheels[i] = a.cars[c].state.cache.wheels_with_contact[i];
+        }
+        arena_push_event(a, ArenaEventKind::CarLanded, c, 0, false,
+                         Vec3A::zero(), Vec3A::zero());
+      }
+    }
+  }
+  ball_pre_tick_update(a.ball, w.dyn_body(a.ball.rigid_body_idx), st.mode);
+  sc.num_records = 0;
+  sc.num_ball_world = 0;
+  sc.num_groups = 0;
+  a.phys.ball_only = a.ball_only;
+  ContactTracker tracker{&w, &sc, a.ball_only};
+  dynamics_step(w, sc.solver, tick_time, tracker);
+  if (a.ball_only) {
+    for (int i = 0; i < sc.num_ball_world; ++i) {
+      BallWorldRecord r = sc.ball_world[i];
+      Vec3A contact_point = r.point * bt_to_uu;
+      ball_on_world_hit(a.ball, w.dyn_body(r.rb), st.mode, r.normal);
+      arena_push_event(a, ArenaEventKind::BallHitWorld, 0, 0, false,
+                       contact_point, r.normal);
+    }
+  } else {
+    for (int i = 0; i < sc.num_records; ++i) {
+      ContactRecord c = sc.records[i];
+      const RigidBody &rb_a = w.body(c.a);
+      const RigidBody &rb_b = w.body(c.b);
+      UserInfoType ua = rb_a.user_idx;
+      UserInfoType ub = rb_b.user_idx;
+      uint32_t pa = rb_a.user_pointer;
+      uint32_t pb = rb_b.user_pointer;
+      if (ua == UserInfoType::Car) {
+        if (ub == UserInfoType::Ball) {
+          RigidBody &brb = w.dyn_body(a.ball.rigid_body_idx);
+          Vec3A vel_before = brb.lin_vel;
+          ball_on_hit(a.ball, a.cars[pa], st.mode, a.mutators, a.tick_count,
+                      brb, st.world.sin_table);
+          Vec3A contact_point =
+              (c.is_swap ? c.point.pos_world_on_a : c.point.pos_world_on_b) *
+              bt_to_uu;
+          Vec3A extra_hit_vel = (brb.lin_vel - vel_before) * bt_to_uu;
+          arena_push_event(a, ArenaEventKind::CarHitBall, pa, 0, false,
+                           contact_point, extra_hit_vel);
+        } else if (ub == UserInfoType::Car) {
+          arena_on_car_car(a, pa, pb, c.point);
+        } else {
+          arena_push_event(a, ArenaEventKind::CarHitWorld, pa, 0, false,
+                           c.point.pos_world_on_b * bt_to_uu,
+                           c.point.normal_world_on_b);
+          a.cars[pa].state.cache.has_world_contact_normal = true;
+          a.cars[pa].state.cache.world_contact_normal =
+              c.point.normal_world_on_b;
+        }
+      } else if (ua == UserInfoType::Ball) {
+        if (ub == UserInfoType::DropshotTile) {
+          ball_on_dropshot_tile_collision(a.ball, a.tiles, pb, a.tick_count);
+        } else if (ub == UserInfoType::None) {
+          Vec3A contact_point = c.point.pos_world_on_b * bt_to_uu;
+          ball_on_world_hit(a.ball, w.dyn_body(c.a), st.mode,
+                            c.point.normal_world_on_b);
+          arena_push_event(a, ArenaEventKind::BallHitWorld, 0, 0, false,
+                           contact_point, c.point.normal_world_on_b);
+        }
+      }
+    }
+    arena_update_world_contact_normal(a, sc);
+  }
+  if (!a.ball_only) {
+    for (uint32_t c = 0; c < a.num_cars; ++c) {
+      car_post_tick_update(a.cars[c], w);
+      car_finish_physics_tick(a.cars[c], w.dyn_body(a.cars[c].rigid_body_idx));
+    }
+    if (a.mutators.boost_pads_enabled && st.has_pads) {
+      bool any =
+          pad_update_membership(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
+                                a.mutators.car_max_boost_amount);
+      if (any) {
+        for (uint32_t c = 0; c < a.num_cars; ++c) {
+          int32_t pad = pad_maybe_give_car_boost(st.pads, a.pads, sc.pads,
+                                                 a.cars[c].state, a.mutators,
+                                                 a.tick_count, c);
+          if (pad >= 0) {
+            arena_push_event(a, ArenaEventKind::CarPickupBoost, c,
+                             static_cast<uint32_t>(pad), false, Vec3A::zero(),
+                             Vec3A::zero());
+            pad_refresh_winner(a.pads, sc.pads, static_cast<uint32_t>(pad),
+                               a.cars, a.num_cars,
+                               a.mutators.car_max_boost_amount);
+          }
+        }
+      }
+    }
+  }
+  ball_finish_physics_tick(a.ball, w.dyn_body(a.ball.rigid_body_idx));
+  if (st.mode == GameMode::Dropshot &&
+      a.ball.state.ds_info.has_last_damage_tick &&
+      a.ball.state.ds_info.last_damage_tick == a.tick_count) {
+    arena_update_tile_flags(a);
+  }
+  a.tick_count += 1;
+  arena_count_events(a);
+  if (!a.counters.goal_scored && arena_is_ball_scored(st, a)) {
+    a.counters.goal_scored = true;
+    a.counters.goal_tick = a.tick_count;
+  }
+}
+
+}

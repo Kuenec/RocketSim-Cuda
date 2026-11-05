@@ -1,0 +1,7 @@
+/build/
+/target/
+/harness/target/
+/collision_meshes
+*.cmf
+/AGENTS.md
+compile_commands.json
