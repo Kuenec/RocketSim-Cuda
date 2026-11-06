@@ -554,6 +554,8 @@ RS_HDN void grid_ray_test(const World &w, const Vec3A *ray_from,
   }
   uint32_t seen[k_max_handles];
   uint32_t num_seen = 0;
+  uint32_t bodies[k_max_handles];
+  uint32_t num_bodies = 0;
   for (int c = 0; c < num_cells; ++c) {
     uint32_t cell = cell_idxs[c];
     uint32_t begin = s.cell_static_offsets[cell];
@@ -584,11 +586,13 @@ RS_HDN void grid_ray_test(const World &w, const Vec3A *ray_from,
       }
       const BroadphaseProxy &p = w.proxy(handle);
       if (ray_aabb.intersects(p.aabb) && result.needs_collision(p)) {
-        uint32_t obj = p.client_obj_idx;
-        quad_ray_test_body(w, ray_from, ray_to, w.body(obj),
-                           static_cast<int>(obj), result);
+        bodies[num_bodies++] = p.client_obj_idx;
       }
     }
+  }
+  for (uint32_t k = 0; k < num_bodies; ++k) {
+    quad_ray_test_body(w, ray_from, ray_to, w.body(bodies[k]),
+                       static_cast<int>(bodies[k]), result);
   }
 }
 
