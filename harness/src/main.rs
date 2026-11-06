@@ -244,7 +244,7 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
     ];
     out.push(batch);
 
-    for (arenas, seed) in [(512usize, 6u64), (1024, 5), (2048, 3), (4096, 4)] {
+    for (arenas, seed) in [(512usize, 6u64), (1024, 5), (2048, 3), (4096, 4), (8192, 7)] {
         let mut wide = base(
             format!("soccar_1v1_batch{arenas}"),
             GameMode::Soccar,

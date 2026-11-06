@@ -18,6 +18,7 @@ constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_device_stack_bytes = 16384;
 constexpr uint32_t k_max_lanes_per_arena = 32;
 constexpr uint32_t k_timed_launches = 64;
+constexpr uint32_t k_cost_buckets = 64;
 
 uint32_t pow2_lanes(uint32_t wanted) {
   uint32_t lanes = 1;
@@ -77,11 +78,68 @@ struct DeviceMesh {
   DeviceArray<BvhWideLeaf> leaves;
 };
 
+__device__ uint32_t cost_bucket(uint32_t cycles, uint64_t top) {
+  return k_cost_buckets - 1 -
+         static_cast<uint32_t>(static_cast<uint64_t>(cycles) * k_cost_buckets /
+                               top);
+}
+
+__global__ void order_blocks_kernel(const uint32_t *block_cycles,
+                                    uint32_t blocks, uint32_t *block_order) {
+  __shared__ uint32_t cursor[k_cost_buckets];
+  uint32_t lane = threadIdx.x;
+  uint32_t most = 0;
+  for (uint32_t b = lane; b < blocks; b += 32) {
+    most = max(most, block_cycles[b]);
+  }
+  most = __reduce_max_sync(0xffffffffu, most);
+  uint64_t top = static_cast<uint64_t>(most) + 1;
+  for (uint32_t k = lane; k < k_cost_buckets; k += 32) {
+    cursor[k] = 0;
+  }
+  __syncwarp();
+  for (uint32_t b = lane; b < blocks; b += 32) {
+    atomicAdd(&cursor[cost_bucket(block_cycles[b], top)], 1u);
+  }
+  __syncwarp();
+  if (lane == 0) {
+    uint32_t sum = 0;
+    for (uint32_t k = 0; k < k_cost_buckets; ++k) {
+      uint32_t count = cursor[k];
+      cursor[k] = sum;
+      sum += count;
+    }
+  }
+  __syncwarp();
+  for (uint32_t base = 0; base < blocks; base += 32) {
+    uint32_t b = base + lane;
+    bool valid = b < blocks;
+    uint32_t bucket =
+        valid ? cost_bucket(block_cycles[b], top) : k_cost_buckets;
+    uint32_t peers = __match_any_sync(0xffffffffu, bucket);
+    uint32_t first = __ffs(peers) - 1;
+    uint32_t start = 0;
+    if (valid && lane == first) {
+      start = atomicAdd(&cursor[bucket], static_cast<uint32_t>(__popc(peers)));
+    }
+    start = __shfl_sync(0xffffffffu, start, first);
+    if (valid) {
+      block_order[start + __popc(peers & ((1u << lane) - 1))] = b;
+    }
+    __syncwarp();
+  }
+}
+
 __global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
                             StepScratch *scratch, TeamSatScratch *team_sat,
                             uint32_t num_arenas, uint32_t lanes_per_arena,
-                            uint32_t ticks) {
-  uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
+                            uint32_t ticks, const uint32_t *block_order,
+                            uint32_t *block_cycles) {
+  uint32_t block = block_order ? block_order[blockIdx.x] : blockIdx.x;
+  if (block_order && threadIdx.x == 0) {
+    block_cycles[block] = static_cast<uint32_t>(clock());
+  }
+  uint32_t thread = block * blockDim.x + threadIdx.x;
   uint32_t i = thread / lanes_per_arena;
   uint32_t live = __ballot_sync(__activemask(), i < num_arenas);
   if (i >= num_arenas) {
@@ -94,7 +152,7 @@ __global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
                   team_lane,
                   static_cast<uint32_t>(__popc(live)),
                   scratch + (thread - team_lane) / lanes_per_arena,
-                  team_sat + blockIdx.x * ((blockDim.x + 31) / 32) +
+                  team_sat + block * ((blockDim.x + 31) / 32) +
                       threadIdx.x / 32};
   Arena &a = arenas[i];
   if (lanes.leader()) {
@@ -102,6 +160,10 @@ __global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
   }
   for (uint32_t t = 0; t < ticks; ++t) {
     arena_step_tick(*st, a, scratch[i], lanes);
+  }
+  if (block_order && threadIdx.x == 0) {
+    uint32_t done = block_order[blockIdx.x];
+    block_cycles[done] = static_cast<uint32_t>(clock()) - block_cycles[done];
   }
 }
 
@@ -214,6 +276,10 @@ struct CudaBatch::Impl {
   uint32_t resident_threads = 0;
   uint32_t sm_count = 0;
   size_t team_sat_capacity = 0;
+  DeviceArray<uint32_t> block_order;
+  DeviceArray<uint32_t> block_cycles;
+  size_t block_capacity = 0;
+  uint32_t resident_blocks = 0;
   cudaEvent_t launch_events[2 * k_timed_launches] = {};
   uint32_t timed_launches = 0;
 
@@ -235,6 +301,16 @@ struct CudaBatch::Impl {
     if (warps > team_sat_capacity) {
       team_sat.allocate(warps);
       team_sat_capacity = warps;
+    }
+    if (blocks > block_capacity) {
+      block_order.allocate(blocks);
+      block_cycles.allocate(blocks);
+      block_capacity = blocks;
+    }
+    if (blocks != 0) {
+      check(cudaMemsetAsync(block_cycles.get(), 0, sizeof(uint32_t) * blocks,
+                            stream),
+            "block cycles reset");
     }
   }
 
@@ -306,6 +382,7 @@ struct CudaBatch::Impl {
     sm_count = static_cast<uint32_t>(device_sms);
     resident_threads =
         static_cast<uint32_t>(blocks_per_sm) * k_max_block_size * sm_count;
+    resident_blocks = static_cast<uint32_t>(blocks_per_sm) * sm_count;
     car_lanes = pow2_lanes(cars);
     for (cudaEvent_t &e : launch_events) {
       check(cudaEventCreate(&e), "cudaEventCreate");
@@ -485,6 +562,12 @@ void CudaBatch::step(uint32_t ticks) {
   if (im.num_arenas == 0) {
     return;
   }
+  bool ordered = im.blocks > im.resident_blocks;
+  if (ordered) {
+    order_blocks_kernel<<<1, 32, 0, im.stream>>>(
+        im.block_cycles.get(), im.blocks, im.block_order.get());
+    check(cudaGetLastError(), "order kernel launch");
+  }
   bool timed = im.timed_launches < k_timed_launches;
   if (timed) {
     check(cudaEventRecord(im.launch_events[2 * im.timed_launches], im.stream),
@@ -492,7 +575,8 @@ void CudaBatch::step(uint32_t ticks) {
   }
   step_kernel<<<im.blocks, im.block_size, 0, im.stream>>>(
       im.device_view.get(), im.arenas.get(), im.scratch.get(),
-      im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks);
+      im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks,
+      ordered ? im.block_order.get() : nullptr, im.block_cycles.get());
   check(cudaGetLastError(), "step kernel launch");
   if (timed) {
     check(
