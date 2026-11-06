@@ -20,7 +20,7 @@ Results are only guaranteed against a reference built on a machine with the same
 - Exact upstream per-tick event lists (goals via `is_ball_scored`, ball touches, bumps, demos, boost pickups, landings, world hits) plus per-step event counters.
 - Synchronous and asynchronous stepping of N ticks; the CPU backend steps arenas on a thread pool (`BatchConfig::cpu_threads`, all hardware threads by default), which cannot change results because arenas are independent.
 - A device-resident CUDA backend: every tick, reset, state change, mutator change, and copy runs as a kernel on the GPU, and arena state never travels to the host unless you ask for it. Controls can be read from device memory, kickoff resets can be selected by a device-side mask, and the full observable state can be exported straight into device buffers, so a GPU policy can drive a batch with no host transfers.
-- A hybrid backend for the highest total throughput on large batches: the GPU steps the first arenas while the CPU thread pool steps the last `BatchConfig::hybrid_cpu_arenas` arenas at the same time. It has the same API as the CUDA backend, including device-memory controls, masks, and exports; only the CPU arenas' rows cross the PCIe bus, through pinned staging buffers.
+- A hybrid backend for the highest total throughput: the GPU steps the first arenas while the CPU thread pool steps the rest at the same time, and the split moves at runtime so both finish together. It has the same API as the CUDA backend, including device-memory controls, masks, and exports; only the CPU arenas' rows cross the PCIe bus, through pinned staging buffers.
 
 ## Build
 
@@ -87,15 +87,13 @@ cudaStream_t stream = static_cast<cudaStream_t>(batch.cuda_stream());
 
 All of these calls are queued on the batch's stream in order. Device inputs (actions, masks, seeds) must be fully written before the call that reads them, so finish or order any copy or kernel that produces them against the batch's stream first; likewise, synchronize with that stream (or call `batch.sync()`) before another stream reads the exported buffers.
 
-The hybrid backend takes the same calls. Set the number of arenas the CPU steps, then construct the batch with `Backend::Hybrid`:
+The hybrid backend takes the same calls. Construct the batch with `Backend::Hybrid`:
 
 ```cpp
-config.hybrid_cpu_arenas =
-    static_cast<uint32_t>(config.rng_seeds.size() * 45 / 100);
 ArenaBatch batch(Backend::Hybrid, meshes, config);
 ```
 
-Arenas `0` to `num_arenas - hybrid_cpu_arenas - 1` run on the GPU and the rest on the CPU thread pool (`BatchConfig::cpu_threads`). `step_async` launches the GPU arenas, steps the CPU arenas on the calling thread and the pool, and returns while the GPU may still be running. Calls that move CPU arenas' rows between host and device memory (device controls, device masks and seeds, device exports) wait for the batch's stream before they return.
+The first arenas run on the GPU and the rest on the CPU thread pool (`BatchConfig::cpu_threads`). `BatchConfig::hybrid_cpu_arenas` sets how many arenas start on the CPU (0 starts with half). After every 16 steps the batch compares the GPU kernel time with the CPU pool time and moves arenas at the boundary between the two halfway toward the split where both take equally long, which can put a whole small batch on the CPU or a whole large one on the GPU. Moving an arena copies its full state, so results stay bit-identical; arena indices never change. `step_async` launches the GPU arenas, steps the CPU arenas on the calling thread and the pool, and returns while the GPU may still be running. Calls that move CPU arenas' rows between host and device memory (device controls, device masks and seeds, device exports) wait for the batch's stream before they return.
 
 ## Verification
 
@@ -103,7 +101,7 @@ Arenas `0` to `num_arenas - hybrid_cpu_arenas - 1` run on the GPU and the rest o
 tools/run_gates.sh
 ```
 
-The script builds the library and the Rust harness, runs the quick libm check, and runs every gate scenario on every backend against the upstream crate. It prints one PASS or FAIL line per scenario and backend with event coverage, and ends with `ALL GATES PASS` or `GATES FAIL`. Arguments are passed to the harness, for example `--backend cuda`, `--backend hybrid`, `--filter hoops`, or `--quick`; by default every scenario runs on the CPU, CUDA, and hybrid backends, and the hybrid runs put the last half of each batch (rounded up) on the CPU. Scenarios cover every mode, 0, 1, 2, 3, 4, 6, and 8 cars, all bodies, all demo modes, 20,000-tick single-arena runs, batches of 128 to 4,096 arenas, seeded random controls, controls from the `rocketsim_test` recordings, kickoffs, scripted goals and head-on collisions, mid-run state sets, runtime mutator changes, pad state restores, clones, snapshots, and cross-batch and cross-backend copies. Scenarios for a mode whose meshes are missing report BLOCKED.
+The script builds the library and the Rust harness, runs the quick libm check, and runs every gate scenario on every backend against the upstream crate. It prints one PASS or FAIL line per scenario and backend with event coverage, and ends with `ALL GATES PASS` or `GATES FAIL`. Arguments are passed to the harness, for example `--backend cuda`, `--backend hybrid`, `--filter hoops`, or `--quick`; by default every scenario runs on the CPU, CUDA, and hybrid backends, and the hybrid runs start with the last half of each batch (rounded up) on the CPU and rebalance as they run, so they also check arena moves between the GPU and the CPU. Scenarios cover every mode, 0, 1, 2, 3, 4, 6, and 8 cars, all bodies, all demo modes, 20,000-tick single-arena runs, batches of 128 to 4,096 arenas, seeded random controls, controls from the `rocketsim_test` recordings, kickoffs, scripted goals and head-on collisions, mid-run state sets, runtime mutator changes, pad state restores, clones, snapshots, and cross-batch and cross-backend copies. Scenarios for a mode whose meshes are missing report BLOCKED.
 
 ## Benchmarks
 
@@ -111,7 +109,7 @@ The script builds the library and the Rust harness, runs the quick libm check, a
 build/harness-target/release/rsv3_harness bench --targets upstream,cpu,cpu-mt,cuda,hybrid --arenas 100,1000,10000,20000 --hybrid-cpu-share 0.45
 ```
 
-Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after a 1,200-tick warm-up over 5 runs of 240 ticks (arena-ticks per second, median with min to max). Upstream and the single-thread CPU backend run on one core of a Ryzen 7 7700X (8 cores, 16 threads); the all-cores CPU column uses 16 threads and varies by about 10 percent between runs with normal desktop load. The CUDA backend runs on an RTX 5070 in the device-resident loop: controls are read from device memory, steps are asynchronous, and the ball, car, arena-info, and event-count state of every arena is exported into device buffers after every 8-tick action, with one host synchronization per measured run. The hybrid column runs the same loop with 45 percent of the arenas on the CPU thread pool.
+Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after a 1,200-tick warm-up over 5 runs of 240 ticks (arena-ticks per second, median with min to max). Upstream and the single-thread CPU backend run on one core of a Ryzen 7 7700X (8 cores, 16 threads); the all-cores CPU column uses 16 threads and varies by about 10 percent between runs with normal desktop load. The CUDA backend runs on an RTX 5070 in the device-resident loop: controls are read from device memory, steps are asynchronous, and the ball, car, arena-info, and event-count state of every arena is exported into device buffers after every 8-tick action, with one host synchronization per measured run. The hybrid column runs the same loop starting with 45 percent of the arenas on the CPU thread pool.
 
 | Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU, 1 thread | C++ CPU, all cores | CUDA | Hybrid |
 | --- | --- | --- | --- | --- | --- |

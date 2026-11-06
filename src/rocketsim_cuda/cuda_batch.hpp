@@ -40,6 +40,11 @@ private:
   size_t capacity_ = 0;
 };
 
+struct StepTiming {
+  float total_ms;
+  uint32_t launches;
+};
+
 class CudaBatch {
 public:
   CudaBatch(const HostStatic &st, uint32_t num_arenas, uint32_t num_cars);
@@ -61,6 +66,8 @@ public:
                     uint32_t count, uint32_t cars_per_arena,
                     uint32_t pads_per_arena, rocketsim_cuda::MemorySpace space);
   void step(uint32_t ticks);
+  void set_active(uint32_t count);
+  StepTiming take_step_timing();
   void transfer(void *dst, const void *src, size_t bytes);
   void sync();
   void *stream() const;

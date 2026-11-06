@@ -1,9 +1,12 @@
 #include "rocketsim_cuda/rocketsim_cuda.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -36,7 +39,8 @@ uint32_t device_arena_count(Backend backend, uint32_t num_arenas,
   case Backend::Cuda:
     return num_arenas;
   case Backend::Hybrid:
-    return num_arenas - hybrid_cpu_arenas;
+    return num_arenas -
+           (hybrid_cpu_arenas != 0 ? hybrid_cpu_arenas : num_arenas / 2);
   }
   throw std::invalid_argument("unknown backend");
 }
@@ -140,14 +144,15 @@ struct ExportJob {
 using CpuJob = std::variant<StepJob, ExportJob>;
 
 constexpr uint32_t k_parallel_export_rows = 256;
+constexpr uint32_t k_balance_window = 16;
+constexpr uint32_t k_balance_band_divisor = 256;
 
 class CpuPool {
 public:
-  CpuPool(const rsc::ArenaStatic &view, std::vector<rsc::Arena> &arenas,
-          uint32_t threads)
+  CpuPool(const rsc::ArenaStatic &view, std::deque<rsc::Arena> &arenas,
+          uint32_t threads, uint32_t max_arenas)
       : view_(view), arenas_(arenas) {
-    uint32_t n = static_cast<uint32_t>(arenas.size());
-    uint32_t count = std::max(1u, std::min(threads, n));
+    uint32_t count = std::max(1u, std::min(threads, max_arenas));
     for (uint32_t w = 0; w < count; ++w) {
       scratch_.push_back(std::make_unique<rsc::StepScratch>());
     }
@@ -241,7 +246,7 @@ private:
   }
 
   const rsc::ArenaStatic &view_;
-  std::vector<rsc::Arena> &arenas_;
+  std::deque<rsc::Arena> &arenas_;
   std::vector<std::unique_ptr<rsc::StepScratch>> scratch_;
   std::vector<std::thread> workers_;
   std::mutex mutex_;
@@ -264,8 +269,13 @@ struct ArenaBatch::Impl {
   uint32_t num_pads;
   std::vector<CarInfo> car_infos;
   std::vector<rsc::MutatorConfig> mutators;
-  std::vector<rsc::Arena> host;
+  std::deque<rsc::Arena> host;
   std::unique_ptr<CpuPool> cpu_pool;
+  bool balance = false;
+  uint32_t balance_cpu_steps = 0;
+  double balance_cpu_ms = 0.0;
+  uint32_t balance_gpu_launches = 0;
+  double balance_gpu_ms = 0.0;
   std::vector<CarControls> staged_controls;
   std::vector<uint8_t> staged_mask;
   bool any_staged = false;
@@ -432,13 +442,21 @@ struct ArenaBatch::Impl {
 
   void launch_step(uint32_t ticks) {
 #ifdef RSC_HAS_CUDA
+    rebalance_if_due();
     if (num_device_arenas > 0) {
       flush_controls();
       cuda->step(ticks);
     }
 #endif
-    if (cpu_pool) {
+    if (cpu_pool && !host.empty()) {
+      auto start = std::chrono::steady_clock::now();
       cpu_pool->run(StepJob{ticks});
+      if (balance) {
+        balance_cpu_ms += std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+        ++balance_cpu_steps;
+      }
     }
   }
 
@@ -446,9 +464,68 @@ struct ArenaBatch::Impl {
 #ifdef RSC_HAS_CUDA
     if (cuda) {
       cuda->sync();
+      if (balance) {
+        rsc::StepTiming t = cuda->take_step_timing();
+        balance_gpu_ms += t.total_ms;
+        balance_gpu_launches += t.launches;
+      }
     }
 #endif
   }
+
+#ifdef RSC_HAS_CUDA
+  void rebalance_if_due() {
+    if (!balance || balance_cpu_steps < k_balance_window ||
+        balance_gpu_launches == 0) {
+      return;
+    }
+    double device = num_device_arenas;
+    double hosted = num_arenas - num_device_arenas;
+    double gpu_per_arena = balance_gpu_ms / balance_gpu_launches / device;
+    double cpu_per_arena = balance_cpu_ms / balance_cpu_steps / hosted;
+    double total = num_arenas;
+    double target = total * cpu_per_arena / (cpu_per_arena + gpu_per_arena);
+    balance_cpu_steps = 0;
+    balance_cpu_ms = 0.0;
+    balance_gpu_launches = 0;
+    balance_gpu_ms = 0.0;
+    if (target < 0.5) {
+      move_boundary(0);
+      return;
+    }
+    if (target > total - 0.5) {
+      move_boundary(num_arenas);
+      return;
+    }
+    double band = std::max(1.0, total / k_balance_band_divisor);
+    if (std::abs(target - device) < band) {
+      return;
+    }
+    double next = device + (target - device) / 2.0;
+    move_boundary(static_cast<uint32_t>(std::clamp(next, 0.0, total) + 0.5));
+  }
+
+  void move_boundary(uint32_t device_count) {
+    flush_controls();
+    cuda->sync();
+    while (num_device_arenas > device_count) {
+      rsc::Arena &a = host.emplace_front();
+      cuda->download(num_device_arenas - 1, a);
+      --num_device_arenas;
+    }
+    uint32_t uploaded = 0;
+    for (uint32_t arena = num_device_arenas; arena < device_count; ++arena) {
+      cuda->upload(arena, 1, &host[uploaded++]);
+    }
+    if (uploaded != 0) {
+      cuda->sync();
+      host.erase(host.begin(), host.begin() + uploaded);
+      num_device_arenas = device_count;
+    }
+    cuda->set_active(num_device_arenas);
+    cuda->take_step_timing();
+  }
+#endif
 
   rsc::Arena download(uint32_t arena) {
     check_arena(arena);
@@ -522,13 +599,16 @@ ArenaBatch::ArenaBatch(Backend backend, std::shared_ptr<const MeshSet> meshes,
   }
   rsc::MutatorConfig mutators = to_internal(config.mutators);
   im.mutators.assign(im.num_arenas, mutators);
-  size_t num_slots = static_cast<size_t>(im.num_device_arenas) * im.num_cars;
+  uint32_t device_capacity =
+      backend == Backend::Hybrid ? im.num_arenas : im.num_device_arenas;
+  size_t num_slots = static_cast<size_t>(device_capacity) * im.num_cars;
   im.staged_controls.resize(num_slots);
   im.staged_mask.assign(num_slots, 0);
   if (backend != Backend::Cpu) {
 #ifdef RSC_HAS_CUDA
-    im.cuda = std::make_unique<rsc::CudaBatch>(*im.st, im.num_device_arenas,
-                                               im.num_cars);
+    im.cuda =
+        std::make_unique<rsc::CudaBatch>(*im.st, device_capacity, im.num_cars);
+    im.cuda->set_active(im.num_device_arenas);
     constexpr uint32_t chunk = 64;
     std::vector<rsc::Arena> staging(chunk);
     for (uint32_t first = 0; first < im.num_device_arenas; first += chunk) {
@@ -550,12 +630,16 @@ ArenaBatch::ArenaBatch(Backend backend, std::shared_ptr<const MeshSet> meshes,
                       config.rng_seeds[im.num_device_arenas + i], cars,
                       im.host[i]);
   }
-  if (!im.host.empty()) {
+  if (!im.host.empty() || backend == Backend::Hybrid) {
     uint32_t threads = config.cpu_threads != 0
                            ? config.cpu_threads
                            : std::max(1u, std::thread::hardware_concurrency());
-    im.cpu_pool = std::make_unique<CpuPool>(view, im.host, threads);
+    uint32_t max_host = backend == Backend::Hybrid
+                            ? im.num_arenas
+                            : static_cast<uint32_t>(im.host.size());
+    im.cpu_pool = std::make_unique<CpuPool>(view, im.host, threads, max_host);
   }
+  im.balance = backend == Backend::Hybrid && im.num_arenas >= 2;
 }
 
 ArenaBatch::~ArenaBatch() = default;

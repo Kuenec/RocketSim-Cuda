@@ -17,6 +17,7 @@ constexpr uint32_t k_max_block_size = 32;
 constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_device_stack_bytes = 16384;
 constexpr uint32_t k_max_lanes_per_arena = 32;
+constexpr uint32_t k_timed_launches = 64;
 
 uint32_t pow2_lanes(uint32_t wanted) {
   uint32_t lanes = 1;
@@ -209,6 +210,33 @@ struct CudaBatch::Impl {
   cudaStream_t stream = nullptr;
   uint32_t block_size = 1;
   uint32_t blocks = 0;
+  uint32_t car_lanes = 1;
+  uint32_t resident_threads = 0;
+  uint32_t sm_count = 0;
+  size_t team_sat_capacity = 0;
+  cudaEvent_t launch_events[2 * k_timed_launches] = {};
+  uint32_t timed_launches = 0;
+
+  void configure(uint32_t active) {
+    num_arenas = active;
+    lanes_per_arena = k_max_lanes_per_arena;
+    while (lanes_per_arena > car_lanes &&
+           active * lanes_per_arena > resident_threads) {
+      lanes_per_arena /= 2;
+    }
+    uint32_t threads = active * lanes_per_arena;
+    uint32_t per_block = threads / (k_target_blocks_per_sm * sm_count);
+    block_size = lanes_per_arena;
+    while (block_size * 2 <= per_block && block_size < k_max_block_size) {
+      block_size *= 2;
+    }
+    blocks = (threads + block_size - 1) / block_size;
+    size_t warps = static_cast<size_t>(blocks) * ((block_size + 31) / 32);
+    if (warps > team_sat_capacity) {
+      team_sat.allocate(warps);
+      team_sat_capacity = warps;
+    }
+  }
 
   Impl(const HostStatic &st, uint32_t n, uint32_t cars)
       : num_arenas(n), lanes_per_arena(1) {
@@ -266,8 +294,8 @@ struct CudaBatch::Impl {
     scratch.allocate(n);
     int device = 0;
     check(cudaGetDevice(&device), "cudaGetDevice");
-    int sm_count = 0;
-    check(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+    int device_sms = 0;
+    check(cudaDeviceGetAttribute(&device_sms, cudaDevAttrMultiProcessorCount,
                                  device),
           "cudaDeviceGetAttribute");
     int blocks_per_sm = 0;
@@ -275,30 +303,25 @@ struct CudaBatch::Impl {
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &blocks_per_sm, step_kernel, static_cast<int>(k_max_block_size), 0),
         "cudaOccupancyMaxActiveBlocksPerMultiprocessor");
-    uint32_t resident_threads = static_cast<uint32_t>(blocks_per_sm) *
-                                k_max_block_size *
-                                static_cast<uint32_t>(sm_count);
-    uint32_t car_lanes = pow2_lanes(cars);
-    lanes_per_arena = k_max_lanes_per_arena;
-    while (lanes_per_arena > car_lanes &&
-           n * lanes_per_arena > resident_threads) {
-      lanes_per_arena /= 2;
+    sm_count = static_cast<uint32_t>(device_sms);
+    resident_threads =
+        static_cast<uint32_t>(blocks_per_sm) * k_max_block_size * sm_count;
+    car_lanes = pow2_lanes(cars);
+    for (cudaEvent_t &e : launch_events) {
+      check(cudaEventCreate(&e), "cudaEventCreate");
     }
-    uint32_t threads = n * lanes_per_arena;
-    uint32_t per_block =
-        threads / (k_target_blocks_per_sm * static_cast<uint32_t>(sm_count));
-    block_size = lanes_per_arena;
-    while (block_size * 2 <= per_block && block_size < k_max_block_size) {
-      block_size *= 2;
-    }
-    blocks = (threads + block_size - 1) / block_size;
-    team_sat.allocate(blocks * ((block_size + 31) / 32));
+    configure(n);
   }
 
   ~Impl() {
     if (stream) {
       cudaStreamSynchronize(stream);
       cudaStreamDestroy(stream);
+    }
+    for (cudaEvent_t e : launch_events) {
+      if (e) {
+        cudaEventDestroy(e);
+      }
     }
   }
 };
@@ -458,13 +481,41 @@ void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
 }
 
 void CudaBatch::step(uint32_t ticks) {
-  if (impl_->num_arenas == 0) {
+  Impl &im = *impl_;
+  if (im.num_arenas == 0) {
     return;
   }
-  step_kernel<<<impl_->blocks, impl_->block_size, 0, impl_->stream>>>(
-      impl_->device_view.get(), impl_->arenas.get(), impl_->scratch.get(),
-      impl_->team_sat.get(), impl_->num_arenas, impl_->lanes_per_arena, ticks);
+  bool timed = im.timed_launches < k_timed_launches;
+  if (timed) {
+    check(cudaEventRecord(im.launch_events[2 * im.timed_launches], im.stream),
+          "launch start event");
+  }
+  step_kernel<<<im.blocks, im.block_size, 0, im.stream>>>(
+      im.device_view.get(), im.arenas.get(), im.scratch.get(),
+      im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks);
   check(cudaGetLastError(), "step kernel launch");
+  if (timed) {
+    check(
+        cudaEventRecord(im.launch_events[2 * im.timed_launches + 1], im.stream),
+        "launch stop event");
+    ++im.timed_launches;
+  }
+}
+
+void CudaBatch::set_active(uint32_t count) { impl_->configure(count); }
+
+StepTiming CudaBatch::take_step_timing() {
+  Impl &im = *impl_;
+  StepTiming out{0.0f, im.timed_launches};
+  for (uint32_t i = 0; i < im.timed_launches; ++i) {
+    float ms = 0.0f;
+    check(cudaEventElapsedTime(&ms, im.launch_events[2 * i],
+                               im.launch_events[2 * i + 1]),
+          "cudaEventElapsedTime");
+    out.total_ms += ms;
+  }
+  im.timed_launches = 0;
+  return out;
 }
 
 void CudaBatch::transfer(void *dst, const void *src, size_t bytes) {
