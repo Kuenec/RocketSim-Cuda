@@ -138,6 +138,9 @@ struct SingleLane {
   static constexpr uint32_t size = 1;
 
   RS_HDI static constexpr bool leader() { return true; }
+  RS_HDI static constexpr uint32_t group_ballot(bool pred) {
+    return pred ? 1u : 0u;
+  }
   RS_HDI static void barrier() {}
 };
 
@@ -631,18 +634,8 @@ RS_HD bool arena_rays_precomputable(const ArenaStatic &st, Arena &a) {
   return true;
 }
 
-RS_HD bool arena_rays_hit_static_only(const ArenaStatic &st, Arena &a,
-                                      const StepScratch &sc) {
-  World w = arena_world(st, a);
-  for (uint32_t c = 0; c < a.num_cars; ++c) {
-    for (int i = 0; i < k_num_wheels; ++i) {
-      const VehicleHit &hit = sc.rays[c][i];
-      if (hit.valid && hit.body_idx >= w.num_static()) {
-        return false;
-      }
-    }
-  }
-  return true;
+RS_HD bool ray_hit_dynamic(const World &w, const VehicleHit &hit) {
+  return hit.valid && hit.body_idx >= w.num_static();
 }
 
 RS_HD void arena_apply_wheel_impulses(const StepScratch &sc, RigidBody &chassis,
@@ -734,23 +727,32 @@ RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
   }
   lanes.barrier();
   World w = arena_world(st, a);
+  bool dynamic_hit = false;
   if (sc.car_plan != CarPhasePlan::Sequential) {
     if (lanes.size >= k_num_wheels * a.num_cars) {
       for (uint32_t item = lanes.lane; item < k_num_wheels * a.num_cars;
            item += lanes.size) {
         uint32_t c = item / k_num_wheels;
         int wheel = static_cast<int>(item % k_num_wheels);
-        a.cars[c].vehicle.cast_wheel_ray(w, wheel, sc.rays[c][wheel]);
+        VehicleHit hit;
+        a.cars[c].vehicle.cast_wheel_ray(w, wheel, hit);
+        sc.rays[c][wheel] = hit;
+        dynamic_hit = dynamic_hit || ray_hit_dynamic(w, hit);
       }
     } else {
       for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
-        a.cars[c].vehicle.cast_wheel_rays(w, sc.rays[c]);
+        VehicleHit hits[k_num_wheels];
+        a.cars[c].vehicle.cast_wheel_rays(w, hits);
+        for (int i = 0; i < k_num_wheels; ++i) {
+          sc.rays[c][i] = hits[i];
+          dynamic_hit = dynamic_hit || ray_hit_dynamic(w, hits[i]);
+        }
       }
     }
   }
-  lanes.barrier();
+  uint32_t dynamic_hits = lanes.group_ballot(dynamic_hit);
   if (lanes.leader() && sc.car_plan == CarPhasePlan::Precast &&
-      arena_rays_hit_static_only(st, a, sc)) {
+      dynamic_hits == 0) {
     sc.car_plan = CarPhasePlan::Parallel;
   }
   lanes.barrier();
