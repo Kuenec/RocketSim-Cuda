@@ -9,6 +9,7 @@
 namespace rsc {
 
 inline constexpr int k_max_pads = 48;
+static_assert(k_max_pads <= 64);
 
 struct BoostPadConfig {
   Vec3A pos;
@@ -29,6 +30,8 @@ struct PadState {
   uint32_t num_touching;
   uint8_t touching[k_max_cars];
 };
+
+RS_HDI uint64_t pad_bit(uint32_t pad_idx) { return uint64_t{1} << pad_idx; }
 
 RS_HDI float pad_cyl_radius(bool big) {
   return big ? consts::boost_pads::cyl_rad_big
@@ -135,6 +138,7 @@ struct PadMembershipProcessor {
   const PadLayoutView *layout;
   PadState *pads;
   PadUpdateScratch *sc;
+  uint64_t *touched_pads;
   uint32_t car_idx;
   Vec3A car_pos;
 
@@ -148,6 +152,7 @@ struct PadMembershipProcessor {
       if (!pad_contains(p, car_idx)) {
         p.touching[p.num_touching++] = static_cast<uint8_t>(car_idx);
       }
+      *touched_pads |= pad_bit(pad_idx);
       sc->touching_pad_by_car[car_idx] = static_cast<int32_t>(pad_idx);
     }
   }
@@ -192,9 +197,18 @@ RS_HD void pad_recheck_touching(const PadLayoutView &layout, PadState *pads,
   p.num_touching = kept;
 }
 
+RS_HD void pad_prune_touched(const PadState *pads, uint64_t &touched_pads) {
+  for (uint64_t m = touched_pads; m != 0; m &= m - 1) {
+    uint32_t pad_idx = lowest_set_bit(m);
+    if (pads[pad_idx].num_touching == 0) {
+      touched_pads &= ~pad_bit(pad_idx);
+    }
+  }
+}
+
 RS_HD void pad_enter_touching(const PadLayoutView &layout, PadState *pads,
                               PadUpdateScratch &sc, const Car *cars,
-                              uint32_t num_cars) {
+                              uint32_t num_cars, uint64_t &touched_pads) {
   constexpr float half_tick = 0.5f * consts::tick_time;
   for (uint32_t car_idx = 0; car_idx < num_cars; ++car_idx) {
     const Car &car = cars[car_idx];
@@ -206,7 +220,8 @@ RS_HD void pad_enter_touching(const PadLayoutView &layout, PadState *pads,
     }
     Vec3A car_pos = car.state.phys.pos - car.state.phys.vel * half_tick;
     Aabb car_aabb{car_pos, car_pos};
-    PadMembershipProcessor proc{&layout, pads, &sc, car_idx, car_pos};
+    PadMembershipProcessor proc{&layout,       pads,    &sc,
+                                &touched_pads, car_idx, car_pos};
     layout.bvh.report_aabb_overlapping_node(proc, car_aabb);
   }
 }
@@ -222,14 +237,16 @@ RS_HD bool pad_any_touching(const PadUpdateScratch &sc, uint32_t num_cars) {
 
 RS_HDN bool pad_update_membership(const PadLayoutView &layout, PadState *pads,
                                   PadUpdateScratch &sc, const Car *cars,
-                                  uint32_t num_cars, float max_boost) {
+                                  uint32_t num_cars, float max_boost,
+                                  uint64_t &touched_pads) {
   pad_begin_update(sc, num_cars);
-  for (uint32_t pad_idx = 0; pad_idx < layout.num_pads; ++pad_idx) {
-    pad_recheck_touching(layout, pads, sc, cars, num_cars, pad_idx);
+  for (uint64_t m = touched_pads; m != 0; m &= m - 1) {
+    pad_recheck_touching(layout, pads, sc, cars, num_cars, lowest_set_bit(m));
   }
-  pad_enter_touching(layout, pads, sc, cars, num_cars);
-  for (uint32_t pad_idx = 0; pad_idx < layout.num_pads; ++pad_idx) {
-    pad_refresh_winner(pads, sc, pad_idx, cars, num_cars, max_boost);
+  pad_prune_touched(pads, touched_pads);
+  pad_enter_touching(layout, pads, sc, cars, num_cars, touched_pads);
+  for (uint64_t m = touched_pads; m != 0; m &= m - 1) {
+    pad_refresh_winner(pads, sc, lowest_set_bit(m), cars, num_cars, max_boost);
   }
   return pad_any_touching(sc, num_cars);
 }

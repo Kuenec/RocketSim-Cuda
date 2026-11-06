@@ -75,6 +75,7 @@ struct Arena {
   MutatorConfig mutators;
   uint32_t num_pads;
   PadState pads[k_max_pads];
+  uint64_t touched_pads;
   bool pad_lists_unchecked;
   bool has_tiles;
   TileStates tiles;
@@ -723,7 +724,7 @@ RS_HD void arena_tick_pads(const ArenaStatic &st, Arena &a, StepScratch &sc,
   if (lanes.size == 1) {
     if (pads) {
       pad_update_membership(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
-                            a.mutators.car_max_boost_amount);
+                            a.mutators.car_max_boost_amount, a.touched_pads);
       arena_give_pad_boosts(st, a, sc);
     }
     return;
@@ -736,20 +737,29 @@ RS_HD void arena_tick_pads(const ArenaStatic &st, Arena &a, StepScratch &sc,
     uint32_t first = a.pad_lists_unchecked ? 0 : lanes.lane;
     uint32_t stride = a.pad_lists_unchecked ? 1 : lanes.size;
     if (!a.pad_lists_unchecked || lanes.leader()) {
-      for (uint32_t p = first; p < st.pads.num_pads; p += stride) {
-        pad_recheck_touching(st.pads, a.pads, sc.pads, a.cars, a.num_cars, p);
+      uint32_t rank = 0;
+      for (uint64_t m = a.touched_pads; m != 0; m &= m - 1, ++rank) {
+        if (rank % stride == first) {
+          pad_recheck_touching(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
+                               lowest_set_bit(m));
+        }
       }
     }
   }
   lanes.barrier();
   if (lanes.leader() && pads) {
-    pad_enter_touching(st.pads, a.pads, sc.pads, a.cars, a.num_cars);
+    pad_prune_touched(a.pads, a.touched_pads);
+    pad_enter_touching(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
+                       a.touched_pads);
   }
   lanes.barrier();
   if (pads) {
-    for (uint32_t p = lanes.lane; p < st.pads.num_pads; p += lanes.size) {
-      pad_refresh_winner(a.pads, sc.pads, p, a.cars, a.num_cars,
-                         a.mutators.car_max_boost_amount);
+    uint32_t rank = 0;
+    for (uint64_t m = a.touched_pads; m != 0; m &= m - 1, ++rank) {
+      if (rank % lanes.size == lanes.lane) {
+        pad_refresh_winner(a.pads, sc.pads, lowest_set_bit(m), a.cars,
+                           a.num_cars, a.mutators.car_max_boost_amount);
+      }
     }
   }
   lanes.barrier();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -90,6 +91,14 @@ RS_HDI double copysign_f64(double mag, double sign) {
 
 RS_HDI bool is_nan_f32(float x) {
   return (f32_to_u32(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
+RS_HDI uint32_t lowest_set_bit(uint64_t x) {
+#ifdef __CUDA_ARCH__
+  return static_cast<uint32_t>(__ffsll(static_cast<long long>(x)) - 1);
+#else
+  return static_cast<uint32_t>(std::countr_zero(x));
+#endif
 }
 
 RS_HDI bool is_finite_f32(float x) {

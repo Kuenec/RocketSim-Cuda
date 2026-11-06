@@ -34,6 +34,7 @@ RS_HD void arena_set_tile_states(Arena &a, const TileStates &tiles) {
 
 RS_HD void arena_reset_pads(const ArenaStatic &st, Arena &a) {
   a.pad_lists_unchecked = false;
+  a.touched_pads = 0;
   for (uint32_t i = 0; i < st.pads.num_pads; ++i) {
     a.pads[i].has_gave_tick = false;
     a.pads[i].gave_tick = 0;
@@ -295,6 +296,11 @@ RS_HD void arena_set_pad_state(const ArenaStatic &st, Arena &a, uint32_t idx,
                                const PadOp &op) {
   PadState &pad = a.pads[idx];
   a.pad_lists_unchecked = true;
+  if (op.num_touching > 0) {
+    a.touched_pads |= pad_bit(idx);
+  } else {
+    a.touched_pads &= ~pad_bit(idx);
+  }
   pad.num_touching = op.num_touching;
   for (uint32_t i = 0; i < op.num_touching; ++i) {
     pad.touching[i] = op.touching[i];
