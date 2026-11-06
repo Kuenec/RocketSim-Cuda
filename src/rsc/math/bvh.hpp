@@ -105,7 +105,8 @@ struct BvhView {
 
   template <typename F>
   RS_HD void report_quad_ray_overlapping_node(F &callback,
-                                              QuadRayInfo &ray_info) const {
+                                              QuadRayInfo &ray_info,
+                                              const Aabb &node_cull) const {
     if (!ray_info.aabb.intersects(aabb)) {
       return;
     }
@@ -131,7 +132,7 @@ struct BvhView {
         continue;
       }
       const BvhWideNode &node = nodes[work];
-      uint32_t mask = node.intersection_mask(ray_info.aabb);
+      uint32_t mask = node.intersection_mask(node_cull);
       for (int lane = static_cast<int>(node.child_count) - 1; lane >= 0;
            --lane) {
         if (mask & (1u << lane)) {

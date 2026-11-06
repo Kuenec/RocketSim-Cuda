@@ -340,6 +340,30 @@ struct SphereClosest {
   }
 };
 
+inline constexpr float k_slab_relative_slack = 1e-5f;
+inline constexpr float k_slab_absolute_slack = 1e-30f;
+
+RS_HD Aabb quad_ray_node_cull(const QuadRayInfo &ray_info,
+                              uint8_t active_rays) {
+  if (active_rays == 0 || (active_rays & (active_rays - 1)) != 0) {
+    return ray_info.aabb;
+  }
+  int ray = 0;
+  while ((active_rays & (1u << ray)) == 0) {
+    ++ray;
+  }
+  Vec3A source = ray_info.ray_sources[ray];
+  Vec3A target = ray_info.ray_targets[ray];
+  if (!source.is_finite() || !target.is_finite()) {
+    return ray_info.aabb;
+  }
+  Vec3A slack = (target - source).abs() * k_slab_relative_slack +
+                Vec3A::splat(k_slab_absolute_slack);
+  Vec3A lo = source.min(target) - slack;
+  Vec3A hi = source.max(target) + slack;
+  return {lo.max(ray_info.aabb.min), hi.min(ray_info.aabb.max)};
+}
+
 RS_HD void shape_quad_raycast(const World &w, const Shape &shape,
                               BridgeTriQuadRay &cb, QuadRayInfo &ray_info) {
   switch (shape.kind) {
@@ -449,7 +473,8 @@ RS_HD void shape_quad_raycast(const World &w, const Shape &shape,
   case ShapeKind::TriangleMesh: {
     const MeshView &mesh = w.mesh(shape.mesh);
     cb.tris = mesh.tris;
-    mesh.bvh.report_quad_ray_overlapping_node(cb, ray_info);
+    mesh.bvh.report_quad_ray_overlapping_node(
+        cb, ray_info, quad_ray_node_cull(ray_info, cb.result->active_rays));
     return;
   }
   case ShapeKind::ConvexHull: {
