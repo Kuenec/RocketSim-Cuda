@@ -141,6 +141,7 @@ struct SingleLane {
   RS_HDI static constexpr uint32_t group_ballot(bool pred) {
     return pred ? 1u : 0u;
   }
+  RS_HDI static SoloRayLanes car_ray_lanes() { return {}; }
   RS_HDI static void barrier() {}
 };
 
@@ -174,6 +175,10 @@ struct LaneGroup {
 #else
     return pred ? 1u : 0u;
 #endif
+  }
+  RS_HDI CarRayLanes car_ray_lanes() const {
+    uint32_t base = team_lane - lane % CarRayLanes::size;
+    return {0xfu << base, base, lane % CarRayLanes::size};
   }
   RS_HDI void group_sync() const {
 #ifdef __CUDA_ARCH__
@@ -735,7 +740,7 @@ RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
         uint32_t c = item / k_num_wheels;
         int wheel = static_cast<int>(item % k_num_wheels);
         VehicleHit hit;
-        a.cars[c].vehicle.cast_wheel_ray(w, wheel, hit);
+        a.cars[c].vehicle.cast_wheel_ray(w, wheel, lanes.car_ray_lanes(), hit);
         sc.rays[c][wheel] = hit;
         dynamic_hit = dynamic_hit || ray_hit_dynamic(w, hit);
       }

@@ -561,24 +561,71 @@ RS_HD void quad_ray_test_body(const World &w, const Vec3A *ray_from,
   shape_quad_raycast(w, co.shape, cb, ray_info);
 }
 
-template <typename Filter>
-RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(const World &w,
-                                                  const Vec3A *ray_from,
-                                                  const Vec3A *ray_to,
-                                                  const Filter &filter,
-                                                  uint32_t *bodies) {
+struct SoloRayLanes {
+  static constexpr uint32_t size = 1;
+  static constexpr uint32_t index = 0;
+
+  RS_HDI static constexpr uint32_t ballot(bool pred) { return pred ? 1u : 0u; }
+  RS_HDI static uint32_t shfl(uint32_t v, uint32_t) { return v; }
+  RS_HDI static Vec3A shfl(Vec3A v, uint32_t) { return v; }
+};
+
+struct CarRayLanes {
+  static constexpr uint32_t size = 4;
+  uint32_t mask;
+  uint32_t base;
+  uint32_t index;
+
+  RS_HDI uint32_t ballot(bool pred) const {
+#ifdef __CUDA_ARCH__
+    return __ballot_sync(mask, pred) >> base;
+#else
+    return pred ? 1u << index : 0u;
+#endif
+  }
+  RS_HDI uint32_t shfl(uint32_t v, uint32_t src) const {
+#ifdef __CUDA_ARCH__
+    return __shfl_sync(mask, v, static_cast<int>(base + src));
+#else
+    static_cast<void>(src);
+    return v;
+#endif
+  }
+  RS_HDI float shfl(float v, uint32_t src) const {
+#ifdef __CUDA_ARCH__
+    return __shfl_sync(mask, v, static_cast<int>(base + src));
+#else
+    static_cast<void>(src);
+    return v;
+#endif
+  }
+  RS_HDI Vec3A shfl(Vec3A v, uint32_t src) const {
+    return {shfl(v.x, src), shfl(v.y, src), shfl(v.z, src)};
+  }
+};
+
+template <typename Filter, typename RayLanes>
+RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(
+    const World &w, const Vec3A *ray_from, const Vec3A *ray_to,
+    const Filter &filter, const RayLanes &lanes, uint32_t *bodies) {
   const StaticWorldData &s = *w.s;
   Aabb ray_aabb{ray_from[0].min(ray_to[0]), ray_from[0].max(ray_to[0])};
   for (int i = 1; i < 4; ++i) {
     ray_aabb = ray_aabb.combine(
         Aabb{ray_from[i].min(ray_to[i]), ray_from[i].max(ray_to[i])});
   }
+  uint32_t own_cells[4][3] = {};
+  for (uint32_t r = lanes.index; r < 4; r += RayLanes::size) {
+    grid_cell_indices(s, ray_from[r], own_cells[r]);
+  }
   uint32_t cell_idxs[4];
   uint32_t cell_coords[4][3];
   int num_cells = 0;
-  for (int r = 0; r < 4; ++r) {
-    uint32_t idx3[3];
-    grid_cell_indices(s, ray_from[r], idx3);
+  for (uint32_t r = 0; r < 4; ++r) {
+    uint32_t owner = r % RayLanes::size;
+    uint32_t idx3[3] = {lanes.shfl(own_cells[r][0], owner),
+                        lanes.shfl(own_cells[r][1], owner),
+                        lanes.shfl(own_cells[r][2], owner)};
     uint32_t idx = grid_cell_index(s, idx3);
     bool found = false;
     for (int c = 0; c < num_cells; ++c) {
@@ -621,11 +668,24 @@ RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(const World &w,
         seen_static[m] |= bits;
       }
       while (bits != 0) {
-        const BroadphaseProxy &p =
-            s.static_proxies[m * 32 + lowest_set_bit(bits)];
-        bits &= bits - 1;
-        if (ray_aabb.intersects(p.aabb) && filter.needs_collision(p)) {
-          bodies[num_bodies++] = p.client_obj_idx;
+        uint32_t mine = bits;
+        for (uint32_t k = 0; k < lanes.index && mine != 0; ++k) {
+          mine &= mine - 1;
+        }
+        bool accepted = false;
+        uint32_t candidate = 0;
+        if (mine != 0) {
+          const BroadphaseProxy &p =
+              s.static_proxies[m * 32 + lowest_set_bit(mine)];
+          accepted = ray_aabb.intersects(p.aabb) && filter.needs_collision(p);
+          candidate = p.client_obj_idx;
+        }
+        uint32_t round = lanes.ballot(accepted);
+        for (uint32_t k = 0; k < RayLanes::size && bits != 0; ++k) {
+          bits &= bits - 1;
+          if (round & (1u << k)) {
+            bodies[num_bodies++] = lanes.shfl(candidate, k);
+          }
         }
       }
     }
@@ -652,7 +712,8 @@ RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(const World &w,
 RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
                          const Vec3A *ray_to, QuadRayResult &result) {
   uint32_t bodies[k_max_handles];
-  uint32_t num_bodies = gather_ray_bodies(w, ray_from, ray_to, result, bodies);
+  uint32_t num_bodies =
+      gather_ray_bodies(w, ray_from, ray_to, result, SoloRayLanes{}, bodies);
   for (uint32_t k = 0; k < num_bodies; ++k) {
     quad_ray_test_body(w, ray_from, ray_to, w.body(bodies[k]),
                        static_cast<int>(bodies[k]), result);
@@ -854,11 +915,13 @@ RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
   }
 }
 
+template <typename RayLanes>
 RS_HD void single_grid_ray_test(const World &w, const Vec3A *ray_from,
                                 const Vec3A *ray_to, int ray,
-                                SingleRay &result) {
+                                const RayLanes &lanes, SingleRay &result) {
   uint32_t bodies[k_max_handles];
-  uint32_t num_bodies = gather_ray_bodies(w, ray_from, ray_to, result, bodies);
+  uint32_t num_bodies =
+      gather_ray_bodies(w, ray_from, ray_to, result, lanes, bodies);
   for (uint32_t k = 0; k < num_bodies; ++k) {
     single_ray_test_body(w, ray_from, ray_to, ray, w.body(bodies[k]),
                          static_cast<int>(bodies[k]), result);

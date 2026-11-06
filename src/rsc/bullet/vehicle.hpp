@@ -536,12 +536,18 @@ struct VehicleRL {
     cast_rays(w, sources, targets, hits);
   }
 
-  RS_HD void cast_wheel_ray(const World &w, int wheel, VehicleHit &hit) const {
+  template <typename RayLanes>
+  RS_HD void cast_wheel_ray(const World &w, int wheel, const RayLanes &lanes,
+                            VehicleHit &hit) const {
     const Affine3A &trans = w.body(chassis_body_idx).world_trans;
-    Vec3A sources[k_num_wheels];
-    Vec3A targets[k_num_wheels];
-    for (int i = 0; i < k_num_wheels; ++i) {
+    Vec3A sources[k_num_wheels] = {};
+    Vec3A targets[k_num_wheels] = {};
+    for (uint32_t i = lanes.index; i < k_num_wheels; i += RayLanes::size) {
       wheels[i].ray_endpoints(trans, sources[i], targets[i]);
+    }
+    for (uint32_t i = 0; i < k_num_wheels; ++i) {
+      sources[i] = lanes.shfl(sources[i], i % RayLanes::size);
+      targets[i] = lanes.shfl(targets[i], i % RayLanes::size);
     }
     SingleRay r{sources[wheel],
                 targets[wheel],
@@ -553,7 +559,7 @@ struct VehicleRL {
                 -1,
                 Vec3A::zero(),
                 Vec3A::zero()};
-    single_grid_ray_test(w, sources, targets, wheel, r);
+    single_grid_ray_test(w, sources, targets, wheel, lanes, r);
     hit = vehicle_hit(w, r.collision_obj_idx, r.hit_point_world,
                       r.hit_normal_world);
   }
