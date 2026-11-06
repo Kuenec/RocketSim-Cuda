@@ -1181,6 +1181,16 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
       lanes.barrier();
     }
   }
+  if (lanes.size == 2 && lanes.lane == 1) {
+    const char *manifolds = reinterpret_cast<const char *>(a.phys.manifolds);
+    uint32_t lines = (a.phys.num_manifolds *
+                          static_cast<uint32_t>(sizeof(PersistentManifold)) +
+                      127u) /
+                     128u;
+    for (uint32_t l = 0; l < lines; ++l) {
+      prefetch_l1(manifolds + 128u * l);
+    }
+  }
   if (lanes.leader()) {
     dispatch_apply_pairs(w, tracker, sc.num_gate_jobs, plans);
     dynamics_solve(w, sc.solver, tick_time);
