@@ -693,6 +693,7 @@ RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
   }
   float flat_slope = k_tie_eps / flat_link;
   float best_d2 = k_f32_max;
+  RS_NO_UNROLL
   for (int i = 0; i < n; ++i) {
     if (pairs[i].distance_sq < best_d2) {
       best_d2 = pairs[i].distance_sq;
@@ -704,6 +705,7 @@ RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
   float tie_d2 = tie_d * tie_d;
   int tied[n];
   int tied_count = 0;
+  RS_NO_UNROLL
   for (int i = 0; i < n; ++i) {
     if (pairs[i].distance_sq <= tie_d2) {
       tied[tied_count++] = i;
@@ -714,6 +716,7 @@ RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
   }
   Vec3A mean_a = Vec3A::zero();
   Vec3A mean_b = Vec3A::zero();
+  RS_NO_UNROLL
   for (int k = 0; k < tied_count; ++k) {
     mean_a += pairs[tied[k]].point_box;
     mean_b += pairs[tied[k]].point_tri;
@@ -724,6 +727,7 @@ RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
   float d0 = (mean_a - mean_b).length();
   int flat = -1;
   float best_slope = flat_slope;
+  RS_NO_UNROLL
   for (int i = 0; i < n; ++i) {
     float sep2 = (pairs[i].point_tri - mean_b).length_squared();
     if (sep2 <= flat_link2) {
@@ -744,6 +748,7 @@ RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
   CandidatePair end1 = pairs[tied[0]];
   float span2 = 0.0f;
   auto consider = [&](const CandidatePair &cand) {
+    RS_NO_UNROLL
     for (int k = 0; k <= tied_count; ++k) {
       const CandidatePair *pair = nullptr;
       if (k < tied_count) {
@@ -761,6 +766,7 @@ RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
       }
     }
   };
+  RS_NO_UNROLL
   for (int k = 0; k < tied_count; ++k) {
     consider(pairs[tied[k]]);
   }

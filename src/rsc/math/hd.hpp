@@ -15,6 +15,12 @@
 #define RS_HDN inline
 #endif
 
+#ifdef __CUDA_ARCH__
+#define RS_NO_UNROLL _Pragma("unroll 1")
+#else
+#define RS_NO_UNROLL
+#endif
+
 namespace rsc {
 
 RS_HDI uint32_t f32_to_u32(float f) {
