@@ -184,6 +184,33 @@ Aabb update_triangle_aabb(const TriangleShape &tri) {
   return aabb;
 }
 
+void require_depth_first_leaves(const BvhStorage &bvh) {
+  uint32_t expected = 0;
+  std::vector<uint32_t> stack{0};
+  while (!stack.empty()) {
+    uint32_t work = stack.back();
+    stack.pop_back();
+    if (work & k_bvh_leaf_bit) {
+      if ((work & ~k_bvh_leaf_bit) != expected) {
+        throw std::runtime_error(
+            "mesh BVH leaves are not stored in depth-first order at leaf " +
+            std::to_string(expected));
+      }
+      ++expected;
+      continue;
+    }
+    const BvhWideNode &node = bvh.nodes[work];
+    for (uint32_t slot = node.child_count; slot > 0; --slot) {
+      stack.push_back(node.children[slot - 1]);
+    }
+  }
+  if (expected != bvh.leaves.size()) {
+    throw std::runtime_error("mesh BVH reaches " + std::to_string(expected) +
+                             " of " + std::to_string(bvh.leaves.size()) +
+                             " leaves");
+  }
+}
+
 Vec3A mesh_support_vertex(const std::vector<TriangleShape> &tris, Vec3A vec) {
   Vec3A support = Vec3A::zero();
   float best = k_f32_min;
@@ -344,6 +371,7 @@ ProcessedMesh process_mesh(const CollisionMeshFile &file) {
     tree_aabb = tree_aabb.combine(leaves[i].aabb);
   }
   pm.bvh = build_bvh_bullet(tree_aabb, leaves);
+  require_depth_first_leaves(pm.bvh);
   pm.infos.assign(pm.tris.size(), TriangleInfo{0, k_tau, k_tau, k_tau});
   BvhView view = pm.bvh.view();
   for (uint32_t i = 0; i < pm.tris.size(); ++i) {

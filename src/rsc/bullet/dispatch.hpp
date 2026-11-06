@@ -230,6 +230,7 @@ struct GateJob {
   uint32_t first_item;
   uint32_t num_items;
   const TriangleShape *tris;
+  const BvhView *bvh;
   Affine3A mesh_to_box;
   GateMeshParams params;
   PersistentManifold fresh;
@@ -396,11 +397,10 @@ RS_HD void dispatch_plan_pairs(const World &w, Callback &callback,
 }
 
 template <typename Callback>
-RS_HD uint32_t dispatch_collect_jobs(const World &w, Callback &callback) {
+RS_HD uint32_t dispatch_plan_jobs(const World &w, Callback &callback) {
   const PairPlan *plans = callback.pair_plans();
   GateJob *jobs = callback.gate_jobs();
-  GateItems &items = callback.gate_items();
-  items.count = 0;
+  callback.gate_items().count = 0;
   uint32_t num_jobs = 0;
   for (uint32_t i = 0; i < w.a->num_pairs && num_jobs < k_max_gate_jobs; ++i) {
     if (plans[i] != PairPlan::Gate) {
@@ -419,21 +419,26 @@ RS_HD uint32_t dispatch_collect_jobs(const World &w, Callback &callback) {
     const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
     if (other.shape.kind == ShapeKind::TriangleMesh) {
       job.mesh = true;
-      job.items_complete = true;
-      job.first_item = items.count;
-      job.num_items = 0;
       job.params = gate_mesh_params(compound_obj, compound_obj.shape.compound,
                                     setup.child_world, other);
       job.mesh_to_box = mesh_to_box_transform(
           job.params.box_trans, other.world_trans, job.params.flat);
       const MeshView &mesh = w.mesh(other.shape.mesh);
       job.tris = mesh.tris;
-      GateLeafSink sink{&items, &job, static_cast<uint8_t>(num_jobs)};
-      mesh.bvh.report_aabb_overlapping_node(sink, job.params.local_convex_aabb);
+      job.bvh = &mesh.bvh;
     }
     ++num_jobs;
   }
   return num_jobs;
+}
+
+RS_HD void gate_collect_job_serial(GateJob &job, uint32_t job_idx,
+                                   GateItems &items) {
+  job.items_complete = true;
+  job.first_item = items.count;
+  job.num_items = 0;
+  GateLeafSink sink{&items, &job, static_cast<uint8_t>(job_idx)};
+  job.bvh->report_aabb_overlapping_node(sink, job.params.local_convex_aabb);
 }
 
 RS_HD bool gate_test_item_begin(const GateJob *jobs, GateItems &items,
