@@ -17,6 +17,7 @@
 namespace rsc {
 
 inline constexpr int k_max_records = 160;
+inline constexpr uint32_t k_job_records = 8;
 inline constexpr int k_max_ball_world_records = 32;
 inline constexpr int k_max_normal_groups = 64;
 
@@ -113,15 +114,23 @@ enum class CarPhasePlan : uint8_t { Sequential, Precast, Parallel };
 struct LaneGroup {
   uint32_t lane;
   uint32_t size;
-  uint32_t mask;
+  uint32_t team_mask;
 
   RS_HDI static LaneGroup single() { return {0, 1, 1}; }
   RS_HDI bool leader() const { return lane == 0; }
-  RS_HDI void sync() const {
+  RS_HDI void barrier() const {
 #ifdef __CUDA_ARCH__
-    __syncwarp(mask);
+    if (size > 1) {
+      __syncwarp(team_mask);
+    }
 #endif
   }
+};
+
+struct JobRecords {
+  uint32_t count;
+  bool overflow;
+  ContactRecord records[k_job_records];
 };
 
 struct StepScratch {
@@ -136,12 +145,43 @@ struct StepScratch {
   BallWorldRecord ball_world[k_max_ball_world_records];
   int num_groups;
   WorldNormalGroup groups[k_max_normal_groups];
+  PairPlan pair_plans[k_max_pairs];
+  uint32_t num_gate_jobs;
+  GateJob gate_jobs[k_max_gate_jobs];
+  GateItems gate_items;
+  JobRecords job_records[k_max_gate_jobs];
 };
+
+enum class RecordSink : uint8_t { Records, Job };
 
 struct ContactTracker {
   World *w;
   StepScratch *sc;
   bool ball_only;
+  RecordSink sink;
+  uint32_t job;
+
+  RS_HD PairPlan *pair_plans() const { return sc->pair_plans; }
+  RS_HD GateJob *gate_jobs() const { return sc->gate_jobs; }
+  RS_HD GateItems &gate_items() const { return sc->gate_items; }
+
+  RS_HD ContactTracker job_tracker(uint32_t j) const {
+    sc->job_records[j].count = 0;
+    sc->job_records[j].overflow = false;
+    return {w, sc, ball_only, RecordSink::Job, j};
+  }
+
+  RS_HD bool job_overflowed(uint32_t j) const {
+    return sc->job_records[j].overflow;
+  }
+
+  RS_HD void replay_job(uint32_t j) {
+    const JobRecords &jr = sc->job_records[j];
+    for (uint32_t k = 0; k < jr.count; ++k) {
+      push_record(jr.records[k].is_swap, jr.records[k].a, jr.records[k].b,
+                  jr.records[k].point);
+    }
+  }
 
   RS_HD static bool should_swap(const RigidBody &a, const RigidBody &b) {
     if (a.user_idx != UserInfoType::None && b.user_idx != UserInfoType::None) {
@@ -152,6 +192,15 @@ struct ContactTracker {
 
   RS_HD void push_record(bool swap, uint32_t a, uint32_t b,
                          const ManifoldPoint &p) {
+    if (sink == RecordSink::Job) {
+      JobRecords &jr = sc->job_records[job];
+      if (jr.count >= k_job_records) {
+        jr.overflow = true;
+        return;
+      }
+      jr.records[jr.count++] = {swap, a, b, p};
+      return;
+    }
     if (sc->num_records >= k_max_records) {
       w->flag_error(k_error_records_overflow);
       return;
@@ -181,7 +230,9 @@ struct ContactTracker {
     }
     if (ball_only && a.user_idx == UserInfoType::Ball &&
         b.user_idx == UserInfoType::None && b.is_static_obj()) {
-      if (sc->num_ball_world >= k_max_ball_world_records) {
+      if (sink == RecordSink::Job) {
+        sc->job_records[job].overflow = true;
+      } else if (sc->num_ball_world >= k_max_ball_world_records) {
         w->flag_error(k_error_records_overflow);
       } else {
         sc->ball_world[sc->num_ball_world++] = {
@@ -454,32 +505,26 @@ RS_HD void arena_update_world_contact_normal(Arena &a, const StepScratch &sc) {
   }
 }
 
-RS_HD void arena_step_tick_front(const ArenaStatic &st, Arena &a) {
+RS_HD void arena_tick_front_item(const ArenaStatic &st, Arena &a,
+                                 uint32_t item) {
   using namespace consts;
   World w = arena_world(st, a);
-  a.num_events = 0;
-  for (uint32_t i = 0; i < a.phys.num_dyn_bodies; ++i) {
-    a.phys.dyn_bodies[i].clear_accum_vels();
+  if (item == a.num_cars) {
+    RigidBody &ball_rb = w.dyn_body(a.ball.rigid_body_idx);
+    ball_rb.limit_vels(a.mutators.ball_max_speed * uu_to_bt,
+                       ball::max_ang_speed);
+    quantize_body(ball_rb);
+    a.ball.state.phys.vel = ball_rb.lin_vel * bt_to_uu;
+    a.ball.state.phys.ang_vel = ball_rb.ang_vel;
+    return;
   }
-  if (!a.ball_only) {
-    for (uint32_t c = 0; c < a.num_cars; ++c) {
-      RigidBody &rb = w.dyn_body(a.cars[c].rigid_body_idx);
-      rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
-      quantize_body(rb);
-      a.cars[c].state.phys.vel = rb.lin_vel * bt_to_uu;
-      a.cars[c].state.phys.ang_vel = rb.ang_vel;
-    }
-  }
-  RigidBody &ball_rb = w.dyn_body(a.ball.rigid_body_idx);
-  ball_rb.limit_vels(a.mutators.ball_max_speed * uu_to_bt, ball::max_ang_speed);
-  quantize_body(ball_rb);
-  a.ball.state.phys.vel = ball_rb.lin_vel * bt_to_uu;
-  a.ball.state.phys.ang_vel = ball_rb.ang_vel;
-  if (!a.ball_only) {
-    for (uint32_t c = 0; c < a.num_cars; ++c) {
-      car_apply_flip_zdamp_prepass(a.cars[c], w);
-    }
-  }
+  Car &car = a.cars[item];
+  RigidBody &rb = w.dyn_body(car.rigid_body_idx);
+  rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
+  quantize_body(rb);
+  car.state.phys.vel = rb.lin_vel * bt_to_uu;
+  car.state.phys.ang_vel = rb.ang_vel;
+  car_apply_flip_zdamp_prepass(car, w);
 }
 
 RS_HD void arena_push_car_landed(Arena &a, uint32_t c) {
@@ -530,11 +575,8 @@ RS_HD bool arena_rays_hit_static_only(const ArenaStatic &st, Arena &a,
   return true;
 }
 
-RS_HD void arena_step_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
+RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
                            const LaneGroup &lanes) {
-  if (a.ball_only) {
-    return;
-  }
   if (lanes.size == 1) {
     arena_car_pre_ticks_in_order(st, a, nullptr);
     return;
@@ -543,43 +585,39 @@ RS_HD void arena_step_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
     sc.car_plan = arena_rays_precomputable(st, a) ? CarPhasePlan::Precast
                                                   : CarPhasePlan::Sequential;
   }
-  lanes.sync();
-  if (sc.car_plan == CarPhasePlan::Sequential) {
-    if (lanes.leader()) {
-      arena_car_pre_ticks_in_order(st, a, nullptr);
-    }
-    return;
-  }
+  lanes.barrier();
   World w = arena_world(st, a);
-  if (lanes.size >= k_num_wheels * a.num_cars) {
-    for (uint32_t item = lanes.lane; item < k_num_wheels * a.num_cars;
-         item += lanes.size) {
-      uint32_t c = item / k_num_wheels;
-      int wheel = static_cast<int>(item % k_num_wheels);
-      a.cars[c].vehicle.cast_wheel_ray(w, wheel, sc.rays[c][wheel]);
-    }
-  } else {
-    for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
-      a.cars[c].vehicle.cast_wheel_rays(w, sc.rays[c]);
+  if (sc.car_plan != CarPhasePlan::Sequential) {
+    if (lanes.size >= k_num_wheels * a.num_cars) {
+      for (uint32_t item = lanes.lane; item < k_num_wheels * a.num_cars;
+           item += lanes.size) {
+        uint32_t c = item / k_num_wheels;
+        int wheel = static_cast<int>(item % k_num_wheels);
+        a.cars[c].vehicle.cast_wheel_ray(w, wheel, sc.rays[c][wheel]);
+      }
+    } else {
+      for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
+        a.cars[c].vehicle.cast_wheel_rays(w, sc.rays[c]);
+      }
     }
   }
-  lanes.sync();
-  if (lanes.leader() && arena_rays_hit_static_only(st, a, sc)) {
+  lanes.barrier();
+  if (lanes.leader() && sc.car_plan == CarPhasePlan::Precast &&
+      arena_rays_hit_static_only(st, a, sc)) {
     sc.car_plan = CarPhasePlan::Parallel;
   }
-  lanes.sync();
-  if (sc.car_plan == CarPhasePlan::Precast) {
-    if (lanes.leader()) {
-      arena_car_pre_ticks_in_order(st, a, &sc);
+  lanes.barrier();
+  if (sc.car_plan == CarPhasePlan::Parallel) {
+    for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
+      sc.was_on_ground[c] = a.cars[c].state.cache.is_on_ground;
+      car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators, sc.rays[c]);
     }
-    return;
+  } else if (lanes.leader()) {
+    arena_car_pre_ticks_in_order(
+        st, a, sc.car_plan == CarPhasePlan::Precast ? &sc : nullptr);
   }
-  for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
-    sc.was_on_ground[c] = a.cars[c].state.cache.is_on_ground;
-    car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators, sc.rays[c]);
-  }
-  lanes.sync();
-  if (!lanes.leader()) {
+  lanes.barrier();
+  if (!lanes.leader() || sc.car_plan != CarPhasePlan::Parallel) {
     return;
   }
   for (uint32_t c = 0; c < a.num_cars; ++c) {
@@ -589,17 +627,10 @@ RS_HD void arena_step_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
   }
 }
 
-RS_HD void arena_step_tick_back(const ArenaStatic &st, Arena &a,
-                                StepScratch &sc) {
+RS_HD void arena_tick_contacts(const ArenaStatic &st, Arena &a,
+                               StepScratch &sc) {
   using namespace consts;
   World w = arena_world(st, a);
-  ball_pre_tick_update(a.ball, w.dyn_body(a.ball.rigid_body_idx), st.mode);
-  sc.num_records = 0;
-  sc.num_ball_world = 0;
-  sc.num_groups = 0;
-  a.phys.ball_only = a.ball_only;
-  ContactTracker tracker{&w, &sc, a.ball_only};
-  dynamics_step(w, sc.solver, tick_time, tracker);
   if (a.ball_only) {
     for (int i = 0; i < sc.num_ball_world; ++i) {
       BallWorldRecord r = sc.ball_world[i];
@@ -653,11 +684,12 @@ RS_HD void arena_step_tick_back(const ArenaStatic &st, Arena &a,
     }
     arena_update_world_contact_normal(a, sc);
   }
+}
+
+RS_HD void arena_tick_finish(const ArenaStatic &st, Arena &a, StepScratch &sc) {
+  using namespace consts;
+  World w = arena_world(st, a);
   if (!a.ball_only) {
-    for (uint32_t c = 0; c < a.num_cars; ++c) {
-      car_post_tick_update(a.cars[c], w);
-      car_finish_physics_tick(a.cars[c], w.dyn_body(a.cars[c].rigid_body_idx));
-    }
     if (a.mutators.boost_pads_enabled && st.has_pads) {
       bool any =
           pad_update_membership(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
@@ -695,15 +727,76 @@ RS_HD void arena_step_tick_back(const ArenaStatic &st, Arena &a,
 
 RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
                            const LaneGroup &lanes) {
+  using namespace consts;
+  World w = arena_world(st, a);
   if (lanes.leader()) {
-    arena_step_tick_front(st, a);
+    a.num_events = 0;
+    for (uint32_t i = 0; i < a.phys.num_dyn_bodies; ++i) {
+      a.phys.dyn_bodies[i].clear_accum_vels();
+    }
   }
-  lanes.sync();
-  arena_step_cars(st, a, sc, lanes);
-  lanes.sync();
+  lanes.barrier();
+  for (uint32_t item = lanes.lane; item <= a.num_cars; item += lanes.size) {
+    arena_tick_front_item(st, a, item);
+  }
+  lanes.barrier();
+  arena_tick_cars(st, a, sc, lanes);
+  lanes.barrier();
   if (lanes.leader()) {
-    arena_step_tick_back(st, a, sc);
+    ball_pre_tick_update(a.ball, w.dyn_body(a.ball.rigid_body_idx), st.mode);
+    sc.num_records = 0;
+    sc.num_ball_world = 0;
+    sc.num_groups = 0;
+    a.phys.ball_only = a.ball_only;
   }
+  lanes.barrier();
+  for (uint32_t i = lanes.lane; i < a.phys.num_dyn_bodies; i += lanes.size) {
+    dynamics_predict_body(a.phys, i, tick_time);
+  }
+  lanes.barrier();
+  ContactTracker tracker{&w, &sc, a.ball_only, RecordSink::Records, 0};
+  if (lanes.leader()) {
+    collision_update_aabbs(w);
+  }
+  lanes.barrier();
+  PlanSource plans = PlanSource::Inline;
+  if (lanes.size > 1) {
+    plans = PlanSource::Precomputed;
+    dispatch_plan_pairs(w, tracker, lanes.lane, lanes.size);
+    lanes.barrier();
+    if (lanes.leader()) {
+      sc.num_gate_jobs = dispatch_collect_jobs(w, tracker);
+    }
+    lanes.barrier();
+    dispatch_test_triangles(tracker, lanes.lane, lanes.size);
+    lanes.barrier();
+    dispatch_compute_jobs(w, tracker, sc.num_gate_jobs, lanes.lane, lanes.size);
+    lanes.barrier();
+  } else {
+    sc.num_gate_jobs = 0;
+  }
+  if (lanes.leader()) {
+    dispatch_apply_pairs(w, tracker, sc.num_gate_jobs, plans);
+    dynamics_solve(w, sc.solver, tick_time);
+  }
+  lanes.barrier();
+  for (uint32_t i = lanes.lane; i < a.phys.num_dyn_bodies; i += lanes.size) {
+    dynamics_integrate_body(a.phys, i, tick_time);
+  }
+  lanes.barrier();
+  if (lanes.leader()) {
+    arena_tick_contacts(st, a, sc);
+  }
+  lanes.barrier();
+  for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
+    car_post_tick_update(a.cars[c], w);
+    car_finish_physics_tick(a.cars[c], w.dyn_body(a.cars[c].rigid_body_idx));
+  }
+  lanes.barrier();
+  if (lanes.leader()) {
+    arena_tick_finish(st, a, sc);
+  }
+  lanes.barrier();
 }
 
 }

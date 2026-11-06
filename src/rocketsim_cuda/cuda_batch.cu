@@ -18,6 +18,7 @@ constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_device_stack_bytes = 16384;
 constexpr uint32_t k_max_lanes_per_arena = 32;
 constexpr uint32_t k_lanes_per_car = 4;
+constexpr uint32_t k_max_lane_waves = 3;
 
 uint32_t lanes_for_cars(uint32_t cars) {
   uint32_t lanes = 1;
@@ -77,25 +78,22 @@ struct DeviceMesh {
   DeviceArray<BvhWideLeaf> leaves;
 };
 
-__global__ void step_kernel(ArenaStatic st, Arena *arenas, StepScratch *scratch,
-                            uint32_t num_arenas, uint32_t lanes_per_arena,
-                            uint32_t ticks) {
+__global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
+                            StepScratch *scratch, uint32_t num_arenas,
+                            uint32_t lanes_per_arena, uint32_t ticks) {
   uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t i = thread / lanes_per_arena;
+  uint32_t live = __ballot_sync(__activemask(), i < num_arenas);
   if (i >= num_arenas) {
     return;
   }
-  uint32_t lane = thread % lanes_per_arena;
-  uint32_t first_in_warp = (threadIdx.x % 32) - lane;
-  uint32_t group_bits =
-      lanes_per_arena == 32 ? 0xffffffffu : (1u << lanes_per_arena) - 1u;
-  LaneGroup lanes{lane, lanes_per_arena, group_bits << first_in_warp};
+  LaneGroup lanes{thread % lanes_per_arena, lanes_per_arena, live};
   Arena &a = arenas[i];
   if (lanes.leader()) {
     a.counters = ArenaEventCounters{};
   }
   for (uint32_t t = 0; t < ticks; ++t) {
-    arena_step_tick(st, a, scratch[i], lanes);
+    arena_step_tick(*st, a, scratch[i], lanes);
   }
 }
 
@@ -111,29 +109,31 @@ __global__ void controls_kernel(Arena *arenas,
       rocketsim_cuda::convert::to_internal(controls[i]);
 }
 
-__global__ void op_kernel(ArenaStatic st, Arena *arena, ArenaOp op) {
-  arena_apply_op(st, *arena, op);
+__global__ void op_kernel(const ArenaStatic *__restrict__ st, Arena *arena,
+                          ArenaOp op) {
+  arena_apply_op(*st, *arena, op);
 }
 
-__global__ void kickoff_kernel(ArenaStatic st, Arena *arenas,
-                               uint32_t num_arenas, const uint8_t *mask,
-                               const uint64_t *seeds) {
+__global__ void kickoff_kernel(const ArenaStatic *__restrict__ st,
+                               Arena *arenas, uint32_t num_arenas,
+                               const uint8_t *mask, const uint64_t *seeds) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= num_arenas || mask[i] == 0) {
     return;
   }
-  arena_reset_to_random_kickoff(st, arenas[i], seeds != nullptr,
+  arena_reset_to_random_kickoff(*st, arenas[i], seeds != nullptr,
                                 seeds ? seeds[i] : 0);
 }
 
-__global__ void export_kernel(ArenaStatic st, const Arena *arenas,
-                              uint32_t first, uint32_t count,
+__global__ void export_kernel(const ArenaStatic *__restrict__ st,
+                              const Arena *arenas, uint32_t first,
+                              uint32_t count,
                               rocketsim_cuda::StateBuffers out) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= count) {
     return;
   }
-  rocketsim_cuda::convert::export_arena(st, arenas[first + i], i, out);
+  rocketsim_cuda::convert::export_arena(*st, arenas[first + i], i, out);
 }
 
 uint32_t grid_for(uint32_t count, uint32_t block) {
@@ -197,6 +197,7 @@ struct CudaBatch::Impl {
   DeviceArray<Arena> copy_staging;
   size_t copy_capacity = 0;
   ArenaStatic view;
+  DeviceArray<ArenaStatic> device_view;
   cudaStream_t stream = nullptr;
   uint32_t block_size = 1;
   uint32_t blocks = 0;
@@ -252,6 +253,7 @@ struct CudaBatch::Impl {
       view.pads.bvh.nodes = pad_nodes.get();
       view.pads.bvh.leaves = pad_leaves.get();
     }
+    device_view.upload(&view, 1);
     arenas.allocate(n);
     scratch.allocate(n);
     int device = 0;
@@ -268,9 +270,10 @@ struct CudaBatch::Impl {
     uint32_t resident_threads = static_cast<uint32_t>(blocks_per_sm) *
                                 k_max_block_size *
                                 static_cast<uint32_t>(sm_count);
-    uint32_t car_lanes = lanes_for_cars(cars);
-    if (n * car_lanes <= resident_threads) {
-      lanes_per_arena = car_lanes;
+    lanes_per_arena = lanes_for_cars(cars);
+    while (lanes_per_arena > 1 &&
+           n * lanes_per_arena > k_max_lane_waves * resident_threads) {
+      lanes_per_arena /= 2;
     }
     uint32_t threads = n * lanes_per_arena;
     uint32_t per_block =
@@ -333,7 +336,7 @@ void CudaBatch::read(uint32_t arena, size_t offset, size_t size, void *dst) {
 }
 
 void CudaBatch::apply_op(uint32_t arena, const ArenaOp &op) {
-  op_kernel<<<1, 1, 0, impl_->stream>>>(impl_->view,
+  op_kernel<<<1, 1, 0, impl_->stream>>>(impl_->device_view.get(),
                                         impl_->arenas.get() + arena, op);
   check(cudaGetLastError(), "arena op kernel launch");
 }
@@ -393,7 +396,7 @@ void CudaBatch::reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
     }
   }
   kickoff_kernel<<<grid_for(n, 64), 64, 0, impl_->stream>>>(
-      impl_->view, impl_->arenas.get(), n, d_mask, d_seeds);
+      impl_->device_view.get(), impl_->arenas.get(), n, d_mask, d_seeds);
   check(cudaGetLastError(), "kickoff kernel launch");
 }
 
@@ -430,7 +433,7 @@ void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
                          : nullptr;
   }
   export_kernel<<<grid_for(count, 64), 64, 0, im.stream>>>(
-      im.view, im.arenas.get(), first, count, target);
+      im.device_view.get(), im.arenas.get(), first, count, target);
   check(cudaGetLastError(), "export kernel launch");
   if (!host) {
     return;
@@ -449,8 +452,8 @@ void CudaBatch::step(uint32_t ticks) {
     return;
   }
   step_kernel<<<impl_->blocks, impl_->block_size, 0, impl_->stream>>>(
-      impl_->view, impl_->arenas.get(), impl_->scratch.get(), impl_->num_arenas,
-      impl_->lanes_per_arena, ticks);
+      impl_->device_view.get(), impl_->arenas.get(), impl_->scratch.get(),
+      impl_->num_arenas, impl_->lanes_per_arena, ticks);
   check(cudaGetLastError(), "step kernel launch");
 }
 

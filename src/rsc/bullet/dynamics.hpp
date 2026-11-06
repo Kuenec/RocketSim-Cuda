@@ -487,43 +487,35 @@ RS_HDN void island_sort_manifolds(World &w) {
   hoare_sort(a.active, keys, 0, static_cast<int>(a.num_active) - 1);
 }
 
-template <typename Callback>
-RS_HD void dynamics_step(World &w, SolverScratch &sc, float time_step,
-                         Callback &callback) {
+RS_HD void dynamics_predict_body(ArenaPhysics &a, uint32_t i, float time_step) {
+  RigidBody &body = a.dyn_bodies[i];
+  if (body.is_active()) {
+    body.add_linear_impulse(a.gravity * time_step, false, true);
+  }
+  if (body.activation == ActivationState::Sleeping) {
+    body.interp_world_trans = body.world_trans;
+    return;
+  }
+  body.apply_damping();
+  body.interp_world_trans = body.predict_integration_trans(time_step);
+}
+
+RS_HD void dynamics_solve(World &w, SolverScratch &sc, float time_step) {
   ArenaPhysics &a = *w.a;
-  Vec3A gravity_impulse = a.gravity * time_step;
-  for (uint32_t i = 0; i < a.num_dyn_bodies; ++i) {
-    RigidBody &body = a.dyn_bodies[i];
-    if (body.is_active()) {
-      body.add_linear_impulse(gravity_impulse, false, true);
-    }
-  }
-  for (uint32_t i = 0; i < a.num_dyn_bodies; ++i) {
-    RigidBody &body = a.dyn_bodies[i];
-    if (body.activation == ActivationState::Sleeping) {
-      body.interp_world_trans = body.world_trans;
-      continue;
-    }
-    body.apply_damping();
-    body.interp_world_trans = body.predict_integration_trans(time_step);
-  }
-  collision_update_aabbs(w);
-  dispatch_all_collision_pairs(w, callback);
   island_sort_manifolds(w);
   a.skip_separated_special_rows =
       a.ball_only && a.num_dyn_bodies == 1 &&
       a.dyn_bodies[0].user_idx == UserInfoType::Ball;
   solve_group(w, sc, time_step);
-  for (uint32_t i = 0; i < a.num_dyn_bodies; ++i) {
-    RigidBody &body = a.dyn_bodies[i];
-    if (!body.is_active()) {
-      continue;
-    }
+}
+
+RS_HD void dynamics_integrate_body(ArenaPhysics &a, uint32_t i,
+                                   float time_step) {
+  RigidBody &body = a.dyn_bodies[i];
+  if (body.is_active()) {
     body.set_center_of_mass_trans(body.predict_integration_trans(time_step));
   }
-  for (uint32_t i = 0; i < a.num_dyn_bodies; ++i) {
-    a.dyn_bodies[i].update_activation_state(time_step);
-  }
+  body.update_activation_state(time_step);
 }
 
 }

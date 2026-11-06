@@ -31,53 +31,129 @@ RS_HD Affine3A mesh_to_box_transform(const Affine3A &box_trans,
   return {m, box_to_local.transform_point3a(mesh_trans.translation)};
 }
 
-template <typename Callback> struct CompoundTriangleCallback {
+struct GateMeshParams {
+  Affine3A box_trans;
+  Vec3A half;
+  float margin;
+  float maximum_distance;
+  Aabb local_convex_aabb;
+  bool flat;
+};
+
+struct GateTriangle {
+  uint32_t tri_idx;
+  Vec3A q[3];
+  bool hit;
+  BoxTriangleSatContact contact;
+};
+
+RS_HD GateMeshParams gate_mesh_params(const RigidBody &compound_obj,
+                                      const CompoundShape &compound,
+                                      const Affine3A &child_world,
+                                      const RigidBody &other) {
+  const BoxShape &box = compound.child_shape;
+  bool identity = (other.collision_flags & k_flag_identity_transform) != 0;
+  bool no_angular = (other.collision_flags & k_flag_no_angular_motion) != 0;
+  Affine3A convex_in_tri =
+      mesh_pair_transform(other.world_trans, identity, no_angular, child_world);
+  float breaking = min_f32(compound_obj.contact_breaking_threshold,
+                           other.contact_breaking_threshold);
+  return {child_world,
+          box.half_extents,
+          box.margin,
+          box.margin + breaking,
+          box.get_aabb(convex_in_tri),
+          no_angular || identity};
+}
+
+RS_HD void gate_triangle_sat(const GateMeshParams &p, GateTriangle &t) {
+  t.hit = box_triangle_sat(p.box_trans, p.half, p.margin, t.q,
+                           p.maximum_distance, t.contact);
+}
+
+RS_HD bool gate_triangle_overlaps(const GateMeshParams &p,
+                                  const TriangleShape &tri) {
+  Vec3A tri_min = tri.points[0].min(tri.points[1]).min(tri.points[2]);
+  Vec3A tri_max = tri.points[0].max(tri.points[1]).max(tri.points[2]);
+  return tri_min.cmple(p.local_convex_aabb.max).all() &&
+         tri_max.cmpge(p.local_convex_aabb.min).all();
+}
+
+RS_HD GateTriangle gate_triangle_in_box(const Affine3A &mesh_to_box,
+                                        const TriangleShape &tri,
+                                        uint32_t triangle_idx) {
+  GateTriangle t;
+  t.tri_idx = triangle_idx;
+  t.q[0] = mesh_to_box.transform_point3a(tri.points[0]);
+  t.q[1] = mesh_to_box.transform_point3a(tri.points[1]);
+  t.q[2] = mesh_to_box.transform_point3a(tri.points[2]);
+  return t;
+}
+
+template <typename Sink> struct GateTriangleCollector {
+  const GateMeshParams *params;
+  const Affine3A *tri_trans;
+  const TriangleShape *tris;
+  bool have_mesh_to_box;
+  Affine3A mesh_to_box;
+  Sink *sink;
+
+  RS_HD void process_node(uint32_t triangle_idx) {
+    const TriangleShape &tri = tris[triangle_idx];
+    if (!gate_triangle_overlaps(*params, tri)) {
+      return;
+    }
+    if (!have_mesh_to_box) {
+      mesh_to_box =
+          mesh_to_box_transform(params->box_trans, *tri_trans, params->flat);
+      have_mesh_to_box = true;
+    }
+    sink->push(gate_triangle_in_box(mesh_to_box, tri, triangle_idx));
+  }
+};
+
+template <typename Callback> struct GateManifoldBuilder {
   bool has_manifold;
   PersistentManifold manifold;
   const RigidBody *convex_obj;
   const RigidBody *tri_obj;
-  Aabb local_convex_aabb;
-  Vec3A half;
-  float margin;
-  float maximum_distance;
-  Affine3A box_trans;
-  const Affine3A *tri_trans;
-  bool tri_identity;
-  bool tri_no_angular;
-  bool have_mesh_to_box;
-  Affine3A mesh_to_box;
   const TriangleShape *tris;
   Callback *callback;
 
-  RS_HD void process_node(uint32_t triangle_idx) {
-    const TriangleShape &tri = tris[triangle_idx];
-    Vec3A tri_min = tri.points[0].min(tri.points[1]).min(tri.points[2]);
-    Vec3A tri_max = tri.points[0].max(tri.points[1]).max(tri.points[2]);
-    if (!(tri_min.cmple(local_convex_aabb.max).all() &&
-          tri_max.cmpge(local_convex_aabb.min).all())) {
+  RS_HD void add(const GateTriangle &t) {
+    if (!t.hit) {
       return;
     }
-    if (!have_mesh_to_box) {
-      mesh_to_box = mesh_to_box_transform(box_trans, *tri_trans,
-                                          tri_no_angular || tri_identity);
-      have_mesh_to_box = true;
-    }
-    Vec3A q[3] = {mesh_to_box.transform_point3a(tri.points[0]),
-                  mesh_to_box.transform_point3a(tri.points[1]),
-                  mesh_to_box.transform_point3a(tri.points[2])};
-    BoxTriangleSatContact contact;
-    if (!box_triangle_sat(box_trans, half, margin, q, maximum_distance,
-                          contact)) {
-      return;
-    }
-    Vec3A emit_normal = tri_trans->matrix3 * tri.normal;
+    Vec3A emit_normal = tri_obj->world_trans.matrix3 * tris[t.tri_idx].normal;
     if (!has_manifold) {
       manifold = PersistentManifold::make(*convex_obj, *tri_obj);
       has_manifold = true;
     }
     manifold.add_contact_point(*convex_obj, *tri_obj, emit_normal,
-                               contact.point_on_b_world, contact.distance,
-                               static_cast<int>(triangle_idx), *callback);
+                               t.contact.point_on_b_world, t.contact.distance,
+                               static_cast<int>(t.tri_idx), *callback);
+  }
+
+  RS_HD bool finish(PersistentManifold &out) {
+    if (!has_manifold) {
+      return false;
+    }
+    manifold.refresh_contact_points(*convex_obj, *tri_obj);
+    if (manifold.num_points == 0) {
+      return false;
+    }
+    out = manifold;
+    return true;
+  }
+};
+
+template <typename Callback> struct GateSerialSink {
+  const GateMeshParams *params;
+  GateManifoldBuilder<Callback> *builder;
+
+  RS_HD void push(GateTriangle t) {
+    gate_triangle_sat(*params, t);
+    builder->add(t);
   }
 };
 
@@ -90,39 +166,16 @@ compound_after_child_gate(const World &w, const RigidBody &compound_obj,
   const BoxShape &box = compound.child_shape;
   switch (other.shape.kind) {
   case ShapeKind::TriangleMesh: {
-    const Affine3A &other_trans = other.world_trans;
-    bool identity = (other.collision_flags & k_flag_identity_transform) != 0;
-    bool no_angular = (other.collision_flags & k_flag_no_angular_motion) != 0;
-    Affine3A convex_in_tri =
-        mesh_pair_transform(other_trans, identity, no_angular, child_world);
-    Aabb aabb_in_tri = box.get_aabb(convex_in_tri);
-    float breaking = min_f32(compound_obj.contact_breaking_threshold,
-                             other.contact_breaking_threshold);
+    GateMeshParams params =
+        gate_mesh_params(compound_obj, compound, child_world, other);
     const MeshView &mesh = w.mesh(other.shape.mesh);
-    CompoundTriangleCallback<Callback> cb;
-    cb.has_manifold = false;
-    cb.convex_obj = &compound_obj;
-    cb.tri_obj = &other;
-    cb.local_convex_aabb = aabb_in_tri;
-    cb.half = box.half_extents;
-    cb.margin = box.margin;
-    cb.maximum_distance = box.margin + breaking;
-    cb.box_trans = child_world;
-    cb.tri_trans = &other_trans;
-    cb.tri_identity = identity;
-    cb.tri_no_angular = no_angular;
-    cb.have_mesh_to_box = false;
-    cb.tris = mesh.tris;
-    cb.callback = &callback;
-    mesh.bvh.report_aabb_overlapping_node(cb, aabb_in_tri);
-    if (cb.has_manifold) {
-      cb.manifold.refresh_contact_points(compound_obj, other);
-      if (cb.manifold.num_points != 0) {
-        out = cb.manifold;
-        return true;
-      }
-    }
-    return false;
+    GateManifoldBuilder<Callback> builder{false,  {},        &compound_obj,
+                                          &other, mesh.tris, &callback};
+    GateSerialSink<Callback> sink{&params, &builder};
+    GateTriangleCollector<GateSerialSink<Callback>> collector{
+        &params, &other.world_trans, mesh.tris, false, {}, &sink};
+    mesh.bvh.report_aabb_overlapping_node(collector, params.local_convex_aabb);
+    return builder.finish(out);
   }
   case ShapeKind::StaticPlane: {
     BodyWrapper wrap{&compound_obj, child_world, &box};
@@ -241,9 +294,9 @@ template <typename Callback> struct ConvexTriangleCallback {
 
 template <typename Callback>
 RS_HDN bool convex_concave_into(const World &w, const RigidBody &convex_obj,
-                               const RigidBody &concave_obj,
-                               PersistentManifold &manifold,
-                               Callback &callback) {
+                                const RigidBody &concave_obj,
+                                PersistentManifold &manifold,
+                                Callback &callback) {
   const MeshView &mesh = w.mesh(concave_obj.shape.mesh);
   ConvexTriangleCallback<Callback> cb{&manifold,
                                       &convex_obj,
@@ -304,7 +357,7 @@ RS_HD bool clamp_normal(Vec3A edge, Vec3A tri_normal_org,
 }
 
 RS_HDN void adjust_internal_edge_contacts(const World &w, ManifoldPoint &cp,
-                                         const RigidBody &tri_obj, int idx) {
+                                          const RigidBody &tri_obj, int idx) {
   using namespace edge;
   const MeshView &mesh = w.mesh(tri_obj.shape.mesh);
   const TriangleInfo &info = mesh.infos[idx];
