@@ -73,14 +73,29 @@ struct PersistentManifold {
   RS_HD static PersistentManifold make(const RigidBody &body0,
                                        const RigidBody &body1) {
     PersistentManifold m;
-    m.num_points = 0;
-    m.body0_idx = body0.world_array_idx;
-    m.body1_idx = body1.world_array_idx;
-    m.contact_breaking_threshold = min_f32(body0.contact_breaking_threshold,
-                                           body1.contact_breaking_threshold);
-    m.contact_processing_threshold = min_f32(
-        body0.contact_processing_threshold, body1.contact_processing_threshold);
+    m.reset(body0, body1);
     return m;
+  }
+
+  RS_HD void reset(const RigidBody &body0, const RigidBody &body1) {
+    num_points = 0;
+    body0_idx = body0.world_array_idx;
+    body1_idx = body1.world_array_idx;
+    contact_breaking_threshold = min_f32(body0.contact_breaking_threshold,
+                                         body1.contact_breaking_threshold);
+    contact_processing_threshold = min_f32(body0.contact_processing_threshold,
+                                           body1.contact_processing_threshold);
+  }
+
+  RS_HD void copy_used_from(const PersistentManifold &o) {
+    for (int i = 0; i < o.num_points; ++i) {
+      points[i] = o.points[i];
+    }
+    num_points = o.num_points;
+    body0_idx = o.body0_idx;
+    body1_idx = o.body1_idx;
+    contact_breaking_threshold = o.contact_breaking_threshold;
+    contact_processing_threshold = o.contact_processing_threshold;
   }
 
   RS_HD bool matches(uint32_t a, uint32_t b) const {

@@ -25,7 +25,7 @@ RS_HD int dispatcher_insert(World &w, const PersistentManifold &m) {
     w.flag_error(k_error_manifolds_overflow);
     return -1;
   }
-  a.manifolds[a.num_manifolds] = m;
+  a.manifolds[a.num_manifolds].copy_used_from(m);
   return static_cast<int>(a.num_manifolds++);
 }
 
@@ -44,7 +44,9 @@ RS_HD void dispatcher_release_manifold(World &w, uint32_t body0,
     }
   }
   a.num_active = kept;
-  a.manifolds[index] = a.manifolds[last];
+  if (static_cast<uint32_t>(index) != last) {
+    a.manifolds[index].copy_used_from(a.manifolds[last]);
+  }
   a.num_manifolds = last;
   if (static_cast<uint32_t>(index) != last) {
     for (uint32_t i = 0; i < a.num_active; ++i) {
@@ -225,6 +227,7 @@ struct GateJob {
   uint32_t pair;
   uint32_t memo_owner;
   uint32_t memo_mesh;
+  int compound_side;
   bool computed;
   bool has_fresh;
   bool mesh;
@@ -420,6 +423,7 @@ RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
     job.bvh = &mesh.bvh;
     job.memo_owner = compound_obj.world_array_idx - w.num_static();
     job.memo_mesh = other.shape.mesh.mesh_idx;
+    job.compound_side = setup.compound_side;
   }
 }
 
@@ -493,17 +497,12 @@ RS_HD void dispatch_compute_jobs(const World &w, Callback &callback,
     const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
     Callback job_callback = callback.job_tracker(j);
     if (job.mesh && job.items_complete) {
-      PairSetup setup = plan_pair(w, proxy0, proxy1);
       const RigidBody &rb0 = w.body(proxy0.client_obj_idx);
       const RigidBody &rb1 = w.body(proxy1.client_obj_idx);
-      const RigidBody &compound_obj = setup.compound_side == 0 ? rb0 : rb1;
-      const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
-      GateManifoldBuilder<Callback> builder{false,
-                                            {},
-                                            &compound_obj,
-                                            &other,
-                                            w.mesh(other.shape.mesh).tris,
-                                            &job_callback};
+      const RigidBody &compound_obj = job.compound_side == 0 ? rb0 : rb1;
+      const RigidBody &other = job.compound_side == 0 ? rb1 : rb0;
+      GateManifoldBuilder<Callback> builder(&compound_obj, &other, job.tris,
+                                            &job_callback);
       for (uint32_t k = job.first_item; k < job.first_item + job.num_items;
            ++k) {
         GateTriangle t;

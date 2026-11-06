@@ -120,13 +120,18 @@ template <typename Callback> struct GateManifoldBuilder {
   const TriangleShape *tris;
   Callback *callback;
 
+  RS_HD GateManifoldBuilder(const RigidBody *convex, const RigidBody *tri,
+                            const TriangleShape *triangles, Callback *cb)
+      : has_manifold(false), convex_obj(convex), tri_obj(tri), tris(triangles),
+        callback(cb) {}
+
   RS_HD void add(const GateTriangle &t) {
     if (!t.hit) {
       return;
     }
     Vec3A emit_normal = tri_obj->world_trans.matrix3 * tris[t.tri_idx].normal;
     if (!has_manifold) {
-      manifold = PersistentManifold::make(*convex_obj, *tri_obj);
+      manifold.reset(*convex_obj, *tri_obj);
       has_manifold = true;
     }
     manifold.add_contact_point(*convex_obj, *tri_obj, emit_normal,
@@ -142,7 +147,7 @@ template <typename Callback> struct GateManifoldBuilder {
     if (manifold.num_points == 0) {
       return false;
     }
-    out = manifold;
+    out.copy_used_from(manifold);
     return true;
   }
 };
@@ -169,8 +174,8 @@ compound_after_child_gate(const World &w, const RigidBody &compound_obj,
     GateMeshParams params =
         gate_mesh_params(compound_obj, compound, child_world, other);
     const MeshView &mesh = w.mesh(other.shape.mesh);
-    GateManifoldBuilder<Callback> builder{false,  {},        &compound_obj,
-                                          &other, mesh.tris, &callback};
+    GateManifoldBuilder<Callback> builder(&compound_obj, &other, mesh.tris,
+                                          &callback);
     GateSerialSink<Callback> sink{&params, &builder};
     GateTriangleCollector<GateSerialSink<Callback>> collector{
         &params, &other.world_trans, mesh.tris, false, {}, &sink};

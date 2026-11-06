@@ -17,7 +17,7 @@
 namespace rsc {
 
 inline constexpr int k_max_records = 160;
-inline constexpr uint32_t k_job_records = 8;
+inline constexpr uint32_t k_job_records = 32;
 inline constexpr int k_max_ball_world_records = 32;
 inline constexpr int k_max_normal_groups = 64;
 
