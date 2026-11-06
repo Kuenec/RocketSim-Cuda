@@ -464,19 +464,20 @@ struct ArenaBatch::Impl {
 #ifdef RSC_HAS_CUDA
     if (cuda) {
       cuda->sync();
-      if (balance) {
-        rsc::StepTiming t = cuda->take_step_timing();
-        balance_gpu_ms += t.total_ms;
-        balance_gpu_launches += t.launches;
-      }
     }
 #endif
   }
 
 #ifdef RSC_HAS_CUDA
   void rebalance_if_due() {
-    if (!balance || balance_cpu_steps < k_balance_window ||
-        balance_gpu_launches == 0) {
+    if (!balance || balance_cpu_steps < k_balance_window) {
+      return;
+    }
+    cuda->sync();
+    rsc::StepTiming timing = cuda->take_step_timing();
+    balance_gpu_ms += timing.total_ms;
+    balance_gpu_launches += timing.launches;
+    if (balance_gpu_launches == 0) {
       return;
     }
     double device = num_device_arenas;
