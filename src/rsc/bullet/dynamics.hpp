@@ -296,36 +296,51 @@ RS_HDN float solver_single_iteration(World &w, SolverScratch &sc) {
   return lsr;
 }
 
+RS_HD void solver_finish_body(RigidBody &body, SolverBody &s, float time_step) {
+  s.lin_vel += s.delta_lin_vel;
+  s.ang_vel += s.delta_ang_vel;
+  if (s.push_vel.length_squared() != 0.0f ||
+      s.turn_vel.length_squared() != 0.0f) {
+    Affine3A world_trans = body.world_trans;
+    if (body.collision_flags & k_flag_no_angular_motion) {
+      integrate_trans_no_rot(world_trans.translation, s.push_vel, time_step);
+    } else {
+      Quat world_rot = body.world_quat;
+      integrate_trans(world_trans, world_rot, s.push_vel,
+                      s.turn_vel * k_split_impulse_turn_erp, time_step);
+    }
+    body.set_world_trans(world_trans);
+  }
+  Vec3A lin = s.lin_vel + s.external_force_impulse;
+  Vec3A ang = s.ang_vel + s.external_torque_impulse;
+  bool was_sleeping = body.activation == ActivationState::Sleeping;
+  body.lin_vel = lin;
+  body.ang_vel = ang;
+  if (was_sleeping && (lin != Vec3A::zero() || ang != Vec3A::zero())) {
+    body.set_activation_state(ActivationState::WantsDeactivation);
+    body.deactivation_time = 0.0f;
+  }
+}
+
 RS_HDN void solver_finish(World &w, SolverScratch &sc, float time_step) {
   for (int i = 0; i < sc.num_bodies; ++i) {
     SolverBody &s = sc.bodies[i];
-    if (s.original_body < 0) {
-      continue;
+    if (s.original_body >= 0) {
+      solver_finish_body(w.dyn_body(static_cast<uint32_t>(s.original_body)), s,
+                         time_step);
     }
-    RigidBody &body = w.dyn_body(static_cast<uint32_t>(s.original_body));
-    s.lin_vel += s.delta_lin_vel;
-    s.ang_vel += s.delta_ang_vel;
-    if (s.push_vel.length_squared() != 0.0f ||
-        s.turn_vel.length_squared() != 0.0f) {
-      Affine3A world_trans = body.world_trans;
-      if (body.collision_flags & k_flag_no_angular_motion) {
-        integrate_trans_no_rot(world_trans.translation, s.push_vel, time_step);
-      } else {
-        Quat world_rot = body.world_quat;
-        integrate_trans(world_trans, world_rot, s.push_vel,
-                        s.turn_vel * k_split_impulse_turn_erp, time_step);
-      }
-      body.set_world_trans(world_trans);
-    }
-    Vec3A lin = s.lin_vel + s.external_force_impulse;
-    Vec3A ang = s.ang_vel + s.external_torque_impulse;
-    bool was_sleeping = body.activation == ActivationState::Sleeping;
-    body.lin_vel = lin;
-    body.ang_vel = ang;
-    if (was_sleeping && (lin != Vec3A::zero() || ang != Vec3A::zero())) {
-      body.set_activation_state(ActivationState::WantsDeactivation);
-      body.deactivation_time = 0.0f;
-    }
+  }
+}
+
+RS_HD void dynamics_finish_body(ArenaPhysics &a, SolverScratch &sc, uint32_t i,
+                                float time_step) {
+  RigidBody &body = a.dyn_bodies[i];
+  if (body.companion_id < 0) {
+    return;
+  }
+  SolverBody &s = sc.bodies[body.companion_id];
+  if (s.original_body >= 0) {
+    solver_finish_body(body, s, time_step);
   }
 }
 
@@ -337,7 +352,6 @@ RS_HD void solve_group(World &w, SolverScratch &sc, float time_step) {
       break;
     }
   }
-  solver_finish(w, sc, time_step);
 }
 
 RS_HD uint32_t island_find_recursive(uint32_t *parents, uint32_t index) {
@@ -429,8 +443,12 @@ RS_HDN void island_sort_manifolds(World &w) {
     parents[i] = i;
   }
   for (uint32_t p = 0; p < a.num_pairs; ++p) {
-    const BroadphaseProxy &p0 = w.proxy(a.pairs[p].proxy0);
-    const BroadphaseProxy &p1 = w.proxy(a.pairs[p].proxy1);
+    BroadphasePair pair = a.pairs[p];
+    if (pair.proxy0 <= ns || pair.proxy1 <= ns) {
+      continue;
+    }
+    const BroadphaseProxy &p0 = w.proxy(pair.proxy0);
+    const BroadphaseProxy &p1 = w.proxy(pair.proxy1);
     if ((p0.collision_filter_group & k_group_static) != 0 ||
         (p1.collision_filter_group & k_group_static) != 0) {
       continue;

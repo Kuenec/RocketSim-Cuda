@@ -228,6 +228,7 @@ struct StepScratch {
   bool vehicle_run[k_max_cars];
   float real_throttle[k_max_cars];
   WheelImpulse wheel_impulses[k_max_cars][k_num_wheels];
+  Aabb body_aabbs[k_max_dyn_bodies];
   VehicleHit rays[k_max_cars][k_num_wheels];
   SolverScratch solver;
   PadUpdateScratch pads;
@@ -1259,11 +1260,18 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
   lanes.barrier();
   for (uint32_t i = lanes.lane; i < a.phys.num_dyn_bodies; i += lanes.size) {
     dynamics_predict_body(a.phys, i, tick_time);
+    if constexpr (Lanes::k_cooperative) {
+      sc.body_aabbs[i] = collision_body_aabb(a.phys.dyn_bodies[i]);
+    }
   }
   lanes.barrier();
   ContactTracker tracker{&w, &sc, a.ball_only, RecordSink::Records, 0};
   if (lanes.leader()) {
-    collision_update_aabbs(w);
+    if constexpr (Lanes::k_cooperative) {
+      collision_apply_aabbs(w, sc.body_aabbs);
+    } else {
+      collision_update_aabbs(w);
+    }
   }
   lanes.barrier();
   PlanSource plans = PlanSource::Inline;
@@ -1299,9 +1307,15 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
   if (lanes.leader()) {
     dispatch_apply_pairs(w, tracker, sc.num_gate_jobs, plans);
     dynamics_solve(w, sc.solver, tick_time);
+    if constexpr (!Lanes::k_cooperative) {
+      solver_finish(w, sc.solver, tick_time);
+    }
   }
   lanes.barrier();
   for (uint32_t i = lanes.lane; i < a.phys.num_dyn_bodies; i += lanes.size) {
+    if constexpr (Lanes::k_cooperative) {
+      dynamics_finish_body(a.phys, sc.solver, i, tick_time);
+    }
     dynamics_integrate_body(a.phys, i, tick_time);
   }
   lanes.barrier();

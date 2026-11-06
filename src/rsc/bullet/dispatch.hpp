@@ -584,21 +584,33 @@ RS_HD void dispatch_apply_pairs(World &w, Callback &callback, uint32_t num_jobs,
   }
 }
 
-RS_HDN void collision_update_aabbs(World &w) {
+RS_HD Aabb collision_body_aabb(const RigidBody &obj) {
   const Vec3A cbt = Vec3A::splat(k_contact_breaking_threshold);
+  Aabb aabb = obj.shape.get_aabb(obj.world_trans);
+  aabb.min -= cbt;
+  aabb.max += cbt;
+  Aabb aabb2 = obj.shape.get_aabb(obj.interp_world_trans);
+  aabb2.min -= cbt;
+  aabb2.max += cbt;
+  aabb += aabb2;
+  return aabb;
+}
+
+RS_HDN void collision_apply_aabbs(World &w, const Aabb *aabbs) {
   for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
-    const RigidBody &obj = w.a->dyn_bodies[i];
-    Aabb aabb = obj.shape.get_aabb(obj.world_trans);
-    aabb.min -= cbt;
-    aabb.max += cbt;
-    Aabb aabb2 = obj.shape.get_aabb(obj.interp_world_trans);
-    aabb2.min -= cbt;
-    aabb2.max += cbt;
-    aabb += aabb2;
-    uint16_t handle = static_cast<uint16_t>(obj.broadphase_handle);
-    sweep_set_aabb(w, handle, aabb);
-    grid_update_dynamic(w, handle, aabb);
+    uint16_t handle =
+        static_cast<uint16_t>(w.a->dyn_bodies[i].broadphase_handle);
+    sweep_set_aabb(w, handle, aabbs[i]);
+    grid_update_dynamic(w, handle, aabbs[i]);
   }
+}
+
+RS_HD void collision_update_aabbs(World &w) {
+  Aabb aabbs[k_max_dyn_bodies];
+  for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
+    aabbs[i] = collision_body_aabb(w.a->dyn_bodies[i]);
+  }
+  collision_apply_aabbs(w, aabbs);
 }
 
 }
