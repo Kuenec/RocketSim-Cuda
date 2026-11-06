@@ -933,6 +933,25 @@ RS_HD void arena_tick_finish(const ArenaStatic &st, Arena &a) {
   }
 }
 
+RS_HD void arena_setup_gate_jobs(const World &w, StepScratch &sc,
+                                 const LaneGroup &lanes) {
+  uint32_t jobs = 0;
+  for (uint32_t base = 0; base < w.a->num_pairs; base += lanes.size) {
+    uint32_t i = base + lanes.lane;
+    bool gate = i < w.a->num_pairs && sc.pair_plans[i] == PairPlan::Gate;
+    uint32_t gates = lanes.group_ballot(gate);
+    uint32_t j = jobs + lanes.team_rank(gates);
+    if (gate && j < k_max_gate_jobs) {
+      gate_job_setup(w, i, sc.gate_jobs[j]);
+    }
+    jobs += popcount32(gates);
+  }
+  if (lanes.leader()) {
+    sc.num_gate_jobs = jobs < k_max_gate_jobs ? jobs : k_max_gate_jobs;
+    sc.gate_items.count = 0;
+  }
+}
+
 RS_HD bool arena_collect_job_leaves(const LaneGroup &lanes, StepScratch &sc,
                                     const GateJob &job, uint32_t &found) {
   const BvhView &bvh = *job.bvh;
@@ -1147,9 +1166,7 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
       plans = PlanSource::Precomputed;
       dispatch_plan_pairs(w, tracker, lanes.lane, lanes.size);
       lanes.barrier();
-      if (lanes.leader()) {
-        sc.num_gate_jobs = dispatch_plan_jobs(w, tracker);
-      }
+      arena_setup_gate_jobs(w, sc, lanes);
       lanes.barrier();
       arena_collect_gate_items(sc, lanes);
       lanes.barrier();

@@ -396,40 +396,27 @@ RS_HD void dispatch_plan_pairs(const World &w, Callback &callback,
   }
 }
 
-template <typename Callback>
-RS_HD uint32_t dispatch_plan_jobs(const World &w, Callback &callback) {
-  const PairPlan *plans = callback.pair_plans();
-  GateJob *jobs = callback.gate_jobs();
-  callback.gate_items().count = 0;
-  uint32_t num_jobs = 0;
-  for (uint32_t i = 0; i < w.a->num_pairs && num_jobs < k_max_gate_jobs; ++i) {
-    if (plans[i] != PairPlan::Gate) {
-      continue;
-    }
-    GateJob &job = jobs[num_jobs];
-    job.pair = i;
-    job.mesh = false;
-    BroadphasePair pair = w.a->pairs[i];
-    const BroadphaseProxy &proxy0 = w.proxy(pair.proxy0);
-    const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
-    PairSetup setup = plan_pair(w, proxy0, proxy1);
-    const RigidBody &rb0 = w.body(proxy0.client_obj_idx);
-    const RigidBody &rb1 = w.body(proxy1.client_obj_idx);
-    const RigidBody &compound_obj = setup.compound_side == 0 ? rb0 : rb1;
-    const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
-    if (other.shape.kind == ShapeKind::TriangleMesh) {
-      job.mesh = true;
-      job.params = gate_mesh_params(compound_obj, compound_obj.shape.compound,
-                                    setup.child_world, other);
-      job.mesh_to_box = mesh_to_box_transform(
-          job.params.box_trans, other.world_trans, job.params.flat);
-      const MeshView &mesh = w.mesh(other.shape.mesh);
-      job.tris = mesh.tris;
-      job.bvh = &mesh.bvh;
-    }
-    ++num_jobs;
+RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
+  job.pair = pair_idx;
+  job.mesh = false;
+  BroadphasePair pair = w.a->pairs[pair_idx];
+  const BroadphaseProxy &proxy0 = w.proxy(pair.proxy0);
+  const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
+  PairSetup setup = plan_pair(w, proxy0, proxy1);
+  const RigidBody &rb0 = w.body(proxy0.client_obj_idx);
+  const RigidBody &rb1 = w.body(proxy1.client_obj_idx);
+  const RigidBody &compound_obj = setup.compound_side == 0 ? rb0 : rb1;
+  const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
+  if (other.shape.kind == ShapeKind::TriangleMesh) {
+    job.mesh = true;
+    job.params = gate_mesh_params(compound_obj, compound_obj.shape.compound,
+                                  setup.child_world, other);
+    job.mesh_to_box = mesh_to_box_transform(job.params.box_trans,
+                                            other.world_trans, job.params.flat);
+    const MeshView &mesh = w.mesh(other.shape.mesh);
+    job.tris = mesh.tris;
+    job.bvh = &mesh.bvh;
   }
-  return num_jobs;
 }
 
 RS_HD void gate_collect_job_serial(GateJob &job, uint32_t job_idx,
