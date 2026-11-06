@@ -115,14 +115,14 @@ Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after 
 
 | Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU, 1 thread | C++ CPU, all cores | CUDA | Hybrid |
 | --- | --- | --- | --- | --- | --- |
-| 100 | 1.02M (0.97M to 1.11M) | 0.73M (0.70M to 0.79M) | 5.03M (4.85M to 5.41M) | 0.54M (0.48M to 0.60M) | |
-| 1,000 | 0.80M (0.73M to 0.84M) | 0.68M (0.56M to 0.70M) | 6.32M (5.53M to 6.65M) | 2.35M (2.09M to 2.48M) | |
-| 10,000 | 0.73M (0.72M to 0.76M) | 0.63M (0.62M to 0.67M) | 6.13M (5.97M to 6.37M) | 6.80M (6.51M to 7.38M) | 10.15M (9.78M to 11.07M) |
-| 20,000 | | | 5.49M (5.37M to 5.78M) | 7.55M (7.23M to 7.86M) | 11.72M (11.42M to 13.04M) |
+| 100 | 1.02M (0.97M to 1.11M) | 0.73M (0.70M to 0.79M) | 5.03M (4.85M to 5.41M) | 0.59M (0.52M to 0.65M) | |
+| 1,000 | 0.80M (0.73M to 0.84M) | 0.68M (0.56M to 0.70M) | 6.32M (5.53M to 6.65M) | 2.73M (2.38M to 2.92M) | |
+| 10,000 | 0.73M (0.72M to 0.76M) | 0.63M (0.62M to 0.67M) | 6.13M (5.97M to 6.37M) | 7.97M (7.75M to 8.21M) | 10.92M (10.59M to 11.34M) |
+| 20,000 | | | 5.49M (5.37M to 5.78M) | 8.56M (8.44M to 8.87M) | 10.94M (10.30M to 12.17M) |
 
 With `-DRSC_NATIVE_ARCH=ON` the single-thread CPU backend measures 0.78M, 0.70M, and 0.68M at 100, 1,000, and 10,000 arenas, and the all-cores CPU backend 4.46M, 6.78M, and 6.59M.
 
-The CUDA backend runs one arena per GPU thread and picks the block size from the batch size. Arenas that share a warp take different code paths, and that divergence dominates: a batch of identical arenas runs the same kernel at 10.1M (1,000 arenas) and 14.6M (10,000 arenas) arena-ticks per second. The CUDA backend therefore pays off with thousands of arenas and when the policy also runs on the GPU, since it avoids host transfers; the hybrid backend adds the CPU cores on top for the highest total throughput at 10,000 arenas and more, while below a few thousand arenas the CPU backend alone is fastest. The single-thread C++ CPU backend runs at about 70 to 87 percent of upstream speed; it uses portable scalar code for most vector math where upstream uses SSE vector instructions.
+The CUDA backend runs one arena per GPU thread for large batches. When the whole batch fits on the GPU at once with room to spare, it gives each arena a group of threads instead: the cars' wheel rays are cast one per thread and the car updates run in parallel whenever no car is demolished and no wheel touches another car or the ball, which is checked every tick; otherwise the group's first thread runs the original sequential loop. Arenas that share a warp still take different code paths, and that divergence dominates: a batch of identical arenas runs the same kernel at 10.4M (1,000 arenas) and 16.1M (10,000 arenas) arena-ticks per second. The CUDA backend therefore pays off with thousands of arenas and when the policy also runs on the GPU, since it avoids host transfers; the hybrid backend adds the CPU cores on top for the highest total throughput at 10,000 arenas and more, while below a few thousand arenas the CPU backend alone is fastest. The single-thread C++ CPU backend runs at about 70 to 87 percent of upstream speed; it uses portable scalar code for most vector math where upstream uses SSE vector instructions.
 
 ## License
 
