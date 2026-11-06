@@ -17,7 +17,6 @@ constexpr uint32_t k_max_block_size = 32;
 constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_device_stack_bytes = 16384;
 constexpr uint32_t k_max_lanes_per_arena = 32;
-constexpr uint32_t k_wheel_lanes_per_car = 4;
 
 uint32_t pow2_lanes(uint32_t wanted) {
   uint32_t lanes = 1;
@@ -276,7 +275,7 @@ struct CudaBatch::Impl {
                                 k_max_block_size *
                                 static_cast<uint32_t>(sm_count);
     uint32_t car_lanes = pow2_lanes(cars);
-    lanes_per_arena = pow2_lanes(cars * k_wheel_lanes_per_car);
+    lanes_per_arena = k_max_lanes_per_arena;
     while (lanes_per_arena > car_lanes &&
            n * lanes_per_arena > resident_threads) {
       lanes_per_arena /= 2;
