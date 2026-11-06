@@ -741,6 +741,10 @@ RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
       }
     } else {
       for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
+        const char *car_bytes = reinterpret_cast<const char *>(&a.cars[c]);
+        for (uint32_t l = 0; l < (sizeof(Car) + 127u) / 128u; ++l) {
+          prefetch_l1(car_bytes + 128u * l);
+        }
         VehicleHit hits[k_num_wheels];
         a.cars[c].vehicle.cast_wheel_rays(w, hits);
         for (int i = 0; i < k_num_wheels; ++i) {

@@ -107,6 +107,14 @@ RS_HDI uint32_t lowest_set_bit(uint64_t x) {
 #endif
 }
 
+RS_HDI void prefetch_l1(const void *p) {
+#ifdef __CUDA_ARCH__
+  asm volatile("prefetch.global.L1 [%0];" : : "l"(p) : "memory");
+#else
+  static_cast<void>(p);
+#endif
+}
+
 RS_HDI uint32_t popcount32(uint32_t x) {
 #ifdef __CUDA_ARCH__
   return static_cast<uint32_t>(__popc(x));
