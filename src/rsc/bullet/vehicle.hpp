@@ -308,8 +308,9 @@ struct WheelInfo {
         time_step, friction_scale);
   }
 
-  RS_HD void update_suspension(RigidBody &cb, Vec3A chassis_translation,
-                               float delta_time) {
+  template <typename Sink>
+  RS_HD void suspension_impulse(Vec3A chassis_translation, float delta_time,
+                                Sink &&sink) const {
     if (!has_raycast) {
       return;
     }
@@ -329,21 +330,41 @@ struct WheelInfo {
     float base_force_scale =
         wheels_suspension_force * delta_time + extra_pushback;
     Vec3A offset = ri.contact_point - chassis_translation;
-    cb.add_linear_rel_pos_impulse(ri.contact_normal * base_force_scale, offset,
-                                  true, false);
+    sink(ri.contact_normal * base_force_scale, offset);
   }
 
-  RS_HD void apply_friction_impulses(RigidBody &cb, const Affine3A &trans,
-                                     float time_step) const {
+  RS_HD void update_suspension(RigidBody &cb, Vec3A chassis_translation,
+                               float delta_time) {
+    suspension_impulse(
+        chassis_translation, delta_time, [&](Vec3A impulse, Vec3A rel_pos) {
+          cb.add_linear_rel_pos_impulse(impulse, rel_pos, true, false);
+        });
+  }
+
+  template <typename Sink>
+  RS_HD void friction_impulse(const Affine3A &trans, float time_step,
+                              Sink &&sink) const {
     if (!has_raycast) {
       return;
     }
     Vec3A offset = raycast_info.contact_point - trans.translation;
     float up_dot = trans.matrix3.z_axis.dot(offset);
     Vec3A rel_pos = offset - trans.matrix3.z_axis * up_dot;
-    cb.add_linear_rel_pos_impulse(raycast_info.impulse * time_step, rel_pos,
-                                  true, false);
+    sink(raycast_info.impulse * time_step, rel_pos);
   }
+
+  RS_HD void apply_friction_impulses(RigidBody &cb, const Affine3A &trans,
+                                     float time_step) const {
+    friction_impulse(trans, time_step, [&](Vec3A impulse, Vec3A rel_pos) {
+      cb.add_linear_rel_pos_impulse(impulse, rel_pos, true, false);
+    });
+  }
+};
+
+struct WheelAxleCache {
+  bool cached = false;
+  float angle = 0.0f;
+  Vec3A axle = Vec3A::zero();
 };
 
 struct VehicleRL {
@@ -522,6 +543,44 @@ struct VehicleRL {
     hit = ray_hit(w, r, wheel);
   }
 
+  RS_HDI void wheel_contact(World &w, const Affine3A &trans, int i,
+                            const VehicleHit &hit, float time_step,
+                            float handbrake_val, float real_throttle,
+                            bool three_wheels, WheelAxleCache &axles) {
+    WheelInfo &wheel = wheels[i];
+    if (!hit.valid) {
+      wheel.reset_wheel_suspension();
+      return;
+    }
+    const RigidBody &chassis = w.body(chassis_body_idx);
+    const RigidBody &hit_body = w.body(hit.body_idx);
+    bool front = i < 2;
+    Vec3A axle = front ? front_axle(trans, wheel.steer_angle, axles.cached,
+                                    axles.angle, axles.axle)
+                       : trans.matrix3.y_axis;
+    wheel.apply_ray_cast(w, chassis, trans, axle, hit, time_step, front);
+    wheel.refresh_friction_curves(chassis, trans.translation, hit.normal,
+                                  handbrake_val, real_throttle, three_wheels,
+                                  !hit_body.is_static_obj());
+    apply_single_wheel_dynamic_effects(w, wheel);
+  }
+
+  RS_HDI int num_wheel_contacts() const {
+    int count = 0;
+    for (int i = 0; i < k_num_wheels; ++i) {
+      if (wheels[i].has_raycast) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  RS_HDI void scale_engine_force(int i, int num_in_contact) {
+    if (num_in_contact < 3) {
+      wheels[i].engine_force /= 4.0f;
+    }
+  }
+
   RS_HDN void update(World &w, float time_step, float handbrake_val,
                      float real_throttle, bool three_wheels,
                      const VehicleHit *precomputed_hits) {
@@ -541,33 +600,14 @@ struct VehicleRL {
     } else {
       cast_rays(w, sources, targets, hits);
     }
-    bool cached = false;
-    float cached_angle = 0.0f;
-    Vec3A cached_axle = Vec3A::zero();
-    int num_in_contact = 0;
+    WheelAxleCache axles;
     for (int i = 0; i < k_num_wheels; ++i) {
-      WheelInfo &wheel = wheels[i];
-      if (!hits[i].valid) {
-        wheel.reset_wheel_suspension();
-        continue;
-      }
-      const RigidBody &chassis = w.body(chassis_body_idx);
-      const RigidBody &hit_body = w.body(hits[i].body_idx);
-      ++num_in_contact;
-      bool front = i < 2;
-      Vec3A axle = front ? front_axle(trans, wheel.steer_angle, cached,
-                                      cached_angle, cached_axle)
-                         : trans.matrix3.y_axis;
-      wheel.apply_ray_cast(w, chassis, trans, axle, hits[i], time_step, front);
-      wheel.refresh_friction_curves(
-          chassis, chassis_translation, hits[i].normal, handbrake_val,
-          real_throttle, three_wheels, !hit_body.is_static_obj());
-      apply_single_wheel_dynamic_effects(w, wheel);
+      wheel_contact(w, trans, i, hits[i], time_step, handbrake_val,
+                    real_throttle, three_wheels, axles);
     }
-    if (num_in_contact < 3) {
-      for (int i = 0; i < k_num_wheels; ++i) {
-        wheels[i].engine_force /= 4.0f;
-      }
+    int num_in_contact = num_wheel_contacts();
+    for (int i = 0; i < k_num_wheels; ++i) {
+      scale_engine_force(i, num_in_contact);
     }
     if (num_in_contact == 0) {
       return;

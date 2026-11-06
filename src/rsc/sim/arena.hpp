@@ -175,9 +175,18 @@ struct JobRecords {
   ContactRecord records[k_job_records];
 };
 
+struct WheelImpulse {
+  bool apply;
+  Vec3A lin;
+  Vec3A ang;
+};
+
 struct StepScratch {
   CarPhasePlan car_plan;
   bool was_on_ground[k_max_cars];
+  bool vehicle_run[k_max_cars];
+  float real_throttle[k_max_cars];
+  WheelImpulse wheel_impulses[k_max_cars][k_num_wheels];
   VehicleHit rays[k_max_cars][k_num_wheels];
   SolverScratch solver;
   PadUpdateScratch pads;
@@ -584,7 +593,7 @@ RS_HD void arena_car_pre_ticks_in_order(const ArenaStatic &st, Arena &a,
   for (uint32_t c = 0; c < a.num_cars; ++c) {
     bool was_on_ground = a.cars[c].state.cache.is_on_ground;
     car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators,
-                        precast ? precast->rays[c] : nullptr);
+                        precast ? precast->rays[c] : nullptr, nullptr);
     if (!was_on_ground && a.cars[c].state.cache.is_on_ground) {
       arena_push_car_landed(a, c);
     }
@@ -615,6 +624,82 @@ RS_HD bool arena_rays_hit_static_only(const ArenaStatic &st, Arena &a,
     }
   }
   return true;
+}
+
+RS_HD void arena_apply_wheel_impulses(const StepScratch &sc, RigidBody &chassis,
+                                      uint32_t c) {
+  for (int j = 0; j < k_num_wheels; ++j) {
+    const WheelImpulse &wi = sc.wheel_impulses[c][j];
+    if (wi.apply) {
+      chassis.apply_impulse_parts(wi.lin, wi.ang, false);
+    }
+  }
+}
+
+template <typename Lanes>
+RS_HDN void arena_tick_vehicle_wheels(Arena &a, StepScratch &sc, World &w,
+                                      const Lanes &lanes, bool per_wheel) {
+  uint32_t c = lanes.lane / k_num_wheels;
+  int i = static_cast<int>(lanes.lane % k_num_wheels);
+  bool mine = per_wheel && c < a.num_cars && sc.vehicle_run[c];
+  if (mine) {
+    Car &car = a.cars[c];
+    const Affine3A trans = w.body(car.vehicle.chassis_body_idx).world_trans;
+    Vec3A source, target;
+    car.vehicle.wheels[i].prepare_for_raycast(trans, source, target);
+    WheelAxleCache axles;
+    car.vehicle.wheel_contact(w, trans, i, sc.rays[c][i], consts::tick_time,
+                              car.state.handbrake_val, sc.real_throttle[c],
+                              car.info.config.three_wheels, axles);
+  }
+  lanes.barrier();
+  int contacts = 0;
+  if (mine) {
+    VehicleRL &vehicle = a.cars[c].vehicle;
+    const RigidBody &chassis = w.body(vehicle.chassis_body_idx);
+    contacts = vehicle.num_wheel_contacts();
+    vehicle.scale_engine_force(i, contacts);
+    WheelImpulse &wi = sc.wheel_impulses[c][i];
+    wi.apply = false;
+    if (contacts > 0) {
+      vehicle.wheels[i].suspension_impulse(
+          chassis.world_trans.translation, consts::tick_time,
+          [&](Vec3A impulse, Vec3A rel_pos) {
+            chassis.linear_rel_pos_impulse_parts(impulse, rel_pos, true, wi.lin,
+                                                 wi.ang);
+            wi.apply = true;
+          });
+    }
+  }
+  lanes.barrier();
+  if (mine && i == 0 && contacts > 0) {
+    arena_apply_wheel_impulses(
+        sc, w.dyn_body(a.cars[c].vehicle.chassis_body_idx), c);
+  }
+  lanes.barrier();
+  if (mine && contacts > 0) {
+    WheelInfo &wheel = a.cars[c].vehicle.wheels[i];
+    const RigidBody &chassis = w.body(a.cars[c].vehicle.chassis_body_idx);
+    wheel.update_friction_impulse(chassis, consts::tick_time,
+                                  chassis.get_mass() / 3.0f);
+    WheelImpulse &wi = sc.wheel_impulses[c][i];
+    wi.apply = false;
+    wheel.friction_impulse(chassis.world_trans, consts::tick_time,
+                           [&](Vec3A impulse, Vec3A rel_pos) {
+                             chassis.linear_rel_pos_impulse_parts(
+                                 impulse, rel_pos, true, wi.lin, wi.ang);
+                             wi.apply = true;
+                           });
+  }
+  lanes.barrier();
+  if (mine && i == 0) {
+    if (contacts > 0) {
+      arena_apply_wheel_impulses(
+          sc, w.dyn_body(a.cars[c].vehicle.chassis_body_idx), c);
+    }
+    car_update_contact_state(a.cars[c], w);
+  }
+  lanes.barrier();
 }
 
 template <typename Lanes>
@@ -650,16 +735,23 @@ RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
     sc.car_plan = CarPhasePlan::Parallel;
   }
   lanes.barrier();
+  bool wheel_lanes = lanes.size >= k_num_wheels * a.num_cars;
+  bool per_wheel = sc.car_plan == CarPhasePlan::Parallel && wheel_lanes;
   if (sc.car_plan == CarPhasePlan::Parallel) {
     for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
       sc.was_on_ground[c] = a.cars[c].state.cache.is_on_ground;
-      car_pre_tick_update(a.cars[c], w, a.rng, st.mode, a.mutators, sc.rays[c]);
+      sc.vehicle_run[c] = car_pre_tick_update(
+          a.cars[c], w, a.rng, st.mode, a.mutators, sc.rays[c],
+          per_wheel ? &sc.real_throttle[c] : nullptr);
     }
   } else if (lanes.leader()) {
     arena_car_pre_ticks_in_order(
         st, a, sc.car_plan == CarPhasePlan::Precast ? &sc : nullptr);
   }
   lanes.barrier();
+  if (wheel_lanes) {
+    arena_tick_vehicle_wheels(a, sc, w, lanes, per_wheel);
+  }
   if (!lanes.leader() || sc.car_plan != CarPhasePlan::Parallel) {
     return;
   }
@@ -756,7 +848,7 @@ template <typename Lanes>
 RS_HD void arena_tick_pads(const ArenaStatic &st, Arena &a, StepScratch &sc,
                            const Lanes &lanes) {
   bool pads = arena_pads_active(st, a);
-  if (lanes.size == 1) {
+  if (!Lanes::k_cooperative || lanes.size == 1) {
     if (pads) {
       pad_update_membership(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
                             a.mutators.car_max_boost_amount, a.touched_pads);

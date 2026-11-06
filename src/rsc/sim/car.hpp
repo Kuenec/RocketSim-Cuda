@@ -760,9 +760,10 @@ RS_HD void car_apply_flip_zdamp_prepass(Car &car, World &w) {
   }
 }
 
-RS_HDN void car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
+RS_HDN bool car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
                                 const MutatorConfig &mut,
-                                const VehicleHit *precomputed_hits) {
+                                const VehicleHit *precomputed_hits,
+                                float *deferred_throttle) {
   using namespace consts;
   RigidBody &rb = w.dyn_body(car.rigid_body_idx);
   CarState &s = car.state;
@@ -773,7 +774,7 @@ RS_HDN void car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
     }
     rb.set_activation_state(ActivationState::DisableSimulation);
     rb.collision_flags |= k_flag_no_contact_response;
-    return;
+    return false;
   }
   rb.force_activate();
   rb.collision_flags =
@@ -815,9 +816,14 @@ RS_HDN void car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
   car_update_boost(car, rb, mut);
   float real_throttle =
       (s.controls.boost && s.boost > 0.0f) ? 1.0f : quant_throttle;
+  if (deferred_throttle) {
+    *deferred_throttle = real_throttle;
+    return true;
+  }
   car.vehicle.update(w, tick_time, s.handbrake_val, real_throttle,
                      car.info.config.three_wheels, precomputed_hits);
   car_update_contact_state(car, w);
+  return true;
 }
 
 RS_HDN void car_post_tick_update(Car &car, World &w) {

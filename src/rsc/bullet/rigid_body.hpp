@@ -286,14 +286,20 @@ struct RigidBody {
     apply_impulse_parts(v * scaler, Vec3A::zero(), accum);
   }
 
-  RS_HD void add_linear_rel_pos_impulse(Vec3A v, Vec3A rel_pos, bool massed,
-                                        bool accum) {
+  RS_HD void linear_rel_pos_impulse_parts(Vec3A v, Vec3A rel_pos, bool massed,
+                                          Vec3A &lin, Vec3A &ang) const {
     float scaler = massed ? inv_mass : 1.0f;
-    Vec3A lin = v * scaler;
-    Vec3A ang = inv_inertia_tensor_world * rel_pos.cross(v);
+    lin = v * scaler;
+    ang = inv_inertia_tensor_world * rel_pos.cross(v);
     if (!massed) {
       ang *= mass;
     }
+  }
+
+  RS_HD void add_linear_rel_pos_impulse(Vec3A v, Vec3A rel_pos, bool massed,
+                                        bool accum) {
+    Vec3A lin, ang;
+    linear_rel_pos_impulse_parts(v, rel_pos, massed, lin, ang);
     apply_impulse_parts(lin, ang, accum);
   }
 
