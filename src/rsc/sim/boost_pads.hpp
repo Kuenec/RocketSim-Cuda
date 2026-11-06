@@ -153,42 +153,49 @@ struct PadMembershipProcessor {
   }
 };
 
-RS_HDN bool pad_update_membership(const PadLayoutView &layout, PadState *pads,
-                                 PadUpdateScratch &sc, const Car *cars,
-                                 uint32_t num_cars, float max_boost) {
+RS_HD void pad_begin_update(PadUpdateScratch &sc, uint32_t num_cars) {
   for (uint32_t i = 0; i < num_cars; ++i) {
     sc.touching_pad_by_car[i] = -1;
   }
+}
+
+RS_HD void pad_recheck_touching(const PadLayoutView &layout, PadState *pads,
+                                PadUpdateScratch &sc, const Car *cars,
+                                uint32_t num_cars, uint32_t pad_idx) {
   constexpr float half_tick = 0.5f * consts::tick_time;
-  for (uint32_t pad_idx = 0; pad_idx < layout.num_pads; ++pad_idx) {
-    PadState &p = pads[pad_idx];
-    if (p.num_touching == 0) {
-      continue;
-    }
-    const BoostPadConfig &cfg = layout.configs[pad_idx];
-    float radius = pad_cyl_radius(cfg.is_big);
-    float box_radius = pad_box_radius(cfg.is_big);
-    uint32_t kept = 0;
-    for (uint32_t i = 0; i < p.num_touching; ++i) {
-      uint32_t idx = p.touching[i];
-      bool keep = false;
-      if (idx < num_cars) {
-        const Car &car = cars[idx];
-        if (!car.state.is_demoed && sc.touching_pad_by_car[idx] < 0) {
-          Vec3A car_pos = car.state.phys.pos - car.state.phys.vel * half_tick;
-          if (pad_overlaps_values(cfg.pos, radius, car_pos) ||
-              hitbox_overlaps_pad_box(cfg.pos, box_radius, car_pos, car)) {
-            sc.touching_pad_by_car[idx] = static_cast<int32_t>(pad_idx);
-            keep = true;
-          }
+  PadState &p = pads[pad_idx];
+  if (p.num_touching == 0) {
+    return;
+  }
+  const BoostPadConfig &cfg = layout.configs[pad_idx];
+  float radius = pad_cyl_radius(cfg.is_big);
+  float box_radius = pad_box_radius(cfg.is_big);
+  uint32_t kept = 0;
+  for (uint32_t i = 0; i < p.num_touching; ++i) {
+    uint32_t idx = p.touching[i];
+    bool keep = false;
+    if (idx < num_cars) {
+      const Car &car = cars[idx];
+      if (!car.state.is_demoed && sc.touching_pad_by_car[idx] < 0) {
+        Vec3A car_pos = car.state.phys.pos - car.state.phys.vel * half_tick;
+        if (pad_overlaps_values(cfg.pos, radius, car_pos) ||
+            hitbox_overlaps_pad_box(cfg.pos, box_radius, car_pos, car)) {
+          sc.touching_pad_by_car[idx] = static_cast<int32_t>(pad_idx);
+          keep = true;
         }
       }
-      if (keep) {
-        p.touching[kept++] = static_cast<uint8_t>(idx);
-      }
     }
-    p.num_touching = kept;
+    if (keep) {
+      p.touching[kept++] = static_cast<uint8_t>(idx);
+    }
   }
+  p.num_touching = kept;
+}
+
+RS_HD void pad_enter_touching(const PadLayoutView &layout, PadState *pads,
+                              PadUpdateScratch &sc, const Car *cars,
+                              uint32_t num_cars) {
+  constexpr float half_tick = 0.5f * consts::tick_time;
   for (uint32_t car_idx = 0; car_idx < num_cars; ++car_idx) {
     const Car &car = cars[car_idx];
     if (car.state.is_demoed || car.state.phys.pos.z > layout.max_pad_z) {
@@ -202,15 +209,29 @@ RS_HDN bool pad_update_membership(const PadLayoutView &layout, PadState *pads,
     PadMembershipProcessor proc{&layout, pads, &sc, car_idx, car_pos};
     layout.bvh.report_aabb_overlapping_node(proc, car_aabb);
   }
-  for (uint32_t pad_idx = 0; pad_idx < layout.num_pads; ++pad_idx) {
-    pad_refresh_winner(pads, sc, pad_idx, cars, num_cars, max_boost);
-  }
+}
+
+RS_HD bool pad_any_touching(const PadUpdateScratch &sc, uint32_t num_cars) {
   for (uint32_t i = 0; i < num_cars; ++i) {
     if (sc.touching_pad_by_car[i] >= 0) {
       return true;
     }
   }
   return false;
+}
+
+RS_HDN bool pad_update_membership(const PadLayoutView &layout, PadState *pads,
+                                  PadUpdateScratch &sc, const Car *cars,
+                                  uint32_t num_cars, float max_boost) {
+  pad_begin_update(sc, num_cars);
+  for (uint32_t pad_idx = 0; pad_idx < layout.num_pads; ++pad_idx) {
+    pad_recheck_touching(layout, pads, sc, cars, num_cars, pad_idx);
+  }
+  pad_enter_touching(layout, pads, sc, cars, num_cars);
+  for (uint32_t pad_idx = 0; pad_idx < layout.num_pads; ++pad_idx) {
+    pad_refresh_winner(pads, sc, pad_idx, cars, num_cars, max_boost);
+  }
+  return pad_any_touching(sc, num_cars);
 }
 
 RS_HD int32_t pad_maybe_give_car_boost(const PadLayoutView &layout,

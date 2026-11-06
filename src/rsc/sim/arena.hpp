@@ -75,6 +75,7 @@ struct Arena {
   MutatorConfig mutators;
   uint32_t num_pads;
   PadState pads[k_max_pads];
+  bool pad_lists_unchecked;
   bool has_tiles;
   TileStates tiles;
   uint32_t num_events;
@@ -693,31 +694,73 @@ RS_HD void arena_tick_contacts(const ArenaStatic &st, Arena &a,
   }
 }
 
-RS_HD void arena_tick_finish(const ArenaStatic &st, Arena &a, StepScratch &sc) {
-  using namespace consts;
-  World w = arena_world(st, a);
-  if (!a.ball_only) {
-    if (a.mutators.boost_pads_enabled && st.has_pads) {
-      bool any =
-          pad_update_membership(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
-                                a.mutators.car_max_boost_amount);
-      if (any) {
-        for (uint32_t c = 0; c < a.num_cars; ++c) {
-          int32_t pad = pad_maybe_give_car_boost(st.pads, a.pads, sc.pads,
-                                                 a.cars[c].state, a.mutators,
-                                                 a.tick_count, c);
-          if (pad >= 0) {
-            arena_push_event(a, ArenaEventKind::CarPickupBoost, c,
-                             static_cast<uint32_t>(pad), false, Vec3A::zero(),
-                             Vec3A::zero());
-            pad_refresh_winner(a.pads, sc.pads, static_cast<uint32_t>(pad),
-                               a.cars, a.num_cars,
-                               a.mutators.car_max_boost_amount);
-          }
-        }
+RS_HD bool arena_pads_active(const ArenaStatic &st, const Arena &a) {
+  return !a.ball_only && a.mutators.boost_pads_enabled && st.has_pads;
+}
+
+RS_HD void arena_give_pad_boosts(const ArenaStatic &st, Arena &a,
+                                 StepScratch &sc) {
+  a.pad_lists_unchecked = false;
+  if (!pad_any_touching(sc.pads, a.num_cars)) {
+    return;
+  }
+  for (uint32_t c = 0; c < a.num_cars; ++c) {
+    int32_t pad = pad_maybe_give_car_boost(
+        st.pads, a.pads, sc.pads, a.cars[c].state, a.mutators, a.tick_count, c);
+    if (pad >= 0) {
+      arena_push_event(a, ArenaEventKind::CarPickupBoost, c,
+                       static_cast<uint32_t>(pad), false, Vec3A::zero(),
+                       Vec3A::zero());
+      pad_refresh_winner(a.pads, sc.pads, static_cast<uint32_t>(pad), a.cars,
+                         a.num_cars, a.mutators.car_max_boost_amount);
+    }
+  }
+}
+
+RS_HD void arena_tick_pads(const ArenaStatic &st, Arena &a, StepScratch &sc,
+                           const LaneGroup &lanes) {
+  bool pads = arena_pads_active(st, a);
+  if (lanes.size == 1) {
+    if (pads) {
+      pad_update_membership(st.pads, a.pads, sc.pads, a.cars, a.num_cars,
+                            a.mutators.car_max_boost_amount);
+      arena_give_pad_boosts(st, a, sc);
+    }
+    return;
+  }
+  if (lanes.leader() && pads) {
+    pad_begin_update(sc.pads, a.num_cars);
+  }
+  lanes.barrier();
+  if (pads) {
+    uint32_t first = a.pad_lists_unchecked ? 0 : lanes.lane;
+    uint32_t stride = a.pad_lists_unchecked ? 1 : lanes.size;
+    if (!a.pad_lists_unchecked || lanes.leader()) {
+      for (uint32_t p = first; p < st.pads.num_pads; p += stride) {
+        pad_recheck_touching(st.pads, a.pads, sc.pads, a.cars, a.num_cars, p);
       }
     }
   }
+  lanes.barrier();
+  if (lanes.leader() && pads) {
+    pad_enter_touching(st.pads, a.pads, sc.pads, a.cars, a.num_cars);
+  }
+  lanes.barrier();
+  if (pads) {
+    for (uint32_t p = lanes.lane; p < st.pads.num_pads; p += lanes.size) {
+      pad_refresh_winner(a.pads, sc.pads, p, a.cars, a.num_cars,
+                         a.mutators.car_max_boost_amount);
+    }
+  }
+  lanes.barrier();
+  if (lanes.leader() && pads) {
+    arena_give_pad_boosts(st, a, sc);
+  }
+}
+
+RS_HD void arena_tick_finish(const ArenaStatic &st, Arena &a) {
+  using namespace consts;
+  World w = arena_world(st, a);
   ball_finish_physics_tick(a.ball, w.dyn_body(a.ball.rigid_body_idx));
   if (st.mode == GameMode::Dropshot &&
       a.ball.state.ds_info.has_last_damage_tick &&
@@ -819,8 +862,9 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
     car_finish_physics_tick(a.cars[c], w.dyn_body(a.cars[c].rigid_body_idx));
   }
   lanes.barrier();
+  arena_tick_pads(st, a, sc, lanes);
   if (lanes.leader()) {
-    arena_tick_finish(st, a, sc);
+    arena_tick_finish(st, a);
   }
   lanes.barrier();
 }
