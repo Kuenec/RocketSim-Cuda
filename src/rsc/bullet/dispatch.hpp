@@ -500,6 +500,9 @@ RS_HD void dispatch_apply_pairs(World &w, Callback &callback, uint32_t num_jobs,
   const GateJob *jobs = callback.gate_jobs();
   uint32_t next_job = 0;
   for (uint32_t i = 0; i < w.a->num_pairs; ++i) {
+    if (source == PlanSource::Precomputed && plans[i] == PairPlan::Skip) {
+      continue;
+    }
     BroadphasePair pair = w.a->pairs[i];
     const BroadphaseProxy &proxy0 = w.proxy(pair.proxy0);
     const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
