@@ -9,6 +9,24 @@
 
 namespace rsc {
 
+RS_HDI bool ray_filter_accepts(int ignore_obj_world_idx, uint8_t group,
+                               uint8_t mask, const BroadphaseProxy &p) {
+  if (ignore_obj_world_idx >= 0 &&
+      static_cast<uint32_t>(ignore_obj_world_idx) == p.client_obj_idx) {
+    return false;
+  }
+  return (p.collision_filter_group & mask) != 0 &&
+         (group & p.collision_filter_mask) != 0;
+}
+
+RS_HDI bool ray_hit_point(Vec3A from, Vec3A to, float hit_fraction,
+                          float min_hit_dist_sq, Vec3A &candidate) {
+  float s = 1.0f - hit_fraction;
+  candidate = s * from + hit_fraction * to;
+  return !(min_hit_dist_sq > 0.0f &&
+           (candidate - from).length_squared() < min_hit_dist_sq);
+}
+
 struct QuadRayResult {
   Vec4 closest_hit_fraction;
   int collision_obj_idx[4];
@@ -42,12 +60,8 @@ struct QuadRayResult {
   }
 
   RS_HD bool needs_collision(const BroadphaseProxy &p) const {
-    if (ignore_obj_world_idx >= 0 &&
-        static_cast<uint32_t>(ignore_obj_world_idx) == p.client_obj_idx) {
-      return false;
-    }
-    return (p.collision_filter_group & collision_filter_mask) != 0 &&
-           (collision_filter_group & p.collision_filter_mask) != 0;
+    return ray_filter_accepts(ignore_obj_world_idx, collision_filter_group,
+                              collision_filter_mask, p);
   }
 
   RS_HD void add_single_result(int obj_idx, Vec3A normal_world,
@@ -55,12 +69,9 @@ struct QuadRayResult {
     if (hit_fraction >= closest_hit_fraction[ray_idx]) {
       return;
     }
-    float s = 1.0f - hit_fraction;
-    Vec3A candidate =
-        s * ray_from_world[ray_idx] + hit_fraction * ray_to_world[ray_idx];
-    if (min_hit_dist_sq > 0.0f &&
-        (candidate - ray_from_world[ray_idx]).length_squared() <
-            min_hit_dist_sq) {
+    Vec3A candidate;
+    if (!ray_hit_point(ray_from_world[ray_idx], ray_to_world[ray_idx],
+                       hit_fraction, min_hit_dist_sq, candidate)) {
       return;
     }
     closest_hit_fraction[ray_idx] = hit_fraction;
@@ -69,6 +80,50 @@ struct QuadRayResult {
     hit_point_world[ray_idx] = candidate;
   }
 };
+
+template <typename Closest, typename Report>
+RS_HD void ray_triangle_visit(const TriangleShape &tri, Vec3A from, Vec3A to,
+                              float hf, float &lambda_max, Closest closest,
+                              Report report) {
+  constexpr float edge_tolerance = -0.0001f;
+  float dist = tri.points[0].dot(tri.normal);
+  float dist_a = tri.normal.dot(from) - dist;
+  float dist_b = tri.normal.dot(to) - dist;
+  if (dist_a * dist_b >= 0.0f) {
+    return;
+  }
+  float proj_length = dist_a - dist_b;
+  float distance = dist_a / proj_length;
+  if (distance >= hf) {
+    lambda_max = min_f32(lambda_max, hf);
+    return;
+  }
+  Vec3A point = from.lerp(to, distance);
+  Vec3A v0p = tri.points[0] - point;
+  Vec3A v1p = tri.points[1] - point;
+  Vec3A cp0 = v0p.cross(v1p);
+  if (cp0.dot(tri.normal) < edge_tolerance) {
+    return;
+  }
+  Vec3A v2p = tri.points[2] - point;
+  Vec3A cp1 = v1p.cross(v2p);
+  if (cp1.dot(tri.normal) < edge_tolerance) {
+    return;
+  }
+  Vec3A cp2 = v2p.cross(v0p);
+  if (cp2.dot(tri.normal) < edge_tolerance) {
+    return;
+  }
+  float prev = closest();
+  if (dist_a <= 0.0f) {
+    report(-tri.normal, distance);
+  } else {
+    report(tri.normal, distance);
+  }
+  if (closest() < prev) {
+    lambda_max = closest();
+  }
+}
 
 struct BridgeTriQuadRay {
   const Vec3A *to;
@@ -94,45 +149,12 @@ struct BridgeTriQuadRay {
 
   RS_HD void process_triangle(const TriangleShape &tri, float &lambda_max,
                               int ray_idx) {
-    constexpr float edge_tolerance = -0.0001f;
-    float dist = tri.points[0].dot(tri.normal);
-    float dist_a = tri.normal.dot(from[ray_idx]) - dist;
-    float dist_b = tri.normal.dot(to[ray_idx]) - dist;
-    if (dist_a * dist_b >= 0.0f) {
-      return;
-    }
-    float proj_length = dist_a - dist_b;
-    float distance = dist_a / proj_length;
-    float hf = hit_fraction[ray_idx];
-    if (distance >= hf) {
-      lambda_max = min_f32(lambda_max, hf);
-      return;
-    }
-    Vec3A point = from[ray_idx].lerp(to[ray_idx], distance);
-    Vec3A v0p = tri.points[0] - point;
-    Vec3A v1p = tri.points[1] - point;
-    Vec3A cp0 = v0p.cross(v1p);
-    if (cp0.dot(tri.normal) < edge_tolerance) {
-      return;
-    }
-    Vec3A v2p = tri.points[2] - point;
-    Vec3A cp1 = v1p.cross(v2p);
-    if (cp1.dot(tri.normal) < edge_tolerance) {
-      return;
-    }
-    Vec3A cp2 = v2p.cross(v0p);
-    if (cp2.dot(tri.normal) < edge_tolerance) {
-      return;
-    }
-    float prev = result->closest_hit_fraction[ray_idx];
-    if (dist_a <= 0.0f) {
-      internal_report_hit(-tri.normal, distance, ray_idx);
-    } else {
-      internal_report_hit(tri.normal, distance, ray_idx);
-    }
-    if (result->closest_hit_fraction[ray_idx] < prev) {
-      lambda_max = result->closest_hit_fraction[ray_idx];
-    }
+    ray_triangle_visit(
+        tri, from[ray_idx], to[ray_idx], hit_fraction[ray_idx], lambda_max,
+        [&] { return result->closest_hit_fraction[ray_idx]; },
+        [&](Vec3A normal, float distance) {
+          internal_report_hit(normal, distance, ray_idx);
+        });
   }
 
   RS_HD void process_node(uint32_t tri_idx, uint32_t mask, Vec4 &lambda_max) {
@@ -253,8 +275,9 @@ RS_HD bool solve_rounded_box(Vec3A source_l, Vec3A dir_l, float dist,
   return false;
 }
 
-RS_HD void compound_ray(const CompoundShape &cs, BridgeTriQuadRay &cb,
-                        Vec3A ray_source, Vec3A ray_target, int ray_idx) {
+template <typename Callback>
+RS_HD void compound_ray(const CompoundShape &cs, Callback &cb, Vec3A ray_source,
+                        Vec3A ray_target, int ray_idx) {
   Vec3A delta = ray_target - ray_source;
   float dist = delta.length();
   Vec3A dir = delta / dist;
@@ -343,6 +366,18 @@ struct SphereClosest {
 inline constexpr float k_slab_relative_slack = 1e-5f;
 inline constexpr float k_slab_absolute_slack = 1e-30f;
 
+RS_HD Aabb single_ray_node_cull(const Aabb &quad_aabb, Vec3A source,
+                                Vec3A target) {
+  if (!source.is_finite() || !target.is_finite()) {
+    return quad_aabb;
+  }
+  Vec3A slack = (target - source).abs() * k_slab_relative_slack +
+                Vec3A::splat(k_slab_absolute_slack);
+  Vec3A lo = source.min(target) - slack;
+  Vec3A hi = source.max(target) + slack;
+  return {lo.max(quad_aabb.min), hi.min(quad_aabb.max)};
+}
+
 RS_HD Aabb quad_ray_node_cull(const QuadRayInfo &ray_info,
                               uint8_t active_rays) {
   if (active_rays == 0 || (active_rays & (active_rays - 1)) != 0) {
@@ -352,16 +387,8 @@ RS_HD Aabb quad_ray_node_cull(const QuadRayInfo &ray_info,
   while ((active_rays & (1u << ray)) == 0) {
     ++ray;
   }
-  Vec3A source = ray_info.ray_sources[ray];
-  Vec3A target = ray_info.ray_targets[ray];
-  if (!source.is_finite() || !target.is_finite()) {
-    return ray_info.aabb;
-  }
-  Vec3A slack = (target - source).abs() * k_slab_relative_slack +
-                Vec3A::splat(k_slab_absolute_slack);
-  Vec3A lo = source.min(target) - slack;
-  Vec3A hi = source.max(target) + slack;
-  return {lo.max(ray_info.aabb.min), hi.min(ray_info.aabb.max)};
+  return single_ray_node_cull(ray_info.aabb, ray_info.ray_sources[ray],
+                              ray_info.ray_targets[ray]);
 }
 
 RS_HD void shape_quad_raycast(const World &w, const Shape &shape,
@@ -534,8 +561,12 @@ RS_HD void quad_ray_test_body(const World &w, const Vec3A *ray_from,
   shape_quad_raycast(w, co.shape, cb, ray_info);
 }
 
-RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
-                         const Vec3A *ray_to, QuadRayResult &result) {
+template <typename Filter>
+RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(const World &w,
+                                                  const Vec3A *ray_from,
+                                                  const Vec3A *ray_to,
+                                                  const Filter &filter,
+                                                  uint32_t *bodies) {
   const StaticWorldData &s = *w.s;
   Aabb ray_aabb{ray_from[0].min(ray_to[0]), ray_from[0].max(ray_to[0])};
   for (int i = 1; i < 4; ++i) {
@@ -579,7 +610,6 @@ RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
   }
   uint32_t seen_static[k_cell_mask_words] = {};
   uint32_t seen_dyn = 0;
-  uint32_t bodies[k_max_handles];
   uint32_t num_bodies = 0;
   for (int c = 0; c < num_cells; ++c) {
     const uint32_t *mask =
@@ -594,7 +624,7 @@ RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
         const BroadphaseProxy &p =
             s.static_proxies[m * 32 + lowest_set_bit(bits)];
         bits &= bits - 1;
-        if (ray_aabb.intersects(p.aabb) && result.needs_collision(p)) {
+        if (ray_aabb.intersects(p.aabb) && filter.needs_collision(p)) {
           bodies[num_bodies++] = p.client_obj_idx;
         }
       }
@@ -611,14 +641,227 @@ RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
         }
         seen_dyn |= bit;
       }
-      if (ray_aabb.intersects(p.aabb) && result.needs_collision(p)) {
+      if (ray_aabb.intersects(p.aabb) && filter.needs_collision(p)) {
         bodies[num_bodies++] = p.client_obj_idx;
       }
     }
   }
+  return num_bodies;
+}
+
+RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
+                         const Vec3A *ray_to, QuadRayResult &result) {
+  uint32_t bodies[k_max_handles];
+  uint32_t num_bodies = gather_ray_bodies(w, ray_from, ray_to, result, bodies);
   for (uint32_t k = 0; k < num_bodies; ++k) {
     quad_ray_test_body(w, ray_from, ray_to, w.body(bodies[k]),
                        static_cast<int>(bodies[k]), result);
+  }
+}
+
+struct SingleRay {
+  Vec3A from_world;
+  Vec3A to_world;
+  int ignore_obj_world_idx;
+  uint8_t collision_filter_group;
+  uint8_t collision_filter_mask;
+  float min_hit_dist_sq;
+  float closest_hit_fraction;
+  int collision_obj_idx;
+  Vec3A hit_normal_world;
+  Vec3A hit_point_world;
+
+  RS_HD bool needs_collision(const BroadphaseProxy &p) const {
+    return ray_filter_accepts(ignore_obj_world_idx, collision_filter_group,
+                              collision_filter_mask, p);
+  }
+
+  RS_HD void add_single_result(int obj_idx, Vec3A normal_world,
+                               float hit_fraction) {
+    if (hit_fraction >= closest_hit_fraction) {
+      return;
+    }
+    Vec3A candidate;
+    if (!ray_hit_point(from_world, to_world, hit_fraction, min_hit_dist_sq,
+                       candidate)) {
+      return;
+    }
+    closest_hit_fraction = hit_fraction;
+    hit_normal_world = normal_world;
+    collision_obj_idx = obj_idx;
+    hit_point_world = candidate;
+  }
+};
+
+struct BridgeTriSingleRay {
+  Vec3A from;
+  Vec3A to;
+  float hit_fraction;
+  const RigidBody *obj;
+  int obj_idx;
+  SingleRay *result;
+  const TriangleShape *tris;
+
+  RS_HD void internal_report_hit(Vec3A normal_local, float fraction) {
+    Vec3A normal_world = obj->world_trans.matrix3 * normal_local;
+    result->add_single_result(obj_idx, normal_world, fraction);
+  }
+
+  RS_HD void report_hit(Vec3A normal_local, float fraction, int) {
+    if (fraction >= hit_fraction) {
+      return;
+    }
+    internal_report_hit(normal_local, fraction);
+  }
+
+  RS_HD void process_node(uint32_t tri_idx, float &lambda_max) {
+    ray_triangle_visit(
+        tris[tri_idx], from, to, hit_fraction, lambda_max,
+        [&] { return result->closest_hit_fraction; },
+        [&](Vec3A normal, float distance) {
+          internal_report_hit(normal, distance);
+        });
+  }
+};
+
+RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
+                                const Vec3A *ray_to, int ray,
+                                const RigidBody &co, int obj_idx,
+                                SingleRay &result) {
+  Affine3A world_to_co = Affine3A::identity();
+  bool rotated = !(co.collision_flags & k_flag_identity_transform) &&
+                 !(co.collision_flags & k_flag_no_angular_motion);
+  if (rotated) {
+    world_to_co = co.world_trans.ext_transpose();
+  }
+  Vec3A from_local = Vec3A::zero();
+  Vec3A to_local = Vec3A::zero();
+  Aabb ray_aabb = Aabb::zero();
+  for (int i = 0; i < 4; ++i) {
+    Vec3A f = ray_from[i];
+    Vec3A t = ray_to[i];
+    if (rotated) {
+      f = world_to_co.transform_point3a(f);
+      t = world_to_co.transform_point3a(t);
+    } else if (co.collision_flags & k_flag_no_angular_motion &&
+               !(co.collision_flags & k_flag_identity_transform)) {
+      f = f - co.world_trans.translation;
+      t = t - co.world_trans.translation;
+    }
+    Aabb segment{f.min(t), f.max(t)};
+    if (i == 0) {
+      ray_aabb = segment;
+    } else {
+      ray_aabb += segment;
+    }
+    if (i == ray) {
+      from_local = f;
+      to_local = t;
+    }
+  }
+  BridgeTriSingleRay cb{from_local, to_local, result.closest_hit_fraction,
+                        &co,        obj_idx,  &result,
+                        nullptr};
+  const Shape &shape = co.shape;
+  switch (shape.kind) {
+  case ShapeKind::Compound: {
+    const CompoundShape &cs = shape.compound;
+    if (!ray_aabb.intersects(cs.local_aabb)) {
+      return;
+    }
+    SingleRayPack pack = single_ray_pack(from_local, to_local);
+    if (single_ray_slab(pack.origin, pack.inv_dir, cs.local_aabb,
+                        cb.hit_fraction)) {
+      compound_ray(cs, cb, from_local, to_local, ray);
+    }
+    return;
+  }
+  case ShapeKind::Sphere: {
+    float radius = shape.sphere.radius;
+    float radius_sq = radius * radius;
+    float cx = sse_min(sse_max(0.0f, sse_min(from_local.x, to_local.x)),
+                       sse_max(from_local.x, to_local.x));
+    float cy = sse_min(sse_max(0.0f, sse_min(from_local.y, to_local.y)),
+                       sse_max(from_local.y, to_local.y));
+    float cz = sse_min(sse_max(0.0f, sse_min(from_local.z, to_local.z)),
+                       sse_max(from_local.z, to_local.z));
+    float len_sq = cx * cx + cy * cy + cz * cz;
+    if (!(len_sq <= radius_sq)) {
+      return;
+    }
+    SphereClosest closest{&shape.sphere};
+    ConvexCastResult r;
+    if (calc_point_time_of_impact(from_local, to_local, closest, r)) {
+      cb.report_hit(r.normal, r.fraction, ray);
+    }
+    return;
+  }
+  case ShapeKind::StaticPlane: {
+    const StaticPlaneShape &plane = shape.plane;
+    if (!ray_aabb.intersects(plane.aabb_ident_cache)) {
+      return;
+    }
+    float dx = to_local.x - from_local.x;
+    float dy = to_local.y - from_local.y;
+    float dz = to_local.z - from_local.z;
+    Vec3A inv{1.0f / dx, 1.0f / dy, 1.0f / dz};
+    if (!single_ray_slab(from_local, inv, plane.aabb_ident_cache,
+                         cb.hit_fraction)) {
+      return;
+    }
+    float dist = sqrt_f32(dx * dx + dy * dy + dz * dz);
+    float inv_dist = 1.0f / dist;
+    Vec3A n = plane.plane_normal;
+    float dir_align =
+        dx * inv_dist * n.x + dy * inv_dist * n.y + dz * inv_dist * n.z;
+    if (!(abs_f32(dir_align) >= k_f32_epsilon)) {
+      return;
+    }
+    float normal_start =
+        from_local.x * n.x + from_local.y * n.y + from_local.z * n.z;
+    float tt = -normal_start / dir_align;
+    if (tt >= 0.0f && tt < dist) {
+      cb.report_hit(plane.plane_normal, tt / dist, ray);
+    }
+    return;
+  }
+  case ShapeKind::TriangleMesh: {
+    const MeshView &mesh = w.mesh(shape.mesh);
+    cb.tris = mesh.tris;
+    float lambda_max = cb.hit_fraction;
+    mesh.bvh.report_single_ray_overlapping_node(
+        cb, ray_aabb, from_local, to_local, lambda_max,
+        single_ray_node_cull(ray_aabb, from_local, to_local));
+    return;
+  }
+  case ShapeKind::ConvexHull: {
+    const ConvexHullShape &hull = shape.hull;
+    if (!ray_aabb.intersects(hull.local_aabb)) {
+      return;
+    }
+    SingleRayPack pack = single_ray_pack(from_local, to_local);
+    if (!single_ray_slab(pack.origin, pack.inv_dir, hull.local_aabb,
+                         cb.hit_fraction)) {
+      return;
+    }
+    ConvexShape cs = ConvexShape::hull_shape(w.hull_view(hull));
+    ConvexCastResult r;
+    if (calc_time_of_impact(cs, from_local, to_local, r)) {
+      cb.report_hit(r.normal, r.fraction, ray);
+    }
+    return;
+  }
+  }
+}
+
+RS_HD void single_grid_ray_test(const World &w, const Vec3A *ray_from,
+                                const Vec3A *ray_to, int ray,
+                                SingleRay &result) {
+  uint32_t bodies[k_max_handles];
+  uint32_t num_bodies = gather_ray_bodies(w, ray_from, ray_to, result, bodies);
+  for (uint32_t k = 0; k < num_bodies; ++k) {
+    single_ray_test_body(w, ray_from, ray_to, ray, w.body(bodies[k]),
+                         static_cast<int>(bodies[k]), result);
   }
 }
 

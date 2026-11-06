@@ -177,6 +177,35 @@ struct QuadRayPack {
   Vec4 inv_dirs[3];
 };
 
+struct SingleRayPack {
+  Vec3A origin;
+  Vec3A inv_dir;
+};
+
+RS_HDI SingleRayPack single_ray_pack(Vec3A source, Vec3A target) {
+  SingleRayPack pack{source, Vec3A::zero()};
+  for (int axis = 0; axis < 3; ++axis) {
+    float inv = 1.0f / (target[axis] - source[axis]);
+    pack.inv_dir[axis] = is_finite_f32(inv) ? inv : k_f32_max;
+  }
+  return pack;
+}
+
+RS_HDI bool single_ray_slab(Vec3A origin, Vec3A inv_dir, const Aabb &bounds,
+                            float lambda_max) {
+  float t0x = (bounds.min.x - origin.x) * inv_dir.x;
+  float t1x = (bounds.max.x - origin.x) * inv_dir.x;
+  float t0y = (bounds.min.y - origin.y) * inv_dir.y;
+  float t1y = (bounds.max.y - origin.y) * inv_dir.y;
+  float t0z = (bounds.min.z - origin.z) * inv_dir.z;
+  float t1z = (bounds.max.z - origin.z) * inv_dir.z;
+  float t_enter = sse_max(sse_max(sse_min(t0x, t1x), sse_min(t0y, t1y)),
+                          sse_min(t0z, t1z));
+  float t_exit = sse_min(sse_min(sse_max(t0x, t1x), sse_max(t0y, t1y)),
+                         sse_max(t0z, t1z));
+  return t_enter <= t_exit && t_exit >= 0.0f && t_enter <= lambda_max;
+}
+
 struct QuadRayInfo {
   const Vec3A *ray_sources;
   const Vec3A *ray_targets;

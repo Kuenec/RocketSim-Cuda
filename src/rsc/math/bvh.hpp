@@ -104,6 +104,46 @@ struct BvhView {
   }
 
   template <typename F>
+  RS_HD void report_single_ray_overlapping_node(F &callback,
+                                                const Aabb &ray_aabb,
+                                                Vec3A source, Vec3A target,
+                                                float &lambda_max,
+                                                const Aabb &node_cull) const {
+    if (!ray_aabb.intersects(aabb)) {
+      return;
+    }
+    uint32_t stack[k_bvh_stack_size];
+    stack[0] = 0;
+    int stack_len = 1;
+    bool have_pack = false;
+    SingleRayPack pack;
+    while (stack_len != 0) {
+      --stack_len;
+      uint32_t work = stack[stack_len];
+      if (work & k_bvh_leaf_bit) {
+        const BvhWideLeaf &leaf = leaves[work & ~k_bvh_leaf_bit];
+        if (!have_pack) {
+          pack = single_ray_pack(source, target);
+          have_pack = true;
+        }
+        if (single_ray_slab(pack.origin, pack.inv_dir, leaf.bounds,
+                            lambda_max)) {
+          callback.process_node(leaf.leaf_idx, lambda_max);
+        }
+        continue;
+      }
+      const BvhWideNode &node = nodes[work];
+      uint32_t mask = node.intersection_mask(node_cull);
+      for (int lane = static_cast<int>(node.child_count) - 1; lane >= 0;
+           --lane) {
+        if (mask & (1u << lane)) {
+          stack[stack_len++] = node.children[lane];
+        }
+      }
+    }
+  }
+
+  template <typename F>
   RS_HD void report_quad_ray_overlapping_node(F &callback,
                                               QuadRayInfo &ray_info,
                                               const Aabb &node_cull) const {

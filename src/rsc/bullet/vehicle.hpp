@@ -383,18 +383,23 @@ struct VehicleRL {
     return r;
   }
 
-  RS_HD static VehicleHit ray_hit(const World &w, const QuadRayResult &r,
-                                  int i) {
+  RS_HD static VehicleHit vehicle_hit(const World &w, int idx, Vec3A point,
+                                      Vec3A normal) {
     VehicleHit hit;
     hit.valid = false;
-    int idx = r.collision_obj_idx[i];
     if (idx >= 0 && w.has_contact_response(static_cast<uint32_t>(idx))) {
       hit.valid = true;
       hit.body_idx = static_cast<uint32_t>(idx);
-      hit.point = r.hit_point_world[i];
-      hit.normal = r.hit_normal_world[i].normalize_or_zero();
+      hit.point = point;
+      hit.normal = normal.normalize_or_zero();
     }
     return hit;
+  }
+
+  RS_HD static VehicleHit ray_hit(const World &w, const QuadRayResult &r,
+                                  int i) {
+    return vehicle_hit(w, r.collision_obj_idx[i], r.hit_point_world[i],
+                       r.hit_normal_world[i]);
   }
 
   RS_HD void cast_rays(const World &w, const Vec3A *from, const Vec3A *to,
@@ -538,9 +543,19 @@ struct VehicleRL {
     for (int i = 0; i < k_num_wheels; ++i) {
       wheels[i].ray_endpoints(trans, sources[i], targets[i]);
     }
-    QuadRayResult r =
-        cast_quad(w, sources, targets, static_cast<uint8_t>(1u << wheel));
-    hit = ray_hit(w, r, wheel);
+    SingleRay r{sources[wheel],
+                targets[wheel],
+                static_cast<int>(chassis_body_idx),
+                static_cast<uint8_t>(k_group_default | k_group_dropshot_floor),
+                static_cast<uint8_t>(k_group_all),
+                min_hit_dist_sq,
+                1.0f,
+                -1,
+                Vec3A::zero(),
+                Vec3A::zero()};
+    single_grid_ray_test(w, sources, targets, wheel, r);
+    hit = vehicle_hit(w, r.collision_obj_idx, r.hit_point_world,
+                      r.hit_normal_world);
   }
 
   RS_HDI void wheel_contact(World &w, const Affine3A &trans, int i,

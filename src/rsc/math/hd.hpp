@@ -17,8 +17,10 @@
 
 #ifdef __CUDA_ARCH__
 #define RS_NO_UNROLL _Pragma("unroll 1")
+#define RS_HOST_NOINLINE
 #else
 #define RS_NO_UNROLL
+#define RS_HOST_NOINLINE __attribute__((noinline))
 #endif
 
 namespace rsc {
