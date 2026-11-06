@@ -86,7 +86,13 @@ __global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
   if (i >= num_arenas) {
     return;
   }
-  LaneGroup lanes{thread % lanes_per_arena, lanes_per_arena, live};
+  uint32_t team_lane = threadIdx.x % 32;
+  LaneGroup lanes{thread % lanes_per_arena,
+                  lanes_per_arena,
+                  live,
+                  team_lane,
+                  static_cast<uint32_t>(__popc(live)),
+                  scratch + (thread - team_lane) / lanes_per_arena};
   Arena &a = arenas[i];
   if (lanes.leader()) {
     a.counters = ArenaEventCounters{};

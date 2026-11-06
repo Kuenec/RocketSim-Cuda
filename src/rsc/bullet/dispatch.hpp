@@ -436,24 +436,17 @@ RS_HD uint32_t dispatch_collect_jobs(const World &w, Callback &callback) {
   return num_jobs;
 }
 
-template <typename Callback>
-RS_HD void dispatch_test_triangles(Callback &callback, uint32_t first,
-                                   uint32_t stride) {
-  const GateJob *jobs = callback.gate_jobs();
-  GateItems &items = callback.gate_items();
-  for (uint32_t k = first; k < items.count; k += stride) {
-    const GateJob &job = jobs[items.job[k]];
-    const TriangleShape &tri = job.tris[items.tri_idx[k]];
-    items.hit[k] = false;
-    if (!gate_triangle_overlaps(job.params, tri)) {
-      continue;
-    }
-    GateTriangle t =
-        gate_triangle_in_box(job.mesh_to_box, tri, items.tri_idx[k]);
-    gate_triangle_sat(job.params, t);
-    items.hit[k] = t.hit;
-    items.contact[k] = t.contact;
+RS_HD void gate_test_item(const GateJob *jobs, GateItems &items, uint32_t k) {
+  const GateJob &job = jobs[items.job[k]];
+  const TriangleShape &tri = job.tris[items.tri_idx[k]];
+  items.hit[k] = false;
+  if (!gate_triangle_overlaps(job.params, tri)) {
+    return;
   }
+  GateTriangle t = gate_triangle_in_box(job.mesh_to_box, tri, items.tri_idx[k]);
+  gate_triangle_sat(job.params, t);
+  items.hit[k] = t.hit;
+  items.contact[k] = t.contact;
 }
 
 template <typename Callback>

@@ -111,12 +111,19 @@ struct WorldNormalGroup {
 
 enum class CarPhasePlan : uint8_t { Sequential, Precast, Parallel };
 
+struct StepScratch;
+
 struct LaneGroup {
   uint32_t lane;
   uint32_t size;
   uint32_t team_mask;
+  uint32_t team_lane;
+  uint32_t team_size;
+  StepScratch *team_scratch;
 
-  RS_HDI static LaneGroup single() { return {0, 1, 1}; }
+  RS_HDI static LaneGroup single(StepScratch &sc) {
+    return {0, 1, 1, 0, 1, &sc};
+  }
   RS_HDI bool leader() const { return lane == 0; }
   RS_HDI void barrier() const {
 #ifdef __CUDA_ARCH__
@@ -725,6 +732,25 @@ RS_HD void arena_tick_finish(const ArenaStatic &st, Arena &a, StepScratch &sc) {
   }
 }
 
+inline constexpr uint32_t k_max_team_groups = 32;
+
+RS_HD void arena_test_team_triangles(const LaneGroup &lanes) {
+  uint32_t groups = lanes.team_size / lanes.size;
+  uint32_t prefix[k_max_team_groups + 1];
+  prefix[0] = 0;
+  for (uint32_t g = 0; g < groups; ++g) {
+    prefix[g + 1] = prefix[g] + lanes.team_scratch[g].gate_items.count;
+  }
+  uint32_t group = 0;
+  for (uint32_t k = lanes.team_lane; k < prefix[groups]; k += lanes.team_size) {
+    while (k >= prefix[group + 1]) {
+      ++group;
+    }
+    StepScratch &gs = lanes.team_scratch[group];
+    gate_test_item(gs.gate_jobs, gs.gate_items, k - prefix[group]);
+  }
+}
+
 RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
                            const LaneGroup &lanes) {
   using namespace consts;
@@ -768,7 +794,7 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
       sc.num_gate_jobs = dispatch_collect_jobs(w, tracker);
     }
     lanes.barrier();
-    dispatch_test_triangles(tracker, lanes.lane, lanes.size);
+    arena_test_team_triangles(lanes);
     lanes.barrier();
     dispatch_compute_jobs(w, tracker, sc.num_gate_jobs, lanes.lane, lanes.size);
     lanes.barrier();
