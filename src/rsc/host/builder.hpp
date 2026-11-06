@@ -77,8 +77,7 @@ public:
   std::vector<MeshView> mesh_views;
   std::vector<const BvhStorage *> mesh_bvhs;
   std::vector<Vec3A> hull_points;
-  std::vector<uint32_t> cell_offsets;
-  std::vector<uint16_t> cell_handles;
+  std::vector<uint32_t> cell_masks;
   std::vector<BoostPadConfig> pad_configs;
   std::vector<Aabb> pad_aabbs;
   BvhStorage pad_bvh;

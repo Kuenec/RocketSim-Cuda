@@ -13,6 +13,7 @@ inline constexpr int k_max_cars = 8;
 inline constexpr int k_max_dyn_bodies = 1 + k_max_cars;
 inline constexpr int k_max_static_bodies = 160;
 inline constexpr int k_max_handles = k_max_static_bodies + k_max_dyn_bodies + 1;
+inline constexpr int k_cell_mask_words = (k_max_static_bodies + 31) / 32;
 inline constexpr int k_max_edges = 2 * k_max_handles + 2;
 inline constexpr int k_max_pairs = 256;
 inline constexpr int k_max_manifolds = 128;
@@ -73,8 +74,8 @@ struct StaticWorldData {
   float cell_size;
   float cell_size_sq;
   uint32_t num_cells[3];
-  const uint32_t *cell_static_offsets;
-  const uint16_t *cell_static_handles;
+  uint32_t cell_mask_words;
+  const uint32_t *cell_static_masks;
   const float *sin_table;
 };
 

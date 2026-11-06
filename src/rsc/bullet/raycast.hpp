@@ -577,39 +577,40 @@ RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
     dyn_order[pos] = handle;
     ++num_dyn;
   }
-  uint32_t seen[k_max_handles];
-  uint32_t num_seen = 0;
+  uint32_t seen_static[k_cell_mask_words] = {};
+  uint32_t seen_dyn = 0;
   uint32_t bodies[k_max_handles];
   uint32_t num_bodies = 0;
   for (int c = 0; c < num_cells; ++c) {
-    uint32_t cell = cell_idxs[c];
-    uint32_t begin = s.cell_static_offsets[cell];
-    uint32_t end = s.cell_static_offsets[cell + 1];
-    uint32_t total = (end - begin) + num_dyn;
-    for (uint32_t k = 0; k < total; ++k) {
-      uint32_t handle;
-      if (k < end - begin) {
-        handle = s.cell_static_handles[begin + k];
-      } else {
-        handle = dyn_order[k - (end - begin)];
-        if (!grid_dyn_in_cell(w.proxy(handle), cell_coords[c])) {
-          continue;
+    const uint32_t *mask =
+        s.cell_static_masks + cell_idxs[c] * s.cell_mask_words;
+    for (uint32_t m = 0; m < s.cell_mask_words; ++m) {
+      uint32_t bits = mask[m];
+      if (num_cells > 1) {
+        bits &= ~seen_static[m];
+        seen_static[m] |= bits;
+      }
+      while (bits != 0) {
+        const BroadphaseProxy &p =
+            s.static_proxies[m * 32 + lowest_set_bit(bits)];
+        bits &= bits - 1;
+        if (ray_aabb.intersects(p.aabb) && result.needs_collision(p)) {
+          bodies[num_bodies++] = p.client_obj_idx;
         }
+      }
+    }
+    for (uint32_t d = 0; d < num_dyn; ++d) {
+      const BroadphaseProxy &p = w.proxy(dyn_order[d]);
+      if (!grid_dyn_in_cell(p, cell_coords[c])) {
+        continue;
       }
       if (num_cells > 1) {
-        bool dup = false;
-        for (uint32_t q = 0; q < num_seen; ++q) {
-          if (seen[q] == handle) {
-            dup = true;
-            break;
-          }
-        }
-        if (dup) {
+        uint32_t bit = 1u << (dyn_order[d] - s.num_static_bodies - 1);
+        if (seen_dyn & bit) {
           continue;
         }
-        seen[num_seen++] = handle;
+        seen_dyn |= bit;
       }
-      const BroadphaseProxy &p = w.proxy(handle);
       if (ray_aabb.intersects(p.aabb) && result.needs_collision(p)) {
         bodies[num_bodies++] = p.client_obj_idx;
       }

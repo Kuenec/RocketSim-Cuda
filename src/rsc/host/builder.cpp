@@ -1008,15 +1008,15 @@ void HostStatic::build_grid() {
       }
     }
   }
-  cell_offsets.assign(total + 1, 0);
-  cell_handles.clear();
+  sw.cell_mask_words = (sw.num_static_bodies + 31) / 32;
+  cell_masks.assign(total * sw.cell_mask_words, 0);
   for (uint64_t c = 0; c < total; ++c) {
-    cell_offsets[c] = static_cast<uint32_t>(cell_handles.size());
-    cell_handles.insert(cell_handles.end(), cells[c].begin(), cells[c].end());
+    for (uint16_t handle : cells[c]) {
+      uint32_t bit = handle - 1u;
+      cell_masks[c * sw.cell_mask_words + bit / 32] |= 1u << (bit % 32);
+    }
   }
-  cell_offsets[total] = static_cast<uint32_t>(cell_handles.size());
-  sw.cell_static_offsets = cell_offsets.data();
-  sw.cell_static_handles = cell_handles.data();
+  sw.cell_static_masks = cell_masks.data();
 }
 
 void HostStatic::build_pads() {

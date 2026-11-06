@@ -237,8 +237,7 @@ struct CudaBatch::Impl {
   DeviceArray<RigidBody> static_bodies;
   DeviceArray<BroadphaseProxy> static_proxies;
   DeviceArray<Vec3A> hull_points;
-  DeviceArray<uint32_t> cell_offsets;
-  DeviceArray<uint16_t> cell_handles;
+  DeviceArray<uint32_t> cell_masks;
   DeviceArray<float> sin_table;
   DeviceArray<BoostPadConfig> pad_configs;
   DeviceArray<Aabb> pad_aabbs;
@@ -345,15 +344,13 @@ struct CudaBatch::Impl {
     static_bodies.upload(st.static_bodies.data(), st.static_bodies.size());
     static_proxies.upload(st.static_proxies.data(), st.static_proxies.size());
     hull_points.upload(st.hull_points.data(), st.hull_points.size());
-    cell_offsets.upload(st.cell_offsets.data(), st.cell_offsets.size());
-    cell_handles.upload(st.cell_handles.data(), st.cell_handles.size());
+    cell_masks.upload(st.cell_masks.data(), st.cell_masks.size());
     sin_table.upload(st.sin_table.data(), st.sin_table.size());
     view.world.meshes = mesh_views.get();
     view.world.static_bodies = static_bodies.get();
     view.world.static_proxies = static_proxies.get();
     view.world.hull_points = hull_points.get();
-    view.world.cell_static_offsets = cell_offsets.get();
-    view.world.cell_static_handles = cell_handles.get();
+    view.world.cell_static_masks = cell_masks.get();
     view.world.sin_table = sin_table.get();
     if (view.has_pads) {
       pad_configs.upload(st.pad_configs.data(), st.pad_configs.size());
