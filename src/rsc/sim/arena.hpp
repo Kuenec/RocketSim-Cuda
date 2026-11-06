@@ -115,18 +115,51 @@ enum class CarPhasePlan : uint8_t { Sequential, Precast, Parallel };
 
 struct StepScratch;
 
+inline constexpr uint32_t k_team_sat_slots = 16;
+
+struct TeamSatSlot {
+  uint32_t group;
+  uint32_t item;
+  Vec3A half;
+  Vec3A q[3];
+  SatSweepState state;
+};
+
+struct TeamSatScratch {
+  TeamSatSlot slots[k_team_sat_slots];
+  sat::CandidatePair pairs[k_team_sat_slots][sat::k_sat_candidates];
+};
+
+struct SingleLane {
+  static constexpr bool k_cooperative = false;
+  static constexpr uint32_t lane = 0;
+  static constexpr uint32_t size = 1;
+
+  RS_HDI static constexpr bool leader() { return true; }
+  RS_HDI static void barrier() {}
+};
+
 struct LaneGroup {
+  static constexpr bool k_cooperative = true;
   uint32_t lane;
   uint32_t size;
   uint32_t team_mask;
   uint32_t team_lane;
   uint32_t team_size;
   StepScratch *team_scratch;
+  TeamSatScratch *team_sat;
 
-  RS_HDI static LaneGroup single(StepScratch &sc) {
-    return {0, 1, 1, 0, 1, &sc};
-  }
   RS_HDI bool leader() const { return lane == 0; }
+  RS_HDI uint32_t team_ballot(bool pred) const {
+#ifdef __CUDA_ARCH__
+    return __ballot_sync(team_mask, pred);
+#else
+    return pred ? 1u : 0u;
+#endif
+  }
+  RS_HDI uint32_t team_rank(uint32_t ballot) const {
+    return popcount32(ballot & ((1u << team_lane) - 1u));
+  }
   RS_HDI void barrier() const {
 #ifdef __CUDA_ARCH__
     if (size > 1) {
@@ -584,8 +617,9 @@ RS_HD bool arena_rays_hit_static_only(const ArenaStatic &st, Arena &a,
   return true;
 }
 
+template <typename Lanes>
 RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
-                           const LaneGroup &lanes) {
+                           const Lanes &lanes) {
   if (lanes.size == 1) {
     arena_car_pre_ticks_in_order(st, a, nullptr);
     return;
@@ -718,8 +752,9 @@ RS_HD void arena_give_pad_boosts(const ArenaStatic &st, Arena &a,
   }
 }
 
+template <typename Lanes>
 RS_HD void arena_tick_pads(const ArenaStatic &st, Arena &a, StepScratch &sc,
-                           const LaneGroup &lanes) {
+                           const Lanes &lanes) {
   bool pads = arena_pads_active(st, a);
   if (lanes.size == 1) {
     if (pads) {
@@ -794,18 +829,60 @@ RS_HD void arena_test_team_triangles(const LaneGroup &lanes) {
   for (uint32_t g = 0; g < groups; ++g) {
     prefix[g + 1] = prefix[g] + lanes.team_scratch[g].gate_items.count;
   }
+  uint32_t total = prefix[groups];
+  TeamSatScratch &ts = *lanes.team_sat;
+  uint32_t claimed = 0;
   uint32_t group = 0;
-  for (uint32_t k = lanes.team_lane; k < prefix[groups]; k += lanes.team_size) {
-    while (k >= prefix[group + 1]) {
-      ++group;
+  for (uint32_t base = 0; base < total; base += lanes.team_size) {
+    uint32_t k = base + lanes.team_lane;
+    bool needs_pairs = false;
+    uint32_t item = 0;
+    Vec3A q[3];
+    SatSweepState state;
+    if (k < total) {
+      while (k >= prefix[group + 1]) {
+        ++group;
+      }
+      item = k - prefix[group];
+      StepScratch &gs = lanes.team_scratch[group];
+      needs_pairs =
+          gate_test_item_begin(gs.gate_jobs, gs.gate_items, item, q, state);
     }
-    StepScratch &gs = lanes.team_scratch[group];
-    gate_test_item(gs.gate_jobs, gs.gate_items, k - prefix[group]);
+    uint32_t ballot = lanes.team_ballot(needs_pairs);
+    if (needs_pairs) {
+      uint32_t slot = claimed + lanes.team_rank(ballot);
+      StepScratch &gs = lanes.team_scratch[group];
+      if (slot < k_team_sat_slots) {
+        Vec3A half = gs.gate_jobs[gs.gate_items.job[item]].params.half;
+        ts.slots[slot] = {group, item, half, {q[0], q[1], q[2]}, state};
+      } else {
+        gate_test_item_serial_finish(gs.gate_jobs, gs.gate_items, item, q,
+                                     state);
+      }
+    }
+    claimed += popcount32(ballot);
+  }
+  uint32_t used = claimed < k_team_sat_slots ? claimed : k_team_sat_slots;
+  lanes.barrier();
+  for (uint32_t u = lanes.team_lane; u < used * sat::k_sat_candidates;
+       u += lanes.team_size) {
+    const TeamSatSlot &s = ts.slots[u / sat::k_sat_candidates];
+    int p = static_cast<int>(u % sat::k_sat_candidates);
+    ts.pairs[u / sat::k_sat_candidates][p] =
+        sat::sat_candidate_pair(s.half, s.q, s.state.edges, p);
+  }
+  lanes.barrier();
+  for (uint32_t e = lanes.team_lane; e < used; e += lanes.team_size) {
+    const TeamSatSlot &s = ts.slots[e];
+    StepScratch &gs = lanes.team_scratch[s.group];
+    gate_test_item_finish(gs.gate_jobs, gs.gate_items, s.item, s.q, s.state,
+                          ts.pairs[e]);
   }
 }
 
+template <typename Lanes>
 RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
-                           const LaneGroup &lanes) {
+                           const Lanes &lanes) {
   using namespace consts;
   World w = arena_world(st, a);
   if (lanes.leader()) {
@@ -839,20 +916,24 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
   }
   lanes.barrier();
   PlanSource plans = PlanSource::Inline;
-  if (lanes.size > 1) {
-    plans = PlanSource::Precomputed;
-    dispatch_plan_pairs(w, tracker, lanes.lane, lanes.size);
-    lanes.barrier();
-    if (lanes.leader()) {
-      sc.num_gate_jobs = dispatch_collect_jobs(w, tracker);
-    }
-    lanes.barrier();
-    arena_test_team_triangles(lanes);
-    lanes.barrier();
-    dispatch_compute_jobs(w, tracker, sc.num_gate_jobs, lanes.lane, lanes.size);
-    lanes.barrier();
-  } else {
+  if (lanes.leader()) {
     sc.num_gate_jobs = 0;
+  }
+  if constexpr (Lanes::k_cooperative) {
+    if (lanes.size > 1) {
+      plans = PlanSource::Precomputed;
+      dispatch_plan_pairs(w, tracker, lanes.lane, lanes.size);
+      lanes.barrier();
+      if (lanes.leader()) {
+        sc.num_gate_jobs = dispatch_collect_jobs(w, tracker);
+      }
+      lanes.barrier();
+      arena_test_team_triangles(lanes);
+      lanes.barrier();
+      dispatch_compute_jobs(w, tracker, sc.num_gate_jobs, lanes.lane,
+                            lanes.size);
+      lanes.barrier();
+    }
   }
   if (lanes.leader()) {
     dispatch_apply_pairs(w, tracker, sc.num_gate_jobs, plans);

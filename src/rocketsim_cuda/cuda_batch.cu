@@ -77,8 +77,9 @@ struct DeviceMesh {
 };
 
 __global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
-                            StepScratch *scratch, uint32_t num_arenas,
-                            uint32_t lanes_per_arena, uint32_t ticks) {
+                            StepScratch *scratch, TeamSatScratch *team_sat,
+                            uint32_t num_arenas, uint32_t lanes_per_arena,
+                            uint32_t ticks) {
   uint32_t thread = blockIdx.x * blockDim.x + threadIdx.x;
   uint32_t i = thread / lanes_per_arena;
   uint32_t live = __ballot_sync(__activemask(), i < num_arenas);
@@ -91,7 +92,9 @@ __global__ void step_kernel(const ArenaStatic *__restrict__ st, Arena *arenas,
                   live,
                   team_lane,
                   static_cast<uint32_t>(__popc(live)),
-                  scratch + (thread - team_lane) / lanes_per_arena};
+                  scratch + (thread - team_lane) / lanes_per_arena,
+                  team_sat + blockIdx.x * ((blockDim.x + 31) / 32) +
+                      threadIdx.x / 32};
   Arena &a = arenas[i];
   if (lanes.leader()) {
     a.counters = ArenaEventCounters{};
@@ -180,6 +183,7 @@ struct CudaBatch::Impl {
   DeviceArray<BvhWideLeaf> pad_leaves;
   DeviceArray<Arena> arenas;
   DeviceArray<StepScratch> scratch;
+  DeviceArray<TeamSatScratch> team_sat;
   DeviceArray<rocketsim_cuda::CarControls> controls;
   size_t controls_capacity = 0;
   DeviceArray<uint8_t> mask;
@@ -288,6 +292,7 @@ struct CudaBatch::Impl {
       block_size *= 2;
     }
     blocks = (threads + block_size - 1) / block_size;
+    team_sat.allocate(blocks * ((block_size + 31) / 32));
   }
 
   ~Impl() {
@@ -458,7 +463,7 @@ void CudaBatch::step(uint32_t ticks) {
   }
   step_kernel<<<impl_->blocks, impl_->block_size, 0, impl_->stream>>>(
       impl_->device_view.get(), impl_->arenas.get(), impl_->scratch.get(),
-      impl_->num_arenas, impl_->lanes_per_arena, ticks);
+      impl_->team_sat.get(), impl_->num_arenas, impl_->lanes_per_arena, ticks);
   check(cudaGetLastError(), "step kernel launch");
 }
 

@@ -195,7 +195,7 @@ private:
         a.counters = rsc::ArenaEventCounters{};
         for (uint32_t t = 0; t < job.ticks; ++t) {
           rsc::arena_step_tick(pool.view_, a, *pool.scratch_[worker],
-                               rsc::LaneGroup::single(*pool.scratch_[worker]));
+                               rsc::SingleLane{});
         }
       }
     }

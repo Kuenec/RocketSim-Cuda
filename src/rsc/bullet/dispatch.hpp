@@ -436,17 +436,52 @@ RS_HD uint32_t dispatch_collect_jobs(const World &w, Callback &callback) {
   return num_jobs;
 }
 
-RS_HD void gate_test_item(const GateJob *jobs, GateItems &items, uint32_t k) {
+RS_HD bool gate_test_item_begin(const GateJob *jobs, GateItems &items,
+                                uint32_t k, Vec3A *q, SatSweepState &state) {
   const GateJob &job = jobs[items.job[k]];
   const TriangleShape &tri = job.tris[items.tri_idx[k]];
   items.hit[k] = false;
   if (!gate_triangle_overlaps(job.params, tri)) {
-    return;
+    return false;
   }
   GateTriangle t = gate_triangle_in_box(job.mesh_to_box, tri, items.tri_idx[k]);
-  gate_triangle_sat(job.params, t);
-  items.hit[k] = t.hit;
-  items.contact[k] = t.contact;
+  const GateMeshParams &p = job.params;
+  SatStage stage =
+      box_triangle_sat_stage(p.box_trans, p.half, p.margin, t.q,
+                             p.maximum_distance, &state, t.contact);
+  if (stage == SatStage::NeedsPairs) {
+    q[0] = t.q[0];
+    q[1] = t.q[1];
+    q[2] = t.q[2];
+    return true;
+  }
+  if (stage == SatStage::Hit) {
+    items.hit[k] = true;
+    items.contact[k] = t.contact;
+  }
+  return false;
+}
+
+RS_HD void gate_test_item_finish(const GateJob *jobs, GateItems &items,
+                                 uint32_t k, const Vec3A *q,
+                                 const SatSweepState &state,
+                                 const sat::CandidatePair *pairs) {
+  const GateMeshParams &p = jobs[items.job[k]].params;
+  BoxTriangleSatContact contact;
+  if (box_triangle_sat_finish(p.box_trans, p.half, p.margin, q,
+                              p.maximum_distance, state, pairs, contact)) {
+    items.hit[k] = true;
+    items.contact[k] = contact;
+  }
+}
+
+RS_HDN void gate_test_item_serial_finish(const GateJob *jobs, GateItems &items,
+                                         uint32_t k, const Vec3A *q,
+                                         const SatSweepState &state) {
+  sat::CandidatePair pairs[sat::k_sat_candidates];
+  sat::enum_aabb_triangle_pairs(jobs[items.job[k]].params.half, q, state.edges,
+                                pairs);
+  gate_test_item_finish(jobs, items, k, q, state, pairs);
 }
 
 template <typename Callback>

@@ -101,6 +101,14 @@ RS_HDI uint32_t lowest_set_bit(uint64_t x) {
 #endif
 }
 
+RS_HDI uint32_t popcount32(uint32_t x) {
+#ifdef __CUDA_ARCH__
+  return static_cast<uint32_t>(__popc(x));
+#else
+  return static_cast<uint32_t>(std::popcount(x));
+#endif
+}
+
 RS_HDI bool is_finite_f32(float x) {
   return (f32_to_u32(x) & 0x7fffffffu) < 0x7f800000u;
 }

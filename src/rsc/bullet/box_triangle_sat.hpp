@@ -595,52 +595,98 @@ RS_HDN void tri_edge_vs_box_edge_precomp(Vec3A tri_p, Vec3A tri_d, float tri_a,
   point_box = box_p0 + d2 * t;
 }
 
+inline constexpr int k_sat_vertex_pairs = 3;
+inline constexpr int k_sat_corner_pairs = 8;
+inline constexpr int k_sat_box_edges = 12;
+inline constexpr int k_sat_candidates =
+    k_sat_vertex_pairs + k_sat_corner_pairs + 3 * k_sat_box_edges;
+
+RS_HD CandidatePair sat_vertex_pair(Vec3A half, const Vec3A *q, int i) {
+  Vec3A point_box = clamp_point_to_aabb(q[i], half);
+  Vec3A point_tri = q[i];
+  return {point_box, point_tri, (point_box - point_tri).length_squared()};
+}
+
+RS_HD CandidatePair sat_corner_pair(Vec3A half, const Vec3A *q, Vec3A ab,
+                                    Vec3A ac, int corner) {
+  const float signs[2] = {-1.0f, 1.0f};
+  Vec3A box_corner{signs[corner >> 2] * half.x,
+                   signs[(corner >> 1) & 1] * half.y,
+                   signs[corner & 1] * half.z};
+  Vec3A point_tri = closest_point_on_triangle_precomp(box_corner, q, ab, ac);
+  return {box_corner, point_tri, (box_corner - point_tri).length_squared()};
+}
+
+RS_HD Vec3A sat_box_edge_vertex(Vec3A half, int k) {
+  bool pos_x = k == 1 || k == 2 || k == 5 || k == 6;
+  bool pos_y = k == 2 || k == 3 || k == 6 || k == 7;
+  bool pos_z = k >= 4;
+  return {pos_x ? half.x : -half.x, pos_y ? half.y : -half.y,
+          pos_z ? half.z : -half.z};
+}
+
+RS_HD void sat_box_edge_ends(int be, int &v0, int &v1) {
+  v0 = be < 8 ? be : be - 8;
+  v1 = be < 4 ? (be + 1) % 4 : (be < 8 ? 4 + (be - 3) % 4 : be - 4);
+}
+
+RS_HD CandidatePair sat_edge_pair(Vec3A tri_p, Vec3A tri_d, float tri_a,
+                                  Vec3A box_p0, Vec3A box_p1) {
+  Vec3A point_tri, point_box;
+  tri_edge_vs_box_edge_precomp(tri_p, tri_d, tri_a, box_p0, box_p1, point_tri,
+                               point_box);
+  return {point_box, point_tri, (point_box - point_tri).length_squared()};
+}
+
+RS_HD CandidatePair sat_candidate_pair(Vec3A half, const Vec3A *q,
+                                       const Vec3A *edges, int p) {
+  if (p < k_sat_vertex_pairs) {
+    return sat_vertex_pair(half, q, p);
+  }
+  if (p < k_sat_vertex_pairs + k_sat_corner_pairs) {
+    return sat_corner_pair(half, q, edges[0], q[2] - q[0],
+                           p - k_sat_vertex_pairs);
+  }
+  int e = p - k_sat_vertex_pairs - k_sat_corner_pairs;
+  int ti = e / k_sat_box_edges;
+  int v0, v1;
+  sat_box_edge_ends(e % k_sat_box_edges, v0, v1);
+  Vec3A tri_d = edges[ti];
+  return sat_edge_pair(q[ti], tri_d, tri_d.dot(tri_d),
+                       sat_box_edge_vertex(half, v0),
+                       sat_box_edge_vertex(half, v1));
+}
+
 RS_HDN void enum_aabb_triangle_pairs(Vec3A half, const Vec3A *q,
                                      const Vec3A *edges, CandidatePair *pairs) {
   int idx = 0;
-  for (int i = 0; i < 3; ++i) {
-    Vec3A point_box = clamp_point_to_aabb(q[i], half);
-    Vec3A point_tri = q[i];
-    pairs[idx++] = {point_box, point_tri,
-                    (point_box - point_tri).length_squared()};
+  for (int i = 0; i < k_sat_vertex_pairs; ++i) {
+    pairs[idx++] = sat_vertex_pair(half, q, i);
   }
   Vec3A ab = edges[0];
   Vec3A ac = q[2] - q[0];
-  const float signs[2] = {-1.0f, 1.0f};
-  for (int ix = 0; ix < 2; ++ix) {
-    for (int iy = 0; iy < 2; ++iy) {
-      for (int iz = 0; iz < 2; ++iz) {
-        Vec3A corner{signs[ix] * half.x, signs[iy] * half.y,
-                     signs[iz] * half.z};
-        Vec3A point_tri = closest_point_on_triangle_precomp(corner, q, ab, ac);
-        pairs[idx++] = {corner, point_tri,
-                        (corner - point_tri).length_squared()};
-      }
-    }
+  for (int corner = 0; corner < k_sat_corner_pairs; ++corner) {
+    pairs[idx++] = sat_corner_pair(half, q, ab, ac, corner);
   }
-  Vec3A c[8] = {{-half.x, -half.y, -half.z}, {half.x, -half.y, -half.z},
-                {half.x, half.y, -half.z},   {-half.x, half.y, -half.z},
-                {-half.x, -half.y, half.z},  {half.x, -half.y, half.z},
-                {half.x, half.y, half.z},    {-half.x, half.y, half.z}};
-  const int box_edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
-                                {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+  Vec3A c[8];
+  for (int k = 0; k < 8; ++k) {
+    c[k] = sat_box_edge_vertex(half, k);
+  }
   for (int ti = 0; ti < 3; ++ti) {
     Vec3A tri_p = q[ti];
     Vec3A tri_d = edges[ti];
     float tri_a = tri_d.dot(tri_d);
-    for (int be = 0; be < 12; ++be) {
-      Vec3A point_tri, point_box;
-      tri_edge_vs_box_edge_precomp(tri_p, tri_d, tri_a, c[box_edges[be][0]],
-                                   c[box_edges[be][1]], point_tri, point_box);
-      pairs[idx++] = {point_box, point_tri,
-                      (point_box - point_tri).length_squared()};
+    for (int be = 0; be < k_sat_box_edges; ++be) {
+      int v0, v1;
+      sat_box_edge_ends(be, v0, v1);
+      pairs[idx++] = sat_edge_pair(tri_p, tri_d, tri_a, c[v0], c[v1]);
     }
   }
 }
 
 RS_HDN bool flat_tie_segment(Vec3A half, const CandidatePair *pairs,
                              Vec3A &out0, Vec3A &out1) {
-  constexpr int n = 47;
+  constexpr int n = k_sat_candidates;
   float flat_link = 0.5f * half.max_element();
   if (flat_link <= 0.0f || !is_finite_f32(flat_link)) {
     return false;
@@ -741,22 +787,76 @@ struct BoxTriangleSatContact {
   float distance;
 };
 
-RS_HDN bool box_triangle_sat(const Affine3A &box_trans, Vec3A half_unmargined,
-                             float margin, const Vec3A *q,
-                             float maximum_distance,
-                             BoxTriangleSatContact &out) {
+enum class SatStage : uint8_t { Miss, Hit, NeedsPairs };
+
+struct SatSweepState {
+  Vec3A edges[3];
+  Vec3A centroid;
+  sat::SweepResult sweep;
+};
+
+RS_HDN bool box_triangle_sat_finish(const Affine3A &box_trans,
+                                    Vec3A half_unmargined, float margin,
+                                    const Vec3A *q, float maximum_distance,
+                                    const SatSweepState &state,
+                                    const sat::CandidatePair *pairs,
+                                    BoxTriangleSatContact &out) {
   using namespace sat;
+  CandidatePair best = pairs[0];
+  float best_d2 = best.distance_sq;
+  for (int i = 1; i < k_sat_candidates; ++i) {
+    if (pairs[i].distance_sq < best_d2) {
+      best_d2 = pairs[i].distance_sq;
+      best = pairs[i];
+    }
+  }
+  Vec3A pa_first = best.point_box;
+  Vec3A pb_first = best.point_tri;
+  if ((pa_first - pb_first).length_squared() > 1e-24f) {
+    float pair_len = (pa_first - pb_first).length();
+    Vec3A pb_local = pb_first;
+    bool snapped = false;
+    Vec3A te0, te1;
+    if (pair_len - margin < 0.0f &&
+        flat_tie_segment(half_unmargined, pairs, te0, te1)) {
+      pb_local = closest_point_on_segment(state.centroid, te0, te1);
+      snapped = true;
+    }
+    float distance =
+        snapped ? (clamp_point_to_aabb(pb_local, half_unmargined) - pb_local)
+                          .length() -
+                      margin
+                : pair_len - margin;
+    if (distance >= maximum_distance) {
+      return false;
+    }
+    out = {box_trans.transform_point3a(pb_local), distance};
+    return true;
+  }
+  Vec3A pb_local = tri_support_first_max(q, state.sweep.best_sep_axis);
+  out = {box_trans.transform_point3a(pb_local), state.sweep.best_gap - margin};
+  return true;
+}
+
+RS_HDN SatStage box_triangle_sat_stage(const Affine3A &box_trans,
+                                       Vec3A half_unmargined, float margin,
+                                       const Vec3A *q, float maximum_distance,
+                                       SatSweepState *deferred,
+                                       BoxTriangleSatContact &out) {
+  using namespace sat;
+  SatSweepState local;
+  SatSweepState &state = deferred ? *deferred : local;
   Vec3A tri_min = q[0].min(q[1]).min(q[2]);
   Vec3A tri_max = q[0].max(q[1]).max(q[2]);
   for (int axis = 0; axis < 3; ++axis) {
     float h = half_unmargined[axis];
     if (tri_min[axis] > h) {
       if (tri_min[axis] - h - margin >= maximum_distance) {
-        return false;
+        return SatStage::Miss;
       }
     } else if (tri_max[axis] < -h &&
                -h - tri_max[axis] - margin >= maximum_distance) {
-      return false;
+      return SatStage::Miss;
     }
   }
   Vec3A e0 = q[1] - q[0];
@@ -767,71 +867,47 @@ RS_HDN bool box_triangle_sat(const Affine3A &box_trans, Vec3A half_unmargined,
   bool has_face_axis = face_len2 > 1e-20f;
   Vec3A face_axis =
       has_face_axis ? face_cross / sqrt_f32(face_len2) : Vec3A::zero();
-  Vec3A centroid = (q[0] + q[1] + q[2]) * (1.0f / 3.0f);
-  Vec3A edges[3] = {e0, e1, e2};
-  SweepResult sweep;
-  if (!sat_sweep(half_unmargined, q, tri_min, tri_max, edges, face_axis,
-                 has_face_axis, centroid, margin, maximum_distance, sweep)) {
-    return false;
+  state.centroid = (q[0] + q[1] + q[2]) * (1.0f / 3.0f);
+  state.edges[0] = e0;
+  state.edges[1] = e1;
+  state.edges[2] = e2;
+  SweepResult &sweep = state.sweep;
+  if (!sat_sweep(half_unmargined, q, tri_min, tri_max, state.edges, face_axis,
+                 has_face_axis, state.centroid, margin, maximum_distance,
+                 sweep)) {
+    return SatStage::Miss;
   }
   if (sweep.has_sep) {
     Vec3A n_world =
         (box_trans.matrix3 * sweep.best_sep_axis).normalize_or_zero();
     if (n_world.length_squared() < 0.5f) {
-      return false;
+      return SatStage::Miss;
     }
-    CandidatePair pairs[47];
-    enum_aabb_triangle_pairs(half_unmargined, q, edges, pairs);
-    CandidatePair best = pairs[0];
-    float best_d2 = best.distance_sq;
-    for (int i = 1; i < 47; ++i) {
-      if (pairs[i].distance_sq < best_d2) {
-        best_d2 = pairs[i].distance_sq;
-        best = pairs[i];
-      }
+    if (deferred) {
+      return SatStage::NeedsPairs;
     }
-    Vec3A pa_first = best.point_box;
-    Vec3A pb_first = best.point_tri;
-    if ((pa_first - pb_first).length_squared() > 1e-24f) {
-      float pair_len = (pa_first - pb_first).length();
-      Vec3A pb_local = pb_first;
-      bool snapped = false;
-      Vec3A te0, te1;
-      if (pair_len - margin < 0.0f &&
-          flat_tie_segment(half_unmargined, pairs, te0, te1)) {
-        pb_local = closest_point_on_segment(centroid, te0, te1);
-        snapped = true;
-      }
-      float distance =
-          snapped ? (clamp_point_to_aabb(pb_local, half_unmargined) - pb_local)
-                            .length() -
-                        margin
-                  : pair_len - margin;
-      if (distance >= maximum_distance) {
-        return false;
-      }
-      out = {box_trans.transform_point3a(pb_local), distance};
-      return true;
-    }
-    Vec3A pb_local = tri_support_first_max(q, sweep.best_sep_axis);
-    out = {box_trans.transform_point3a(pb_local), sweep.best_gap - margin};
-    return true;
+    CandidatePair pairs[k_sat_candidates];
+    enum_aabb_triangle_pairs(half_unmargined, q, state.edges, pairs);
+    return box_triangle_sat_finish(box_trans, half_unmargined, margin, q,
+                                   maximum_distance, state, pairs, out)
+               ? SatStage::Hit
+               : SatStage::Miss;
   }
   if (sweep.best_overlap == k_f32_max) {
-    return false;
+    return SatStage::Miss;
   }
   Vec3A n_local;
   if (sweep.best_pen_axis.length_squared() > 0.5f) {
     n_local = sweep.best_pen_axis;
   } else if (has_face_axis) {
-    float s = face_axis.dot(-centroid);
+    float s = face_axis.dot(-state.centroid);
     n_local = s < 0.0f ? -face_axis : face_axis;
   } else {
-    return false;
+    return SatStage::Miss;
   }
   float distance = -sweep.best_overlap - margin;
   if (distance >= maximum_distance) {
-    return false;
+    return SatStage::Miss;
   }
   Vec3A pb_local;
   if (!pen_witness_by_kind(half_unmargined, q, sweep.pen_kind, n_local,
@@ -842,10 +918,19 @@ RS_HDN bool box_triangle_sat(const Affine3A &box_trans, Vec3A half_unmargined,
   }
   Vec3A n_world = (box_trans.matrix3 * n_local).normalize_or_zero();
   if (n_world.length_squared() < 0.5f) {
-    return false;
+    return SatStage::Miss;
   }
   out = {box_trans.transform_point3a(pb_local), distance};
-  return true;
+  return SatStage::Hit;
+}
+
+RS_HDN bool box_triangle_sat(const Affine3A &box_trans, Vec3A half_unmargined,
+                             float margin, const Vec3A *q,
+                             float maximum_distance,
+                             BoxTriangleSatContact &out) {
+  return box_triangle_sat_stage(box_trans, half_unmargined, margin, q,
+                                maximum_distance, nullptr,
+                                out) == SatStage::Hit;
 }
 
 }
