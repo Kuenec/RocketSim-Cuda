@@ -365,6 +365,8 @@ struct CudaBatch::Impl {
     device_view.upload(&view, 1);
     arenas.allocate(n);
     scratch.allocate(n);
+    check(cudaMemset(scratch.get(), 0, sizeof(StepScratch) * n),
+          "scratch reset");
     int device = 0;
     check(cudaGetDevice(&device), "cudaGetDevice");
     int device_sms = 0;

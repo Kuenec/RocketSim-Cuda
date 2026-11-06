@@ -118,6 +118,22 @@ struct StepScratch;
 inline constexpr uint32_t k_team_sat_slots = 16;
 inline constexpr uint32_t k_collect_frontier = 128;
 inline constexpr uint32_t k_parallel_collect_lanes = 4;
+inline constexpr uint32_t k_collect_memo_slots = 4;
+inline constexpr uint32_t k_collect_memo_leaves = 128;
+inline constexpr float k_collect_memo_margin = 0.5f;
+
+struct CollectMemo {
+  bool valid;
+  uint32_t mesh;
+  uint32_t count;
+  Aabb outer;
+  uint32_t leaves[k_collect_memo_leaves];
+};
+
+struct CollectMemoOwner {
+  uint32_t next;
+  CollectMemo slots[k_collect_memo_slots];
+};
 
 struct TeamSatSlot {
   uint32_t group;
@@ -228,6 +244,7 @@ struct StepScratch {
   JobRecords job_records[k_max_gate_jobs];
   uint32_t collect_frontier[2][k_collect_frontier];
   uint32_t collect_leaves[k_max_gate_triangles];
+  CollectMemoOwner collect_memo[k_max_dyn_bodies];
 };
 
 enum class RecordSink : uint8_t { Records, Job };
@@ -961,10 +978,30 @@ RS_HD void arena_setup_gate_jobs(const World &w, StepScratch &sc,
   }
 }
 
+RS_HD bool aabb_contains(const Aabb &outer, const Aabb &inner) {
+  return outer.min.cmple(inner.min).all() && inner.max.cmple(outer.max).all();
+}
+
+RS_HD CollectMemo *collect_memo_find(StepScratch &sc, const GateJob &job) {
+  CollectMemoOwner &owner = sc.collect_memo[job.memo_owner];
+  for (CollectMemo &memo : owner.slots) {
+    if (memo.valid && memo.mesh == job.memo_mesh &&
+        aabb_contains(memo.outer, job.params.local_convex_aabb)) {
+      return &memo;
+    }
+  }
+  return nullptr;
+}
+
+RS_HD Aabb collect_memo_outer(const Aabb &query) {
+  Vec3A margin = Vec3A::splat(k_collect_memo_margin);
+  return {query.min - margin, query.max + margin};
+}
+
 RS_HD bool arena_collect_job_leaves(const LaneGroup &lanes, StepScratch &sc,
-                                    const GateJob &job, uint32_t &found) {
+                                    const GateJob &job, const Aabb &query,
+                                    uint32_t &found) {
   const BvhView &bvh = *job.bvh;
-  const Aabb &query = job.params.local_convex_aabb;
   found = 0;
   if (!query.intersects(bvh.aabb)) {
     return true;
@@ -1037,8 +1074,71 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
     if (!job.mesh) {
       continue;
     }
+    CollectMemo *memo = collect_memo_find(sc, job);
+    if (!memo) {
+      Aabb outer = collect_memo_outer(job.params.local_convex_aabb);
+      uint32_t wide = 0;
+      if (arena_collect_job_leaves(lanes, sc, job, outer, wide) &&
+          wide <= k_collect_memo_leaves) {
+        CollectMemoOwner &owner = sc.collect_memo[job.memo_owner];
+        CollectMemo &slot = owner.slots[owner.next % k_collect_memo_slots];
+        for (uint32_t e = lanes.lane; e < wide; e += lanes.size) {
+          uint32_t leaf = sc.collect_leaves[e];
+          uint32_t rank = 0;
+          for (uint32_t k = 0; k < wide; ++k) {
+            rank += sc.collect_leaves[k] < leaf ? 1u : 0u;
+          }
+          slot.leaves[rank] = leaf;
+        }
+        lanes.group_sync();
+        if (lanes.leader()) {
+          slot.valid = true;
+          slot.mesh = job.memo_mesh;
+          slot.count = wide;
+          slot.outer = outer;
+          owner.next = (owner.next + 1) % k_collect_memo_slots;
+        }
+        lanes.group_sync();
+        memo = &slot;
+      }
+    }
+    if (memo) {
+      uint32_t start = items.count;
+      uint32_t room = k_max_gate_triangles - start;
+      uint32_t hits = 0;
+      for (uint32_t base = 0; base < memo->count; base += lanes.size) {
+        uint32_t e = base + lanes.lane;
+        bool hit = false;
+        uint32_t tri = 0;
+        if (e < memo->count) {
+          const BvhWideLeaf &leaf = job.bvh->leaves[memo->leaves[e]];
+          hit = leaf.bounds.intersects(job.params.local_convex_aabb);
+          tri = leaf.leaf_idx;
+        }
+        uint32_t ballot = lanes.group_ballot(hit);
+        if (hit) {
+          uint32_t rank = hits + lanes.team_rank(ballot);
+          if (rank < room) {
+            items.job[start + rank] = static_cast<uint8_t>(j);
+            items.tri_idx[start + rank] = tri;
+          }
+        }
+        hits += popcount32(ballot);
+      }
+      lanes.group_sync();
+      if (lanes.leader()) {
+        uint32_t stored = hits < room ? hits : room;
+        job.items_complete = hits <= room;
+        job.first_item = start;
+        job.num_items = stored;
+        items.count = start + stored;
+      }
+      lanes.group_sync();
+      continue;
+    }
     uint32_t found = 0;
-    bool listed = arena_collect_job_leaves(lanes, sc, job, found);
+    bool listed = arena_collect_job_leaves(lanes, sc, job,
+                                           job.params.local_convex_aabb, found);
     uint32_t start = items.count;
     if (!listed) {
       if (lanes.leader()) {

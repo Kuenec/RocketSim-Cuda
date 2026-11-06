@@ -184,6 +184,54 @@ Aabb update_triangle_aabb(const TriangleShape &tri) {
   return aabb;
 }
 
+bool slot_contains(const BvhWideNode &node, uint32_t slot, const Aabb &box) {
+  return node.min_x[slot] <= box.min.x && node.min_y[slot] <= box.min.y &&
+         node.min_z[slot] <= box.min.z && box.max.x <= node.max_x[slot] &&
+         box.max.y <= node.max_y[slot] && box.max.z <= node.max_z[slot];
+}
+
+bool slot_equals(const BvhWideNode &node, uint32_t slot, const Aabb &box) {
+  return node.min_x[slot] == box.min.x && node.min_y[slot] == box.min.y &&
+         node.min_z[slot] == box.min.z && node.max_x[slot] == box.max.x &&
+         node.max_y[slot] == box.max.y && node.max_z[slot] == box.max.z;
+}
+
+void require_nested_bounds(const BvhStorage &bvh) {
+  const BvhWideNode &root = bvh.nodes[0];
+  for (uint32_t slot = 0; slot < root.child_count; ++slot) {
+    Aabb box{{root.min_x[slot], root.min_y[slot], root.min_z[slot]},
+             {root.max_x[slot], root.max_y[slot], root.max_z[slot]}};
+    if (!(bvh.aabb.min.cmple(box.min).all() &&
+          box.max.cmple(bvh.aabb.max).all())) {
+      throw std::runtime_error("mesh BVH root slot " + std::to_string(slot) +
+                               " is not inside the mesh bounds");
+    }
+  }
+  for (size_t n = 0; n < bvh.nodes.size(); ++n) {
+    const BvhWideNode &node = bvh.nodes[n];
+    for (uint32_t slot = 0; slot < node.child_count; ++slot) {
+      uint32_t child = node.children[slot];
+      bool nested = true;
+      if (child & k_bvh_leaf_bit) {
+        nested =
+            slot_equals(node, slot, bvh.leaves[child & ~k_bvh_leaf_bit].bounds);
+      } else {
+        const BvhWideNode &inner = bvh.nodes[child];
+        for (uint32_t k = 0; k < inner.child_count && nested; ++k) {
+          Aabb box{{inner.min_x[k], inner.min_y[k], inner.min_z[k]},
+                   {inner.max_x[k], inner.max_y[k], inner.max_z[k]}};
+          nested = slot_contains(node, slot, box);
+        }
+      }
+      if (!nested) {
+        throw std::runtime_error(
+            "mesh BVH child bounds are not nested in node " +
+            std::to_string(n) + " slot " + std::to_string(slot));
+      }
+    }
+  }
+}
+
 void require_depth_first_leaves(const BvhStorage &bvh) {
   uint32_t expected = 0;
   std::vector<uint32_t> stack{0};
@@ -372,6 +420,7 @@ ProcessedMesh process_mesh(const CollisionMeshFile &file) {
   }
   pm.bvh = build_bvh_bullet(tree_aabb, leaves);
   require_depth_first_leaves(pm.bvh);
+  require_nested_bounds(pm.bvh);
   pm.infos.assign(pm.tris.size(), TriangleInfo{0, k_tau, k_tau, k_tau});
   BvhView view = pm.bvh.view();
   for (uint32_t i = 0; i < pm.tris.size(); ++i) {

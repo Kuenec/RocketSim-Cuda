@@ -223,6 +223,8 @@ inline constexpr uint32_t k_max_gate_triangles = 256;
 
 struct GateJob {
   uint32_t pair;
+  uint32_t memo_owner;
+  uint32_t memo_mesh;
   bool computed;
   bool has_fresh;
   bool mesh;
@@ -416,6 +418,8 @@ RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
     const MeshView &mesh = w.mesh(other.shape.mesh);
     job.tris = mesh.tris;
     job.bvh = &mesh.bvh;
+    job.memo_owner = compound_obj.world_array_idx - w.num_static();
+    job.memo_mesh = other.shape.mesh.mesh_idx;
   }
 }
 
