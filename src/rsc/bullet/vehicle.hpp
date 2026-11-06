@@ -376,8 +376,8 @@ struct VehicleRL {
     return hit;
   }
 
-  RS_HDN void cast_rays(const World &w, const Vec3A *from, const Vec3A *to,
-                        VehicleHit *hits) const {
+  RS_HD void cast_rays(const World &w, const Vec3A *from, const Vec3A *to,
+                       VehicleHit *hits) const {
     QuadRayResult r = cast_quad(w, from, to, 0xf);
     for (int i = 0; i < k_num_wheels; ++i) {
       hits[i] = ray_hit(w, r, i);
@@ -510,7 +510,7 @@ struct VehicleRL {
     cast_rays(w, sources, targets, hits);
   }
 
-  RS_HDN void cast_wheel_ray(const World &w, int wheel, VehicleHit &hit) const {
+  RS_HD void cast_wheel_ray(const World &w, int wheel, VehicleHit &hit) const {
     const Affine3A &trans = w.body(chassis_body_idx).world_trans;
     Vec3A sources[k_num_wheels];
     Vec3A targets[k_num_wheels];

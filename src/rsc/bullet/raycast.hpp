@@ -340,8 +340,8 @@ struct SphereClosest {
   }
 };
 
-RS_HDN void shape_quad_raycast(const World &w, const Shape &shape,
-                               BridgeTriQuadRay &cb, QuadRayInfo &ray_info) {
+RS_HD void shape_quad_raycast(const World &w, const Shape &shape,
+                              BridgeTriQuadRay &cb, QuadRayInfo &ray_info) {
   switch (shape.kind) {
   case ShapeKind::Compound: {
     const CompoundShape &cs = shape.compound;
@@ -509,8 +509,8 @@ RS_HD void quad_ray_test_body(const World &w, const Vec3A *ray_from,
   shape_quad_raycast(w, co.shape, cb, ray_info);
 }
 
-RS_HDN void grid_ray_test(const World &w, const Vec3A *ray_from,
-                          const Vec3A *ray_to, QuadRayResult &result) {
+RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
+                         const Vec3A *ray_to, QuadRayResult &result) {
   const StaticWorldData &s = *w.s;
   Aabb ray_aabb{ray_from[0].min(ray_to[0]), ray_from[0].max(ray_to[0])};
   for (int i = 1; i < 4; ++i) {
