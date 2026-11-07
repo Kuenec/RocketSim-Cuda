@@ -57,6 +57,7 @@ add_library(rocketsim_cuda STATIC
   src/rocketsim_cuda/api.cpp)
 target_include_directories(rocketsim_cuda PUBLIC src)
 set_target_properties(rocketsim_cuda PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(rocketsim_cuda PROPERTIES CXX_VISIBILITY_PRESET hidden CUDA_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 rsc_set_host_options(rocketsim_cuda)
 if(RSC_ENABLE_CUDA)
   target_sources(rocketsim_cuda PRIVATE src/rocketsim_cuda/cuda_batch.cu
@@ -66,6 +67,7 @@ if(RSC_ENABLE_CUDA)
 endif()
 
 add_library(rocketsim_cuda_c SHARED src/rocketsim_cuda/c_api.cpp)
+set_target_properties(rocketsim_cuda_c PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
 target_link_libraries(rocketsim_cuda_c PRIVATE rocketsim_cuda)
 rsc_set_host_options(rocketsim_cuda_c)
 

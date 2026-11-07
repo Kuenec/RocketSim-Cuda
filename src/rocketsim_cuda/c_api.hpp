@@ -5,6 +5,7 @@
 
 #include "rocketsim_cuda/rocketsim_cuda.hpp"
 
+#pragma GCC visibility push(default)
 extern "C" {
 
 struct RscMeshSet;
@@ -125,3 +126,4 @@ int rsc_batch_copy(RscBatch *dst, const RscBatch *src,
                    const uint32_t *src_arenas, const uint32_t *dst_arenas,
                    uint32_t count);
 }
+#pragma GCC visibility pop
