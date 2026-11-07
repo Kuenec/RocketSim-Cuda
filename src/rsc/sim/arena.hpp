@@ -609,26 +609,63 @@ RS_HD void arena_update_world_contact_normal(Arena &a, const StepScratch &sc) {
   }
 }
 
-RS_HD void arena_tick_front_item(const ArenaStatic &st, Arena &a,
-                                 uint32_t item) {
+RS_HD RigidBody &front_item_limit_vels(Arena &a, World &w, uint32_t item) {
   using namespace consts;
-  World w = arena_world(st, a);
   if (item == a.num_cars) {
     RigidBody &ball_rb = w.dyn_body(a.ball.rigid_body_idx);
     ball_rb.limit_vels(a.mutators.ball_max_speed * uu_to_bt,
                        ball::max_ang_speed);
-    quantize_body(ball_rb);
-    a.ball.state.phys.vel = ball_rb.lin_vel * bt_to_uu;
-    a.ball.state.phys.ang_vel = ball_rb.ang_vel;
+    return ball_rb;
+  }
+  RigidBody &rb = w.dyn_body(a.cars[item].rigid_body_idx);
+  rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
+  return rb;
+}
+
+RS_HD void front_item_finish(Arena &a, World &w, uint32_t item,
+                             const RigidBody &rb) {
+  using namespace consts;
+  if (item == a.num_cars) {
+    a.ball.state.phys.vel = rb.lin_vel * bt_to_uu;
+    a.ball.state.phys.ang_vel = rb.ang_vel;
     return;
   }
   Car &car = a.cars[item];
-  RigidBody &rb = w.dyn_body(car.rigid_body_idx);
-  rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
-  quantize_body(rb);
   car.state.phys.vel = rb.lin_vel * bt_to_uu;
   car.state.phys.ang_vel = rb.ang_vel;
   car_apply_flip_zdamp_prepass(car, w);
+}
+
+RS_HD void arena_tick_front_item(const ArenaStatic &st, Arena &a,
+                                 uint32_t item) {
+  World w = arena_world(st, a);
+  RigidBody &rb = front_item_limit_vels(a, w, item);
+  quantize_body(rb);
+  front_item_finish(a, w, item, rb);
+}
+
+RS_HD void arena_tick_front_items(const ArenaStatic &st, Arena &a) {
+  World w = arena_world(st, a);
+  RigidBody *bodies[k_max_dyn_bodies];
+  Quat rots[k_max_dyn_bodies];
+  uint32_t rotating[k_max_dyn_bodies];
+  uint32_t num_rotating = 0;
+  for (uint32_t item = 0; item <= a.num_cars; ++item) {
+    RigidBody &rb = front_item_limit_vels(a, w, item);
+    quantize_body_motion(rb);
+    bodies[item] = &rb;
+    if (!(rb.collision_flags & k_flag_no_angular_motion)) {
+      rots[num_rotating] = rb.world_quat;
+      rotating[num_rotating++] = item;
+    }
+  }
+  quant::quantize_quats(rots, num_rotating);
+  for (uint32_t k = 0; k < num_rotating; ++k) {
+    quantize_body_rotation(*bodies[rotating[k]], rots[k]);
+  }
+  for (uint32_t item = 0; item <= a.num_cars; ++item) {
+    front_item_finish(a, w, item, *bodies[item]);
+  }
 }
 
 RS_HD void arena_push_car_landed(Arena &a, uint32_t c) {
@@ -1278,8 +1315,12 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
     }
   }
   lanes.barrier();
-  for (uint32_t item = lanes.lane; item <= a.num_cars; item += lanes.size) {
-    arena_tick_front_item(st, a, item);
+  if constexpr (Lanes::k_cooperative) {
+    for (uint32_t item = lanes.lane; item <= a.num_cars; item += lanes.size) {
+      arena_tick_front_item(st, a, item);
+    }
+  } else {
+    arena_tick_front_items(st, a);
   }
   lanes.barrier();
   arena_tick_cars(st, a, sc, lanes);

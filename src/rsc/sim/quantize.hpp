@@ -156,7 +156,12 @@ RS_HD float quantize_component(float c) {
   return (r + r) * 0.70710677f;
 }
 
-RS_HD Quat quantize_quat(Quat q_in) {
+struct QuatSplit {
+  int big;
+  float d[3];
+};
+
+RS_HD QuatSplit split_quat(Quat q_in) {
   Quat q = normalize_scalar(q_in, 1e-8f);
   float c[4] = {q.x, q.y, q.z, q.w};
   float a[4] = {abs_f32(c[0]), abs_f32(c[1]), abs_f32(c[2]), abs_f32(c[3])};
@@ -164,28 +169,50 @@ RS_HD Quat quantize_quat(Quat q_in) {
   int i23 = a[2] < a[3] ? 3 : 2;
   int big = a[i01] >= a[i23] ? i01 : i23;
   float sign = c[big] < 0.0f ? -1.0f : 1.0f;
-  float d_input[3] = {0.0f, 0.0f, 0.0f};
-  int n = 0;
-  for (int i = 0; i < 4; ++i) {
-    if (i != big) {
-      d_input[n++] = c[i] * sign;
-    }
+  return {big,
+          {(big == 0 ? c[1] : c[0]) * sign, (big <= 1 ? c[2] : c[1]) * sign,
+           (big <= 2 ? c[3] : c[2]) * sign}};
+}
+
+RS_HD void quantize_split(QuatSplit &s) {
+  for (float &v : s.d) {
+    v = quantize_component(v);
   }
-  float d[3] = {quantize_component(d_input[0]), quantize_component(d_input[1]),
-                quantize_component(d_input[2])};
-  float rest = ((1.0f - d[0] * d[0]) - d[1] * d[1]) - d[2] * d[2];
+}
+
+RS_HD Quat join_quat(const QuatSplit &s) {
+  float rest = ((1.0f - s.d[0] * s.d[0]) - s.d[1] * s.d[1]) - s.d[2] * s.d[2];
   float dropped = sqrt_f32(rest);
-  float o[4];
-  n = 0;
-  for (int i = 0; i < 4; ++i) {
-    o[i] = i == big ? dropped : d[n++];
+  return normalize_scalar(
+      {s.big == 0 ? dropped : s.d[0],
+       s.big == 1 ? dropped : (s.big == 0 ? s.d[0] : s.d[1]),
+       s.big == 2 ? dropped : (s.big <= 1 ? s.d[1] : s.d[2]),
+       s.big == 3 ? dropped : s.d[2]},
+      1e-8f);
+}
+
+RS_HD Quat quantize_quat(Quat q_in) {
+  QuatSplit s = split_quat(q_in);
+  quantize_split(s);
+  return join_quat(s);
+}
+
+RS_HD void quantize_quats(Quat *q, uint32_t n) {
+  QuatSplit s[k_max_dyn_bodies];
+  for (uint32_t i = 0; i < n; ++i) {
+    s[i] = split_quat(q[i]);
   }
-  return normalize_scalar({o[0], o[1], o[2], o[3]}, 1e-8f);
+  for (uint32_t i = 0; i < n; ++i) {
+    quantize_split(s[i]);
+  }
+  for (uint32_t i = 0; i < n; ++i) {
+    q[i] = join_quat(s[i]);
+  }
 }
 
 }
 
-RS_HD void quantize_body(RigidBody &body) {
+RS_HD void quantize_body_motion(RigidBody &body) {
   Vec3A new_pos =
       quant::quantize_position(body.world_trans.translation * consts::bt_to_uu,
                                consts::quantize::pos_scale) *
@@ -198,13 +225,20 @@ RS_HD void quantize_body(RigidBody &body) {
   body.set_world_pos(new_pos);
   body.lin_vel = new_vel;
   body.ang_vel = new_ang_vel;
-  if (body.collision_flags & k_flag_no_angular_motion) {
-    return;
-  }
-  Quat rot = quant::quantize_quat(body.world_quat);
+}
+
+RS_HD void quantize_body_rotation(RigidBody &body, Quat rot) {
   Affine3A trans = body.world_trans;
   trans.matrix3 = quant::set_rotation_scalar(rot);
   body.set_world_trans_and_rot(trans, rot);
+}
+
+RS_HD void quantize_body(RigidBody &body) {
+  quantize_body_motion(body);
+  if (body.collision_flags & k_flag_no_angular_motion) {
+    return;
+  }
+  quantize_body_rotation(body, quant::quantize_quat(body.world_quat));
 }
 
 }
