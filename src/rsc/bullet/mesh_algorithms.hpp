@@ -293,7 +293,8 @@ template <typename Callback> struct ConvexTriangleCallback {
     ConvexShape tri_shape =
         ConvexShape::triangle(tri.points[0], tri.points[1], tri.points[2]);
     detector.get_closest_points(convex_obj->world_trans, tri_obj->world_trans,
-                                max_dist * max_dist, convex, tri_shape, *this);
+                                max_dist * max_dist, convex, tri_shape,
+                                callback->epa_workspace(), *this);
   }
 };
 

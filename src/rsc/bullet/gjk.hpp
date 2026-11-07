@@ -1242,14 +1242,13 @@ struct GjkEpa2Result {
 
 RS_HDN bool gjk_penetration(const ConvexShape &shape_a, const Affine3A &trans_a,
                             const ConvexShape &shape_b, const Affine3A &trans_b,
-                            Vec3A guess, GjkEpa2Result &out) {
+                            Vec3A guess, Epa2 &epa, GjkEpa2Result &out) {
   MinkowskiDiff shape = MinkowskiDiff::make(shape_a, trans_a, shape_b, trans_b);
   Gjk gjk;
   gjk.init(&shape);
   if (gjk.evaluate<true>(-guess) != GjkStatus::Inside) {
     return false;
   }
-  Epa2 epa;
   epa.init();
   EpaStatus status = epa.evaluate<true>(gjk, -guess);
   if (status == EpaStatus::Failed) {
@@ -1305,12 +1304,13 @@ RS_HD bool gjk_distance(const ConvexShape &shape_a, const Affine3A &trans_a,
 
 RS_HD bool calc_pen_depth(const ConvexShape &shape_a,
                           const ConvexShape &shape_b, const Affine3A &trans_a,
-                          const Affine3A &trans_b, GjkEpa2Result &out) {
+                          const Affine3A &trans_b, Epa2 &epa,
+                          GjkEpa2Result &out) {
   Vec3A delta = trans_b.translation - trans_a.translation;
   float len2 = delta.length_squared();
   Vec3A guess =
       len2 > 1.0e-20f ? delta * (1.0f / sqrt_f32(len2)) : Vec3A::zero();
-  if (gjk_penetration(shape_a, trans_a, shape_b, trans_b, guess, out)) {
+  if (gjk_penetration(shape_a, trans_a, shape_b, trans_b, guess, epa, out)) {
     return true;
   }
   return gjk_distance(shape_a, trans_a, shape_b, trans_b, guess, out);
@@ -1338,7 +1338,7 @@ struct GjkPairDetector {
   RS_HD void
   get_closest_points(const Affine3A &transform_a, const Affine3A &transform_b,
                      float maximum_distance_squared, const ConvexShape &shape_a,
-                     const ConvexShape &shape_b, Output &output) {
+                     const ConvexShape &shape_b, Epa2 &epa, Output &output) {
     Affine3A local_a = transform_a;
     Affine3A local_b = transform_b;
     Vec3A position_offset = (local_a.translation + local_b.translation) * 0.5f;
@@ -1425,7 +1425,7 @@ struct GjkPairDetector {
         degenerate_simplex != 0 && (distance + margin) <= 0.01f;
     GjkEpa2Result pen;
     if ((!is_valid || catch_degenerate) &&
-        calc_pen_depth(shape_a, shape_b, local_a, local_b, pen)) {
+        calc_pen_depth(shape_a, shape_b, local_a, local_b, epa, pen)) {
       Vec3A tmp_a = pen.witnesses[0];
       Vec3A tmp_b = pen.witnesses[1];
       if (pen.penetrating) {

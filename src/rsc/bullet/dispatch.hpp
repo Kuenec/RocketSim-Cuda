@@ -234,6 +234,8 @@ struct PairSetup {
 inline constexpr uint32_t k_max_gate_jobs = 16;
 inline constexpr uint32_t k_max_gate_triangles = 256;
 
+enum class GateTarget : uint8_t { Plane, Mesh, Hull };
+
 struct GateJob {
   uint32_t pair;
   uint32_t memo_owner;
@@ -241,7 +243,7 @@ struct GateJob {
   int compound_side;
   bool computed;
   bool has_fresh;
-  bool mesh;
+  GateTarget target;
   bool items_complete;
   uint32_t first_item;
   uint32_t num_items;
@@ -414,7 +416,6 @@ RS_HD void dispatch_plan_pairs(const World &w, Callback &callback,
 
 RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
   job.pair = pair_idx;
-  job.mesh = false;
   BroadphasePair pair = w.a->pairs[pair_idx];
   const BroadphaseProxy &proxy0 = w.proxy(pair.proxy0);
   const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
@@ -423,8 +424,10 @@ RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
   const RigidBody &rb1 = w.body(proxy1.client_obj_idx);
   const RigidBody &compound_obj = setup.compound_side == 0 ? rb0 : rb1;
   const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
+  job.target = other.shape.kind == ShapeKind::ConvexHull ? GateTarget::Hull
+                                                         : GateTarget::Plane;
   if (other.shape.kind == ShapeKind::TriangleMesh) {
-    job.mesh = true;
+    job.target = GateTarget::Mesh;
     job.params = gate_mesh_params(compound_obj, compound_obj.shape.compound,
                                   setup.child_world, other);
     job.mesh_to_box = mesh_to_box_transform(job.params.box_trans,
@@ -504,11 +507,15 @@ RS_HD void dispatch_compute_jobs(const World &w, Callback &callback,
   const GateItems &items = callback.gate_items();
   for (uint32_t j = first; j < num_jobs; j += stride) {
     GateJob &job = jobs[j];
+    if (job.target == GateTarget::Hull) {
+      job.computed = false;
+      continue;
+    }
     BroadphasePair pair = w.a->pairs[job.pair];
     const BroadphaseProxy &proxy0 = w.proxy(pair.proxy0);
     const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
     Callback job_callback = callback.job_tracker(j);
-    if (job.mesh && job.items_complete) {
+    if (job.target == GateTarget::Mesh && job.items_complete) {
       const RigidBody &rb0 = w.body(proxy0.client_obj_idx);
       const RigidBody &rb1 = w.body(proxy1.client_obj_idx);
       const RigidBody &compound_obj = job.compound_side == 0 ? rb0 : rb1;

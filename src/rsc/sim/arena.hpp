@@ -247,6 +247,7 @@ struct StepScratch {
   uint32_t collect_frontier[2][k_collect_frontier];
   uint32_t collect_leaves[k_max_gate_triangles];
   CollectMemoOwner collect_memo[k_max_dyn_bodies];
+  Epa2 epa;
 };
 
 enum class RecordSink : uint8_t { Records, Job };
@@ -267,6 +268,8 @@ struct ContactTracker {
     sc->job_records[j].overflow = false;
     return {w, sc, ball_only, RecordSink::Job, j};
   }
+
+  RS_HD Epa2 &epa_workspace() const { return sc->epa; }
 
   RS_HD bool job_overflowed(uint32_t j) const {
     return sc->job_records[j].overflow;
@@ -1097,7 +1100,7 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
   if (lanes.size < k_parallel_collect_lanes) {
     if (lanes.leader()) {
       for (uint32_t j = 0; j < sc.num_gate_jobs; ++j) {
-        if (sc.gate_jobs[j].mesh) {
+        if (sc.gate_jobs[j].target == GateTarget::Mesh) {
           gate_collect_job_serial(sc.gate_jobs[j], j, items);
         }
       }
@@ -1106,7 +1109,7 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
   }
   for (uint32_t j = 0; j < sc.num_gate_jobs; ++j) {
     GateJob &job = sc.gate_jobs[j];
-    if (!job.mesh) {
+    if (job.target != GateTarget::Mesh) {
       continue;
     }
     CollectMemo *memo = collect_memo_find(sc, job);

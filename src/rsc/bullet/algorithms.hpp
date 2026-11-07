@@ -99,7 +99,8 @@ RS_HDN bool convex_convex(const World &w, const BodyWrapper &a,
   ConvexShape shape_a = w.convex_of(a.obj->shape);
   ConvexShape shape_b = w.convex_of(b.shape);
   detector.get_closest_points(a.world_trans, b.world_trans, max_dist * max_dist,
-                              shape_a, shape_b, result);
+                              shape_a, shape_b, callback.epa_workspace(),
+                              result);
   if (m.num_points == 0) {
     return false;
   }

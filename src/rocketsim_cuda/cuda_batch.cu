@@ -15,7 +15,7 @@ namespace {
 
 constexpr uint32_t k_max_block_size = 32;
 constexpr uint32_t k_target_blocks_per_sm = 4;
-constexpr size_t k_device_stack_bytes = 16384;
+constexpr size_t k_callee_stack_headroom = 1024;
 constexpr uint32_t k_max_lanes_per_arena = 32;
 constexpr uint32_t k_timed_launches = 64;
 constexpr uint32_t k_cost_buckets = 64;
@@ -315,11 +315,15 @@ struct CudaBatch::Impl {
 
   Impl(const HostStatic &st, uint32_t n, uint32_t cars)
       : num_arenas(n), lanes_per_arena(1) {
-    size_t stack_bytes = 0;
-    check(cudaDeviceGetLimit(&stack_bytes, cudaLimitStackSize),
+    cudaFuncAttributes step_attrs{};
+    check(cudaFuncGetAttributes(&step_attrs, step_kernel),
+          "cudaFuncGetAttributes");
+    size_t stack_bytes = step_attrs.localSizeBytes + k_callee_stack_headroom;
+    size_t current_stack = 0;
+    check(cudaDeviceGetLimit(&current_stack, cudaLimitStackSize),
           "cudaDeviceGetLimit");
-    if (stack_bytes < k_device_stack_bytes) {
-      check(cudaDeviceSetLimit(cudaLimitStackSize, k_device_stack_bytes),
+    if (current_stack < stack_bytes) {
+      check(cudaDeviceSetLimit(cudaLimitStackSize, stack_bytes),
             "cudaDeviceSetLimit");
     }
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
