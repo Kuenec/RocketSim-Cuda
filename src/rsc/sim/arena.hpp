@@ -1010,6 +1010,8 @@ RS_HD bool arena_collect_job_leaves(const LaneGroup &lanes, StepScratch &sc,
   if (!query.intersects(bvh.aabb)) {
     return true;
   }
+  const BvhWideNode *nodes = bvh.nodes;
+  const Aabb box = query;
   if (lanes.leader()) {
     sc.collect_frontier[0][0] = 0;
   }
@@ -1023,8 +1025,8 @@ RS_HD bool arena_collect_job_leaves(const LaneGroup &lanes, StepScratch &sc,
       uint32_t mask = 0;
       uint32_t children[4] = {0, 0, 0, 0};
       if (e < size) {
-        const BvhWideNode &node = bvh.nodes[sc.collect_frontier[cur][e]];
-        mask = node.intersection_mask(query);
+        const BvhWideNode &node = nodes[sc.collect_frontier[cur][e]];
+        mask = node.intersection_mask(box);
         for (int c = 0; c < 4; ++c) {
           children[c] = node.children[c];
         }
@@ -1110,13 +1112,17 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
       uint32_t start = items.count;
       uint32_t room = k_max_gate_triangles - start;
       uint32_t hits = 0;
-      for (uint32_t base = 0; base < memo->count; base += lanes.size) {
+      const BvhWideLeaf *leaves = job.bvh->leaves;
+      const uint32_t *memo_leaves = memo->leaves;
+      const Aabb box = job.params.local_convex_aabb;
+      uint32_t memo_count = memo->count;
+      for (uint32_t base = 0; base < memo_count; base += lanes.size) {
         uint32_t e = base + lanes.lane;
         bool hit = false;
         uint32_t tri = 0;
-        if (e < memo->count) {
-          const BvhWideLeaf &leaf = job.bvh->leaves[memo->leaves[e]];
-          hit = leaf.bounds.intersects(job.params.local_convex_aabb);
+        if (e < memo_count) {
+          const BvhWideLeaf &leaf = leaves[memo_leaves[e]];
+          hit = leaf.bounds.intersects(box);
           tri = leaf.leaf_idx;
         }
         uint32_t ballot = lanes.group_ballot(hit);
@@ -1152,6 +1158,7 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
       continue;
     }
     uint32_t room = k_max_gate_triangles - start;
+    const BvhWideLeaf *leaves = job.bvh->leaves;
     for (uint32_t e = lanes.lane; e < found; e += lanes.size) {
       uint32_t leaf = sc.collect_leaves[e];
       uint32_t rank = 0;
@@ -1160,7 +1167,7 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
       }
       if (rank < room) {
         items.job[start + rank] = static_cast<uint8_t>(j);
-        items.tri_idx[start + rank] = job.bvh->leaves[leaf].leaf_idx;
+        items.tri_idx[start + rank] = leaves[leaf].leaf_idx;
       }
     }
     lanes.group_sync();

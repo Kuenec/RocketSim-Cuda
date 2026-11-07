@@ -39,6 +39,27 @@ struct BvhWideNode {
     return overlap.bitmask() & valid_mask;
 #endif
   }
+
+  RS_HDI int push_children(uint32_t mask, uint32_t *stack,
+                           int stack_len) const {
+    uint32_t c0 = children[0];
+    uint32_t c1 = children[1];
+    uint32_t c2 = children[2];
+    uint32_t c3 = children[3];
+    if (mask & 8u) {
+      stack[stack_len++] = c3;
+    }
+    if (mask & 4u) {
+      stack[stack_len++] = c2;
+    }
+    if (mask & 2u) {
+      stack[stack_len++] = c1;
+    }
+    if (mask & 1u) {
+      stack[stack_len++] = c0;
+    }
+    return stack_len;
+  }
 };
 
 struct BvhWideLeaf {
@@ -55,6 +76,7 @@ struct BvhView {
     if (!query.intersects(aabb)) {
       return false;
     }
+    const BvhWideNode *node_array = nodes;
     uint32_t stack[k_bvh_stack_size];
     stack[0] = 0;
     int stack_len = 1;
@@ -64,14 +86,9 @@ struct BvhView {
       if (work & k_bvh_leaf_bit) {
         return true;
       }
-      const BvhWideNode &node = nodes[work];
+      const BvhWideNode &node = node_array[work];
       uint32_t mask = node.intersection_mask(query);
-      for (int lane = static_cast<int>(node.child_count) - 1; lane >= 0;
-           --lane) {
-        if (mask & (1u << lane)) {
-          stack[stack_len++] = node.children[lane];
-        }
-      }
+      stack_len = node.push_children(mask, stack, stack_len);
     }
     return false;
   }
@@ -82,6 +99,8 @@ struct BvhView {
     if (!query.intersects(aabb)) {
       return;
     }
+    const BvhWideNode *node_array = nodes;
+    const BvhWideLeaf *leaf_array = leaves;
     uint32_t stack[k_bvh_stack_size];
     stack[0] = 0;
     int stack_len = 1;
@@ -89,17 +108,12 @@ struct BvhView {
       --stack_len;
       uint32_t work = stack[stack_len];
       if (work & k_bvh_leaf_bit) {
-        callback.process_node(leaves[work & ~k_bvh_leaf_bit].leaf_idx);
+        callback.process_node(leaf_array[work & ~k_bvh_leaf_bit].leaf_idx);
         continue;
       }
-      const BvhWideNode &node = nodes[work];
+      const BvhWideNode &node = node_array[work];
       uint32_t mask = node.intersection_mask(query);
-      for (int lane = static_cast<int>(node.child_count) - 1; lane >= 0;
-           --lane) {
-        if (mask & (1u << lane)) {
-          stack[stack_len++] = node.children[lane];
-        }
-      }
+      stack_len = node.push_children(mask, stack, stack_len);
     }
   }
 
@@ -112,6 +126,8 @@ struct BvhView {
     if (!ray_aabb.intersects(aabb)) {
       return;
     }
+    const BvhWideNode *node_array = nodes;
+    const BvhWideLeaf *leaf_array = leaves;
     uint32_t stack[k_bvh_stack_size];
     stack[0] = 0;
     int stack_len = 1;
@@ -121,7 +137,7 @@ struct BvhView {
       --stack_len;
       uint32_t work = stack[stack_len];
       if (work & k_bvh_leaf_bit) {
-        const BvhWideLeaf &leaf = leaves[work & ~k_bvh_leaf_bit];
+        const BvhWideLeaf &leaf = leaf_array[work & ~k_bvh_leaf_bit];
         if (!have_pack) {
           pack = single_ray_pack(source, target);
           have_pack = true;
@@ -132,14 +148,9 @@ struct BvhView {
         }
         continue;
       }
-      const BvhWideNode &node = nodes[work];
+      const BvhWideNode &node = node_array[work];
       uint32_t mask = node.intersection_mask(node_cull);
-      for (int lane = static_cast<int>(node.child_count) - 1; lane >= 0;
-           --lane) {
-        if (mask & (1u << lane)) {
-          stack[stack_len++] = node.children[lane];
-        }
-      }
+      stack_len = node.push_children(mask, stack, stack_len);
     }
   }
 
@@ -150,6 +161,8 @@ struct BvhView {
     if (!ray_info.aabb.intersects(aabb)) {
       return;
     }
+    const BvhWideNode *node_array = nodes;
+    const BvhWideLeaf *leaf_array = leaves;
     uint32_t stack[k_bvh_stack_size];
     stack[0] = 0;
     int stack_len = 1;
@@ -159,7 +172,7 @@ struct BvhView {
       --stack_len;
       uint32_t work = stack[stack_len];
       if (work & k_bvh_leaf_bit) {
-        const BvhWideLeaf &leaf = leaves[work & ~k_bvh_leaf_bit];
+        const BvhWideLeaf &leaf = leaf_array[work & ~k_bvh_leaf_bit];
         if (!have_pack) {
           pack = ray_info.calc_pos_dir();
           have_pack = true;
@@ -171,14 +184,9 @@ struct BvhView {
         }
         continue;
       }
-      const BvhWideNode &node = nodes[work];
+      const BvhWideNode &node = node_array[work];
       uint32_t mask = node.intersection_mask(node_cull);
-      for (int lane = static_cast<int>(node.child_count) - 1; lane >= 0;
-           --lane) {
-        if (mask & (1u << lane)) {
-          stack[stack_len++] = node.children[lane];
-        }
-      }
+      stack_len = node.push_children(mask, stack, stack_len);
     }
   }
 };
