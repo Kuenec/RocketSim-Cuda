@@ -1065,6 +1065,33 @@ RS_HD bool arena_collect_job_leaves(const LaneGroup &lanes, StepScratch &sc,
   return true;
 }
 
+inline constexpr uint32_t k_rank_chunk = 8;
+
+template <typename Place>
+RS_HD void rank_collected_leaves(const LaneGroup &lanes, const uint32_t *leaves,
+                                 uint32_t count, Place place) {
+  for (uint32_t base = 0; base < count; base += lanes.size * k_rank_chunk) {
+    uint32_t own[k_rank_chunk];
+    uint32_t rank[k_rank_chunk];
+    for (uint32_t m = 0; m < k_rank_chunk; ++m) {
+      uint32_t e = base + lanes.lane + m * lanes.size;
+      own[m] = e < count ? leaves[e] : 0u;
+      rank[m] = 0;
+    }
+    for (uint32_t k = 0; k < count; ++k) {
+      uint32_t v = leaves[k];
+      for (uint32_t m = 0; m < k_rank_chunk; ++m) {
+        rank[m] += v < own[m] ? 1u : 0u;
+      }
+    }
+    for (uint32_t m = 0; m < k_rank_chunk; ++m) {
+      if (base + lanes.lane + m * lanes.size < count) {
+        place(own[m], rank[m]);
+      }
+    }
+  }
+}
+
 RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
   GateItems &items = sc.gate_items;
   if (lanes.size < k_parallel_collect_lanes) {
@@ -1090,14 +1117,9 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
           wide <= k_collect_memo_leaves) {
         CollectMemoOwner &owner = sc.collect_memo[job.memo_owner];
         CollectMemo &slot = owner.slots[owner.next % k_collect_memo_slots];
-        for (uint32_t e = lanes.lane; e < wide; e += lanes.size) {
-          uint32_t leaf = sc.collect_leaves[e];
-          uint32_t rank = 0;
-          for (uint32_t k = 0; k < wide; ++k) {
-            rank += sc.collect_leaves[k] < leaf ? 1u : 0u;
-          }
-          slot.leaves[rank] = leaf;
-        }
+        rank_collected_leaves(
+            lanes, sc.collect_leaves, wide,
+            [&](uint32_t leaf, uint32_t rank) { slot.leaves[rank] = leaf; });
         lanes.group_sync();
         if (lanes.leader()) {
           slot.valid = true;
@@ -1161,17 +1183,13 @@ RS_HD void arena_collect_gate_items(StepScratch &sc, const LaneGroup &lanes) {
     }
     uint32_t room = k_max_gate_triangles - start;
     const BvhWideLeaf *leaves = job.bvh->leaves;
-    for (uint32_t e = lanes.lane; e < found; e += lanes.size) {
-      uint32_t leaf = sc.collect_leaves[e];
-      uint32_t rank = 0;
-      for (uint32_t k = 0; k < found; ++k) {
-        rank += sc.collect_leaves[k] < leaf ? 1u : 0u;
-      }
-      if (rank < room) {
-        items.job[start + rank] = static_cast<uint8_t>(j);
-        items.tri_idx[start + rank] = leaves[leaf].leaf_idx;
-      }
-    }
+    rank_collected_leaves(
+        lanes, sc.collect_leaves, found, [&](uint32_t leaf, uint32_t rank) {
+          if (rank < room) {
+            items.job[start + rank] = static_cast<uint8_t>(j);
+            items.tri_idx[start + rank] = leaves[leaf].leaf_idx;
+          }
+        });
     lanes.group_sync();
     if (lanes.leader()) {
       uint32_t stored = found < room ? found : room;
