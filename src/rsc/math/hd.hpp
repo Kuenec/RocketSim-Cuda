@@ -101,6 +101,15 @@ RS_HDI bool is_nan_f32(float x) {
   return (f32_to_u32(x) & 0x7fffffffu) > 0x7f800000u;
 }
 
+RS_HDI float div_f32(float a, float b) {
+#ifdef __CUDA_ARCH__
+  if (a == 0.0f && b != 0.0f && !is_nan_f32(b)) {
+    return u32_to_f32((f32_to_u32(a) ^ f32_to_u32(b)) & 0x80000000u);
+  }
+#endif
+  return a / b;
+}
+
 RS_HDI uint32_t lowest_set_bit(uint64_t x) {
 #ifdef __CUDA_ARCH__
   return static_cast<uint32_t>(__ffsll(static_cast<long long>(x)) - 1);

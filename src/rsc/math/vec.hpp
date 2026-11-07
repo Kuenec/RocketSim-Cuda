@@ -107,11 +107,15 @@ struct Vec3A {
   RS_HDI Vec3A operator+(Vec3A o) const { return {x + o.x, y + o.y, z + o.z}; }
   RS_HDI Vec3A operator-(Vec3A o) const { return {x - o.x, y - o.y, z - o.z}; }
   RS_HDI Vec3A operator*(Vec3A o) const { return {x * o.x, y * o.y, z * o.z}; }
-  RS_HDI Vec3A operator/(Vec3A o) const { return {x / o.x, y / o.y, z / o.z}; }
+  RS_HDI Vec3A operator/(Vec3A o) const {
+    return {div_f32(x, o.x), div_f32(y, o.y), div_f32(z, o.z)};
+  }
   RS_HDI Vec3A operator+(float s) const { return {x + s, y + s, z + s}; }
   RS_HDI Vec3A operator-(float s) const { return {x - s, y - s, z - s}; }
   RS_HDI Vec3A operator*(float s) const { return {x * s, y * s, z * s}; }
-  RS_HDI Vec3A operator/(float s) const { return {x / s, y / s, z / s}; }
+  RS_HDI Vec3A operator/(float s) const {
+    return {div_f32(x, s), div_f32(y, s), div_f32(z, s)};
+  }
   RS_HDI Vec3A operator-() const { return {-x, -y, -z}; }
   RS_HDI Vec3A &operator+=(Vec3A o) {
     *this = *this + o;
@@ -268,7 +272,7 @@ struct Vec4 {
     return {x * o.x, y * o.y, z * o.z, w * o.w};
   }
   RS_HDI Vec4 operator/(Vec4 o) const {
-    return {x / o.x, y / o.y, z / o.z, w / o.w};
+    return {div_f32(x, o.x), div_f32(y, o.y), div_f32(z, o.z), div_f32(w, o.w)};
   }
   RS_HDI Vec4 operator*(float s) const { return *this * splat(s); }
   RS_HDI Vec4 operator-() const { return {-x, -y, -z, -w}; }
