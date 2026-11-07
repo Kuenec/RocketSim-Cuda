@@ -93,7 +93,7 @@ RS_HD float sinf_poly(double x, double x2, const SincosTable &p, int n) {
   return static_cast<float>(fma_f64(x6, c2, c));
 }
 
-RS_HD float sincosf_eval(float y, int cos_shift) {
+RS_HD RS_FMA_DISPATCH float sincosf_eval(float y, int cos_shift) {
   double x = y;
   int n;
   const SincosTable *p = &sincosf_table(0);
@@ -162,8 +162,9 @@ RS_HD float atan2f_tiny(float y, float x) {
   return rf;
 }
 
-RS_HD float atan2f_accurate(float y, float x, uint32_t ax, uint32_t ay,
-                            uint32_t gt, uint32_t i, double zx, double zy) {
+RS_HD RS_FMA_DISPATCH float atan2f_accurate(float y, float x, uint32_t ax,
+                                            uint32_t ay, uint32_t gt,
+                                            uint32_t i, double zx, double zy) {
   static constexpr double sgn[2] = {1, -1};
   static constexpr double off[8] = {0.0f,
                                     0x1.921fb54442d18p+0,

@@ -43,7 +43,7 @@ RS_HD double hypot_kernel(double ax, double ay) {
 
 }
 
-RS_HD double atan2_glibc(double y, double x) {
+RS_HD RS_FMA_DISPATCH double atan2_glibc(double y, double x) {
   using namespace glibc_atan;
   using detail::atan2_sign;
   using detail::glibc_c;
@@ -253,7 +253,7 @@ RS_HD double atan2_glibc(double y, double x) {
   return atan2_sign(y, z);
 }
 
-RS_HD double hypot_glibc(double x, double y) {
+RS_HD RS_FMA_DISPATCH double hypot_glibc(double x, double y) {
   constexpr double scale = 0x1p-600;
   constexpr double large_val = 0x1p+511;
   constexpr double tiny_val = 0x1p-459;
