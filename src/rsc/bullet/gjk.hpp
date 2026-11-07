@@ -1474,7 +1474,7 @@ struct ConvexCastResult {
   float fraction;
 };
 
-RS_HDN bool calc_time_of_impact(const ConvexShape &convex_b, Vec3A from_a,
+RS_HDI bool calc_time_of_impact(const ConvexShape &convex_b, Vec3A from_a,
                                 Vec3A to_a, ConvexCastResult &out) {
   VoronoiSimplexSolver simplex_solver;
   simplex_solver.init();

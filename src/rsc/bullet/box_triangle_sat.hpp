@@ -801,7 +801,7 @@ struct SatSweepState {
   sat::SweepResult sweep;
 };
 
-RS_HDN bool box_triangle_sat_finish(const Affine3A &box_trans,
+RS_HDI bool box_triangle_sat_finish(const Affine3A &box_trans,
                                     Vec3A half_unmargined, float margin,
                                     const Vec3A *q, float maximum_distance,
                                     const SatSweepState &state,
@@ -844,7 +844,7 @@ RS_HDN bool box_triangle_sat_finish(const Affine3A &box_trans,
   return true;
 }
 
-RS_HDN SatStage box_triangle_sat_stage(const Affine3A &box_trans,
+RS_HDI SatStage box_triangle_sat_stage(const Affine3A &box_trans,
                                        Vec3A half_unmargined, float margin,
                                        const Vec3A *q, float maximum_distance,
                                        SatSweepState *deferred,
