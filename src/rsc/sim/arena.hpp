@@ -252,7 +252,7 @@ struct StepScratch {
 enum class RecordSink : uint8_t { Records, Job };
 
 struct ContactTracker {
-  World *w;
+  World w;
   StepScratch *sc;
   bool ball_only;
   RecordSink sink;
@@ -297,7 +297,7 @@ struct ContactTracker {
       return;
     }
     if (sc->num_records >= k_max_records) {
-      w->flag_error(k_error_records_overflow);
+      w.flag_error(k_error_records_overflow);
       return;
     }
     sc->records[sc->num_records++] = record;
@@ -334,7 +334,7 @@ struct ContactTracker {
       if (sink == RecordSink::Job) {
         sc->job_records[job].overflow = true;
       } else if (sc->num_ball_world >= k_max_ball_world_records) {
-        w->flag_error(k_error_records_overflow);
+        w.flag_error(k_error_records_overflow);
       } else {
         sc->ball_world[sc->num_ball_world++] = {
             a.world_array_idx, cp.pos_world_on_b, cp.normal_world_on_b};
@@ -343,7 +343,7 @@ struct ContactTracker {
       push_record(swap, a.world_array_idx, b.world_array_idx, cp);
     }
     if (idx >= 0) {
-      adjust_internal_edge_contacts(*w, cp, b, idx);
+      adjust_internal_edge_contacts(w, cp, b, idx);
     }
   }
 
@@ -385,7 +385,7 @@ struct ContactTracker {
       }
       if (!found) {
         if (sc->num_groups >= k_max_normal_groups) {
-          w->flag_error(k_error_records_overflow);
+          w.flag_error(k_error_records_overflow);
         } else {
           sc->groups[sc->num_groups++] = {car_idx, object_idx, normal};
         }
@@ -1277,7 +1277,7 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
     }
   }
   lanes.barrier();
-  ContactTracker tracker{&w, &sc, a.ball_only, RecordSink::Records, 0};
+  ContactTracker tracker{w, &sc, a.ball_only, RecordSink::Records, 0};
   if (lanes.leader()) {
     if constexpr (Lanes::k_cooperative) {
       collision_apply_aabbs(w, sc.body_aabbs);

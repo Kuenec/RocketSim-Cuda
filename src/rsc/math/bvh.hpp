@@ -131,17 +131,12 @@ struct BvhView {
     uint32_t stack[k_bvh_stack_size];
     stack[0] = 0;
     int stack_len = 1;
-    bool have_pack = false;
-    SingleRayPack pack;
+    SingleRayPack pack = single_ray_pack(source, target);
     while (stack_len != 0) {
       --stack_len;
       uint32_t work = stack[stack_len];
       if (work & k_bvh_leaf_bit) {
         const BvhWideLeaf &leaf = leaf_array[work & ~k_bvh_leaf_bit];
-        if (!have_pack) {
-          pack = single_ray_pack(source, target);
-          have_pack = true;
-        }
         if (single_ray_slab(pack.origin, pack.inv_dir, leaf.bounds,
                             lambda_max)) {
           callback.process_node(leaf.leaf_idx, lambda_max);
