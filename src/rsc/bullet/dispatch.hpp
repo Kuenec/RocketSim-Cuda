@@ -262,18 +262,18 @@ struct GateItems {
 
 struct GateLeafSink {
   GateItems *items;
-  GateJob *job;
   uint8_t job_idx;
+  uint32_t count;
+  bool complete;
 
   RS_HD void process_node(uint32_t triangle_idx) {
-    if (items->count >= k_max_gate_triangles) {
-      job->items_complete = false;
+    if (count >= k_max_gate_triangles) {
+      complete = false;
       return;
     }
-    items->job[items->count] = job_idx;
-    items->tri_idx[items->count] = triangle_idx;
-    ++items->count;
-    ++job->num_items;
+    items->job[count] = job_idx;
+    items->tri_idx[count] = triangle_idx;
+    ++count;
   }
 };
 
@@ -440,11 +440,12 @@ RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
 
 RS_HD void gate_collect_job_serial(GateJob &job, uint32_t job_idx,
                                    GateItems &items) {
-  job.items_complete = true;
-  job.first_item = items.count;
-  job.num_items = 0;
-  GateLeafSink sink{&items, &job, static_cast<uint8_t>(job_idx)};
+  GateLeafSink sink{&items, static_cast<uint8_t>(job_idx), items.count, true};
   job.bvh->report_aabb_overlapping_node(sink, job.params.local_convex_aabb);
+  job.items_complete = sink.complete;
+  job.first_item = items.count;
+  job.num_items = sink.count - items.count;
+  items.count = sink.count;
 }
 
 RS_HD bool gate_test_item_begin(const GateJob *jobs, GateItems &items,
