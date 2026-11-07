@@ -1,6 +1,7 @@
 #include "rocketsim_cuda/cuda_batch.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -21,6 +22,7 @@ constexpr size_t k_callee_stack_headroom = 1024;
 constexpr uint32_t k_max_lanes_per_arena = 32;
 constexpr uint32_t k_timed_launches = 64;
 constexpr uint32_t k_cost_buckets = 64;
+constexpr uint32_t k_copy_block_size = 256;
 
 uint32_t pow2_lanes(uint32_t wanted) {
   uint32_t lanes = 1;
@@ -145,6 +147,26 @@ __global__ void resident_step_kernel(const ArenaStatic *__restrict__ st,
                    ticks, blockIdx.x, blockIdx.x, __activemask());
 }
 
+static_assert(sizeof(Arena) % sizeof(uint64_t) == 0);
+static_assert(alignof(Arena) >= alignof(uint64_t));
+
+__global__ void copy_arenas_kernel(const Arena *from, Arena *to,
+                                   const uint32_t *from_arenas,
+                                   const uint32_t *to_arenas) {
+  const auto *src = reinterpret_cast<const unsigned char *>(
+      from + (from_arenas ? from_arenas[blockIdx.x] : blockIdx.x));
+  auto *dst = reinterpret_cast<unsigned char *>(
+      to + (to_arenas ? to_arenas[blockIdx.x] : blockIdx.x));
+  for (size_t offset = threadIdx.x * sizeof(uint64_t); offset < sizeof(Arena);
+       offset += blockDim.x * sizeof(uint64_t)) {
+    uint64_t word;
+    memcpy(&word, __builtin_assume_aligned(src + offset, alignof(uint64_t)),
+           sizeof(word));
+    memcpy(__builtin_assume_aligned(dst + offset, alignof(uint64_t)), &word,
+           sizeof(word));
+  }
+}
+
 __global__ void controls_kernel(Arena *arenas,
                                 const rocketsim_cuda::CarControls *controls,
                                 const uint8_t *mask, uint32_t cars_per_arena,
@@ -244,8 +266,10 @@ struct CudaBatch::Impl {
   size_t out_tiles_capacity = 0;
   DeviceArray<rocketsim_cuda::EventCounts> out_counts;
   size_t out_counts_capacity = 0;
-  DeviceArray<Arena> copy_staging;
-  size_t copy_capacity = 0;
+  DeviceArray<uint32_t> copy_from_arenas;
+  size_t copy_from_capacity = 0;
+  DeviceArray<uint32_t> copy_to_arenas;
+  size_t copy_to_capacity = 0;
   ArenaStatic view;
   DeviceArray<ArenaStatic> device_view;
   cudaStream_t stream = nullptr;
@@ -626,23 +650,55 @@ void CudaBatch::copy_from(const CudaBatch &src, const uint32_t *src_arenas,
     return;
   }
   check(cudaStreamSynchronize(src.impl_->stream), "source stream synchronize");
-  if (count > impl_->copy_capacity) {
-    impl_->copy_staging.allocate(count);
-    impl_->copy_capacity = count;
-  }
+  Impl &im = *impl_;
+  std::vector<std::pair<uint32_t, uint32_t>> moves;
+  moves.reserve(count);
   for (uint32_t k = 0; k < count; ++k) {
-    check(cudaMemcpyAsync(impl_->copy_staging.get() + k,
-                          src.impl_->arenas.get() + src_arenas[k],
-                          sizeof(Arena), cudaMemcpyDeviceToDevice,
-                          impl_->stream),
-          "arena copy");
+    moves.push_back({dst_arenas[k], k});
   }
-  for (uint32_t k = 0; k < count; ++k) {
-    check(cudaMemcpyAsync(impl_->arenas.get() + dst_arenas[k],
-                          impl_->copy_staging.get() + k, sizeof(Arena),
-                          cudaMemcpyDeviceToDevice, impl_->stream),
-          "arena copy");
+  std::sort(moves.begin(), moves.end());
+  std::vector<uint32_t> from;
+  std::vector<uint32_t> to;
+  for (size_t k = 0; k < moves.size(); ++k) {
+    if (k + 1 < moves.size() && moves[k + 1].first == moves[k].first) {
+      continue;
+    }
+    from.push_back(src_arenas[moves[k].second]);
+    to.push_back(moves[k].first);
   }
+  bool overlap = false;
+  if (&src == this) {
+    std::vector<uint32_t> sources = from;
+    std::sort(sources.begin(), sources.end());
+    overlap = std::any_of(to.begin(), to.end(), [&](uint32_t arena) {
+      return std::binary_search(sources.begin(), sources.end(), arena);
+    });
+  }
+  uint32_t kept = static_cast<uint32_t>(to.size());
+  uint32_t *from_device =
+      staged(im.copy_from_arenas, im.copy_from_capacity, kept);
+  uint32_t *to_device = staged(im.copy_to_arenas, im.copy_to_capacity, kept);
+  check(cudaMemcpyAsync(from_device, from.data(), sizeof(uint32_t) * kept,
+                        cudaMemcpyHostToDevice, im.stream),
+        "copy source upload");
+  check(cudaMemcpyAsync(to_device, to.data(), sizeof(uint32_t) * kept,
+                        cudaMemcpyHostToDevice, im.stream),
+        "copy destination upload");
+  if (!overlap) {
+    copy_arenas_kernel<<<kept, k_copy_block_size, 0, im.stream>>>(
+        src.impl_->arenas.get(), im.arenas.get(), from_device, to_device);
+    check(cudaGetLastError(), "arena copy kernel launch");
+    sync();
+    return;
+  }
+  DeviceArray<Arena> staging;
+  staging.allocate(kept);
+  copy_arenas_kernel<<<kept, k_copy_block_size, 0, im.stream>>>(
+      im.arenas.get(), staging.get(), from_device, nullptr);
+  check(cudaGetLastError(), "arena gather kernel launch");
+  copy_arenas_kernel<<<kept, k_copy_block_size, 0, im.stream>>>(
+      staging.get(), im.arenas.get(), nullptr, to_device);
+  check(cudaGetLastError(), "arena scatter kernel launch");
   sync();
 }
 

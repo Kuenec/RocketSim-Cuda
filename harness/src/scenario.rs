@@ -105,6 +105,7 @@ pub enum Action {
     SnapshotRoundTrip,
     CrossBatchCopy,
     CrossBackendCopy,
+    PermuteCopy,
 }
 
 #[derive(Clone)]
@@ -987,6 +988,17 @@ fn apply_action(
                 ours.copy_from(Some(&temp), &[1], &[n as u32 - 1])?;
                 upstream[n - 1] = clone;
             }
+        }
+        Action::PermuteCopy => {
+            let mut srcs: Vec<u32> = (0..n as u32).rev().collect();
+            let mut dsts: Vec<u32> = (0..n as u32).collect();
+            srcs.push(0);
+            dsts.push(0);
+            let snapshot: Vec<_> = srcs.iter().map(|&s| upstream[s as usize].clone()).collect();
+            for (k, &d) in dsts.iter().enumerate() {
+                upstream[d as usize] = snapshot[k].clone();
+            }
+            ours.copy_from(None, &srcs, &dsts)?;
         }
         Action::BallIntoGoal => {
             for (i, arena) in upstream.iter_mut().enumerate() {

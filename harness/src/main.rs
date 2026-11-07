@@ -241,6 +241,7 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
         (scale(1200), Action::CarsCollide),
         (scale(900), Action::KickoffMaskedRng),
         (scale(1100), Action::KickoffMaskedSeeded),
+        (scale(1300), Action::PermuteCopy),
     ];
     out.push(batch);
 
