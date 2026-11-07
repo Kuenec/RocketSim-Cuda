@@ -17,6 +17,10 @@
 #include "rocketsim_cuda/cuda_batch.hpp"
 #include "rsc/host/builder.hpp"
 
+#ifdef RSC_CPU_STEP
+#include "rocketsim_cuda/cpu_step.hpp"
+#endif
+
 namespace rocketsim_cuda {
 
 using namespace convert;
@@ -144,8 +148,10 @@ struct ExportJob {
 using CpuJob = std::variant<StepJob, ExportJob>;
 
 constexpr uint32_t k_parallel_export_rows = 256;
+#ifdef RSC_HAS_CUDA
 constexpr uint32_t k_balance_window = 16;
 constexpr uint32_t k_balance_band_divisor = 256;
+#endif
 
 class CpuPool {
 public:
@@ -198,10 +204,7 @@ private:
       for (size_t i = first; i < last; ++i) {
         rsc::Arena &a = pool.arenas_[i];
         a.counters = rsc::ArenaEventCounters{};
-        for (uint32_t t = 0; t < job.ticks; ++t) {
-          rsc::arena_step_tick(pool.view_, a, *pool.scratch_[worker],
-                               rsc::SingleLane{});
-        }
+        pool.step(a, *pool.scratch_[worker], job.ticks);
       }
     }
 
@@ -213,6 +216,20 @@ private:
       }
     }
   };
+
+  void step(rsc::Arena &a, rsc::StepScratch &scratch, uint32_t ticks) const {
+#ifdef RSC_CPU_STEP_AVX2
+    if (avx2_step_) {
+      step_arena_avx2(view_, a, scratch, ticks);
+      return;
+    }
+#endif
+#ifdef RSC_CPU_STEP
+    step_arena(view_, a, scratch, ticks);
+#else
+    rsc::arena_step_ticks(view_, a, scratch, ticks);
+#endif
+  }
 
   std::pair<size_t, size_t> share(uint32_t worker, size_t total) const {
     size_t parts = scratch_.size();
@@ -247,6 +264,9 @@ private:
 
   const rsc::ArenaStatic &view_;
   std::deque<rsc::Arena> &arenas_;
+#ifdef RSC_CPU_STEP_AVX2
+  bool avx2_step_ = cpu_supports_avx2_step();
+#endif
   std::vector<std::unique_ptr<rsc::StepScratch>> scratch_;
   std::vector<std::thread> workers_;
   std::mutex mutex_;

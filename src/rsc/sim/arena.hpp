@@ -1410,4 +1410,11 @@ RS_HD void arena_step_tick(const ArenaStatic &st, Arena &a, StepScratch &sc,
   lanes.barrier();
 }
 
+inline void arena_step_ticks(const ArenaStatic &st, Arena &a, StepScratch &sc,
+                             uint32_t ticks) {
+  for (uint32_t t = 0; t < ticks; ++t) {
+    arena_step_tick(st, a, sc, SingleLane{});
+  }
+}
+
 }

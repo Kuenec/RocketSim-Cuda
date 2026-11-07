@@ -23,8 +23,8 @@
 #define RS_HOST_NOINLINE __attribute__((noinline))
 #endif
 
-#if !defined(__CUDACC__) && !defined(__FMA__) && defined(__x86_64__) &&        \
-    defined(__ELF__) && defined(__has_attribute)
+#if !defined(RS_FMA_DISPATCH) && !defined(__CUDACC__) && !defined(__FMA__) &&  \
+    defined(__x86_64__) && defined(__ELF__) && defined(__has_attribute)
 #if __has_attribute(target_clones)
 #define RS_FMA_DISPATCH __attribute__((target_clones("fma", "default")))
 #endif
