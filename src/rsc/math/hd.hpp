@@ -80,7 +80,11 @@ RS_HDI float sqrt_f32(float x) { return ::sqrtf(x); }
 RS_HDI double sqrt_f64(double x) { return ::sqrt(x); }
 
 RS_HDI float abs_f32(float x) {
+#ifdef __CUDA_ARCH__
   return u32_to_f32(f32_to_u32(x) & 0x7fffffffu);
+#else
+  return __builtin_fabsf(x);
+#endif
 }
 
 RS_HDI double abs_f64(double x) {
@@ -88,8 +92,12 @@ RS_HDI double abs_f64(double x) {
 }
 
 RS_HDI float copysign_f32(float mag, float sign) {
+#ifdef __CUDA_ARCH__
   return u32_to_f32((f32_to_u32(mag) & 0x7fffffffu) |
                     (f32_to_u32(sign) & 0x80000000u));
+#else
+  return __builtin_copysignf(mag, sign);
+#endif
 }
 
 RS_HDI double copysign_f64(double mag, double sign) {
@@ -98,7 +106,11 @@ RS_HDI double copysign_f64(double mag, double sign) {
 }
 
 RS_HDI bool is_nan_f32(float x) {
+#ifdef __CUDA_ARCH__
   return (f32_to_u32(x) & 0x7fffffffu) > 0x7f800000u;
+#else
+  return __builtin_isnan(x);
+#endif
 }
 
 RS_HDI float div_f32(float a, float b) {
@@ -135,7 +147,11 @@ RS_HDI uint32_t popcount32(uint32_t x) {
 }
 
 RS_HDI bool is_finite_f32(float x) {
+#ifdef __CUDA_ARCH__
   return (f32_to_u32(x) & 0x7fffffffu) < 0x7f800000u;
+#else
+  return __builtin_isfinite(x);
+#endif
 }
 
 RS_HDI bool is_sign_negative_f32(float x) {

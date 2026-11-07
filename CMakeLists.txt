@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
 
+if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+  find_program(RSC_CLANG_CXX clang++)
+  if(RSC_CLANG_CXX)
+    set(CMAKE_CXX_COMPILER "${RSC_CLANG_CXX}")
+  endif()
+endif()
+
 project(RocketSimCuda VERSION 3.0.0 LANGUAGES CXX)
 
 option(RSC_ENABLE_CUDA "Build the CUDA backend" ON)
@@ -15,7 +22,8 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-set(RSC_HOST_FLAGS -ffp-contract=off -fno-fast-math -fno-finite-math-only)
+set(RSC_HOST_FLAGS -ffp-contract=off -fno-fast-math -fno-finite-math-only
+  -fno-math-errno)
 if(RSC_NATIVE_ARCH)
   list(APPEND RSC_HOST_FLAGS -march=native)
 endif()
