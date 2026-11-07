@@ -113,10 +113,10 @@ Soccar 1v1, Octane vs Octane, new random controls every 8 ticks, measured after 
 
 | Arenas | Upstream Rust v0.3.5, 1 thread | C++ CPU, 1 thread | C++ CPU, all cores | CUDA | Hybrid |
 | --- | --- | --- | --- | --- | --- |
-| 100 | 1.02M (0.97M to 1.09M) | 0.73M (0.71M to 0.79M) | 4.62M (4.52M to 5.75M) | 0.95M (0.86M to 1.02M) | 3.99M (2.86M to 4.24M) |
-| 1,000 | 0.81M (0.79M to 0.85M) | 0.67M (0.66M to 0.72M) | 6.23M (6.11M to 6.80M) | 4.46M (3.83M to 4.70M) | 6.43M (5.69M to 6.93M) |
-| 10,000 | 0.73M (0.73M to 0.76M) | 0.64M (0.63M to 0.68M) | 6.04M (5.35M to 6.17M) | 10.59M (10.39M to 10.98M) | 14.02M (13.00M to 14.85M) |
-| 20,000 | 0.73M (0.72M to 0.77M) | 0.65M (0.64M to 0.68M) | 6.30M (5.98M to 6.60M) | 11.06M (10.88M to 11.65M) | 14.79M (13.72M to 15.03M) |
+| 100 | 1.03M (0.98M to 1.11M) | 0.73M (0.70M to 0.78M) | 5.20M (4.81M to 5.70M) | 1.39M (1.26M to 1.44M) | 4.16M (3.29M to 4.39M) |
+| 1,000 | 0.89M (0.87M to 0.95M) | 0.70M (0.67M to 0.73M) | 6.69M (6.53M to 7.12M) | 6.60M (5.97M to 6.65M) | 8.78M (7.29M to 8.92M) |
+| 10,000 | 0.74M (0.74M to 0.78M) | 0.64M (0.63M to 0.67M) | 6.47M (5.59M to 6.82M) | 14.24M (14.05M to 14.88M) | 17.13M (16.33M to 17.26M) |
+| 20,000 | 0.75M (0.74M to 0.78M) | 0.64M (0.63M to 0.67M) | 6.35M (6.20M to 6.67M) | 14.82M (14.48M to 15.60M) | 18.89M (18.30M to 20.03M) |
 
 With `-DRSC_NATIVE_ARCH=ON` the single-thread CPU backend measures 0.78M, 0.72M, and 0.67M at 100, 1,000, and 10,000 arenas, and the all-cores CPU backend 5.24M, 6.74M, and 6.63M.
 
