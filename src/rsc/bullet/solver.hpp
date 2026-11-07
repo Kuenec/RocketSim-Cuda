@@ -18,6 +18,25 @@ inline constexpr float k_warmstarting_factor = 0.85f;
 inline constexpr int k_max_solver_bodies = k_max_dyn_bodies + 1;
 inline constexpr int k_max_constraints = 192;
 
+inline constexpr float k_residual_exact_min_jac = 0x1p-50f;
+inline constexpr float k_residual_nonzero_ratio = 0x1p-74f;
+inline constexpr float k_residual_zero_ratio = 0x1p-76f;
+
+RS_HDI float convergence_residual(float delta_impulse, float jac_diag_ab_inv) {
+  float delta = abs_f32(delta_impulse);
+  float jac = abs_f32(jac_diag_ab_inv);
+  if (is_finite_f32(delta) && is_finite_f32(jac) &&
+      jac >= k_residual_exact_min_jac) {
+    if (delta >= jac * k_residual_nonzero_ratio) {
+      return 1.0f;
+    }
+    if (delta <= jac * k_residual_zero_ratio) {
+      return 0.0f;
+    }
+  }
+  return delta_impulse / jac_diag_ab_inv;
+}
+
 RS_HDI float bullet_dot(Vec3A a, Vec3A b) {
   Vec3A r = a * b;
   return r.x + (r.y + r.z);
@@ -304,7 +323,7 @@ struct SolverConstraint {
     }
     body.delta_lin_vel += contact_normal_1 * body.inv_mass * delta_impulse;
     body.delta_ang_vel += angular_component_a * delta_impulse;
-    return delta_impulse / jac_diag_ab_inv;
+    return convergence_residual(delta_impulse, jac_diag_ab_inv);
   }
 
   RS_HD float resolve_generic_one_dynamic(SolverBody &body) {
@@ -325,7 +344,7 @@ struct SolverConstraint {
     }
     body.delta_lin_vel += contact_normal_1 * body.inv_mass * delta_impulse;
     body.delta_ang_vel += angular_component_a * delta_impulse;
-    return delta_impulse / jac_diag_ab_inv;
+    return convergence_residual(delta_impulse, jac_diag_ab_inv);
   }
 
   RS_HD float resolve_split_one_dynamic(SolverBody &body) {
@@ -345,73 +364,89 @@ struct SolverConstraint {
     }
     body.push_vel += contact_normal_1 * body.inv_mass * delta_impulse;
     body.turn_vel += angular_component_a * delta_impulse;
-    return delta_impulse / jac_diag_ab_inv;
+    return convergence_residual(delta_impulse, jac_diag_ab_inv);
   }
 
   RS_HD float resolve_two(SolverBody &ba, SolverBody &bb, bool upper) {
-    float delta_impulse = rhs;
-    float d1 = ba.original_body >= 0
-                   ? bullet_dot(contact_normal_1, ba.delta_lin_vel) +
-                         bullet_dot(rel_pos1_cross_normal, ba.delta_ang_vel)
-                   : 0.0f;
-    float d2 = bb.original_body >= 0
-                   ? bullet_dot(contact_normal_2, bb.delta_lin_vel) +
-                         bullet_dot(rel_pos2_cross_normal, bb.delta_ang_vel)
-                   : 0.0f;
-    delta_impulse -= d1 * jac_diag_ab_inv;
-    delta_impulse -= d2 * jac_diag_ab_inv;
-    float sum = applied_impulse + delta_impulse;
-    if (sum < lower_limit) {
-      delta_impulse = lower_limit - applied_impulse;
-      applied_impulse = lower_limit;
-    } else if (upper && sum > upper_limit) {
-      delta_impulse = upper_limit - applied_impulse;
-      applied_impulse = upper_limit;
-    } else {
-      applied_impulse = sum;
+    const SolverConstraint c = *this;
+    bool a_dynamic = ba.original_body >= 0;
+    bool b_dynamic = bb.original_body >= 0;
+    Vec3A a_lin = ba.delta_lin_vel;
+    Vec3A a_ang = ba.delta_ang_vel;
+    Vec3A a_inv_mass = ba.inv_mass;
+    Vec3A b_lin = bb.delta_lin_vel;
+    Vec3A b_ang = bb.delta_ang_vel;
+    Vec3A b_inv_mass = bb.inv_mass;
+    float delta_impulse = c.rhs;
+    float d1 = a_dynamic ? bullet_dot(c.contact_normal_1, a_lin) +
+                               bullet_dot(c.rel_pos1_cross_normal, a_ang)
+                         : 0.0f;
+    float d2 = b_dynamic ? bullet_dot(c.contact_normal_2, b_lin) +
+                               bullet_dot(c.rel_pos2_cross_normal, b_ang)
+                         : 0.0f;
+    delta_impulse -= d1 * c.jac_diag_ab_inv;
+    delta_impulse -= d2 * c.jac_diag_ab_inv;
+    float sum = c.applied_impulse + delta_impulse;
+    float applied = sum;
+    if (sum < c.lower_limit) {
+      delta_impulse = c.lower_limit - c.applied_impulse;
+      applied = c.lower_limit;
+    } else if (upper && sum > c.upper_limit) {
+      delta_impulse = c.upper_limit - c.applied_impulse;
+      applied = c.upper_limit;
     }
-    if (ba.original_body >= 0) {
-      ba.delta_lin_vel += contact_normal_1 * ba.inv_mass * delta_impulse;
-      ba.delta_ang_vel += angular_component_a * delta_impulse;
+    applied_impulse = applied;
+    if (a_dynamic) {
+      ba.delta_lin_vel =
+          a_lin + c.contact_normal_1 * a_inv_mass * delta_impulse;
+      ba.delta_ang_vel = a_ang + c.angular_component_a * delta_impulse;
     }
-    if (bb.original_body >= 0) {
-      bb.delta_lin_vel += contact_normal_2 * bb.inv_mass * delta_impulse;
-      bb.delta_ang_vel += angular_component_b * delta_impulse;
+    if (b_dynamic) {
+      bb.delta_lin_vel =
+          b_lin + c.contact_normal_2 * b_inv_mass * delta_impulse;
+      bb.delta_ang_vel = b_ang + c.angular_component_b * delta_impulse;
     }
-    return delta_impulse / jac_diag_ab_inv;
+    return convergence_residual(delta_impulse, c.jac_diag_ab_inv);
   }
 
   RS_HD float resolve_split_two(SolverBody &ba, SolverBody &bb) {
-    if (rhs_penetration == 0.0f) {
+    const SolverConstraint c = *this;
+    if (c.rhs_penetration == 0.0f) {
       return 0.0f;
     }
-    float delta_impulse = rhs_penetration;
-    float d1 = ba.original_body >= 0
-                   ? bullet_dot(contact_normal_1, ba.push_vel) +
-                         bullet_dot(rel_pos1_cross_normal, ba.turn_vel)
-                   : 0.0f;
-    float d2 = bb.original_body >= 0
-                   ? bullet_dot(contact_normal_2, bb.push_vel) +
-                         bullet_dot(rel_pos2_cross_normal, bb.turn_vel)
-                   : 0.0f;
-    delta_impulse -= d1 * jac_diag_ab_inv;
-    delta_impulse -= d2 * jac_diag_ab_inv;
-    float sum = applied_push_impulse + delta_impulse;
-    if (sum < lower_limit) {
-      delta_impulse = lower_limit - applied_push_impulse;
-      applied_push_impulse = lower_limit;
-    } else {
-      applied_push_impulse = sum;
+    bool a_dynamic = ba.original_body >= 0;
+    bool b_dynamic = bb.original_body >= 0;
+    Vec3A a_push = ba.push_vel;
+    Vec3A a_turn = ba.turn_vel;
+    Vec3A a_inv_mass = ba.inv_mass;
+    Vec3A b_push = bb.push_vel;
+    Vec3A b_turn = bb.turn_vel;
+    Vec3A b_inv_mass = bb.inv_mass;
+    float delta_impulse = c.rhs_penetration;
+    float d1 = a_dynamic ? bullet_dot(c.contact_normal_1, a_push) +
+                               bullet_dot(c.rel_pos1_cross_normal, a_turn)
+                         : 0.0f;
+    float d2 = b_dynamic ? bullet_dot(c.contact_normal_2, b_push) +
+                               bullet_dot(c.rel_pos2_cross_normal, b_turn)
+                         : 0.0f;
+    delta_impulse -= d1 * c.jac_diag_ab_inv;
+    delta_impulse -= d2 * c.jac_diag_ab_inv;
+    float sum = c.applied_push_impulse + delta_impulse;
+    float applied = sum;
+    if (sum < c.lower_limit) {
+      delta_impulse = c.lower_limit - c.applied_push_impulse;
+      applied = c.lower_limit;
     }
-    if (ba.original_body >= 0) {
-      ba.push_vel += contact_normal_1 * ba.inv_mass * delta_impulse;
-      ba.turn_vel += angular_component_a * delta_impulse;
+    applied_push_impulse = applied;
+    if (a_dynamic) {
+      ba.push_vel = a_push + c.contact_normal_1 * a_inv_mass * delta_impulse;
+      ba.turn_vel = a_turn + c.angular_component_a * delta_impulse;
     }
-    if (bb.original_body >= 0) {
-      bb.push_vel += contact_normal_2 * bb.inv_mass * delta_impulse;
-      bb.turn_vel += angular_component_b * delta_impulse;
+    if (b_dynamic) {
+      bb.push_vel = b_push + c.contact_normal_2 * b_inv_mass * delta_impulse;
+      bb.turn_vel = b_turn + c.angular_component_b * delta_impulse;
     }
-    return delta_impulse / jac_diag_ab_inv;
+    return convergence_residual(delta_impulse, c.jac_diag_ab_inv);
   }
 };
 
