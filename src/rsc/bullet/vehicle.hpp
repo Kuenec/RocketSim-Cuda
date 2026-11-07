@@ -527,7 +527,7 @@ struct VehicleRL {
   }
 
   RS_HD void cast_wheel_rays(const World &w, VehicleHit *hits) const {
-    const Affine3A &trans = w.body(chassis_body_idx).world_trans;
+    const Affine3A trans = w.body(chassis_body_idx).world_trans;
     Vec3A sources[k_num_wheels];
     Vec3A targets[k_num_wheels];
     for (int i = 0; i < k_num_wheels; ++i) {
