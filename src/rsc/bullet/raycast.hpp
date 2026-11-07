@@ -604,69 +604,51 @@ struct CarRayLanes {
   }
 };
 
-RS_HDI Vec3A ray_pick(const Vec3A *rays, uint32_t i) {
-  Vec3A picked = rays[0];
-  for (uint32_t k = 1; k < 4; ++k) {
-    if (i == k) {
-      picked = rays[k];
+struct RayCells {
+  Aabb ray_aabb;
+  uint32_t idxs[4];
+  uint32_t coords[4][3];
+  uint32_t unique;
+};
+
+RS_HD Aabb shfl_aabb(const CarRayLanes &lanes, const Aabb &box, uint32_t src) {
+  return {lanes.shfl(box.min, src), lanes.shfl(box.max, src)};
+}
+
+RS_HD RayCells ray_cells_lanes(const StaticWorldData &s, Vec3A own_from,
+                               Vec3A own_to, const CarRayLanes &lanes) {
+  RayCells cells;
+  Aabb own_segment{own_from.min(own_to), own_from.max(own_to)};
+  cells.ray_aabb = shfl_aabb(lanes, own_segment, 0);
+  for (uint32_t i = 1; i < 4; ++i) {
+    cells.ray_aabb = cells.ray_aabb.combine(shfl_aabb(lanes, own_segment, i));
+  }
+  cells.unique = 0;
+  uint32_t own[3];
+  grid_cell_indices(s, own_from, own);
+  for (uint32_t r = 0; r < 4; ++r) {
+    for (uint32_t k = 0; k < 3; ++k) {
+      cells.coords[r][k] = lanes.shfl(own[k], r);
+    }
+    cells.idxs[r] = grid_cell_index(s, cells.coords[r]);
+    bool found = false;
+    for (uint32_t c = 0; c < r; ++c) {
+      found = found || cells.idxs[c] == cells.idxs[r];
+    }
+    if (!found) {
+      cells.unique |= 1u << r;
     }
   }
-  return picked;
+  return cells;
 }
 
 template <typename Filter, typename RayLanes>
-RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(
-    const World &w, const Vec3A *ray_from, const Vec3A *ray_to,
-    const Filter &filter, const RayLanes &lanes, uint32_t *bodies) {
+RS_HDI uint32_t gather_cell_bodies(const World &w, const Aabb &ray_aabb,
+                                   const uint32_t *cell_idxs,
+                                   const uint32_t (*cell_coords)[3],
+                                   uint32_t unique_cells, const Filter &filter,
+                                   const RayLanes &lanes, uint32_t *bodies) {
   const StaticWorldData &s = *w.s;
-  Aabb ray_aabb{ray_from[0].min(ray_to[0]), ray_from[0].max(ray_to[0])};
-  for (int i = 1; i < 4; ++i) {
-    ray_aabb = ray_aabb.combine(
-        Aabb{ray_from[i].min(ray_to[i]), ray_from[i].max(ray_to[i])});
-  }
-  uint32_t cell_idxs[4];
-  uint32_t cell_coords[4][3];
-  uint32_t unique_cells = 0;
-  if constexpr (RayLanes::size == 1) {
-    uint32_t count = 0;
-    for (uint32_t r = 0; r < 4; ++r) {
-      uint32_t idx3[3];
-      grid_cell_indices(s, ray_from[r], idx3);
-      uint32_t idx = grid_cell_index(s, idx3);
-      bool found = false;
-      for (uint32_t c = 0; c < count; ++c) {
-        if (cell_idxs[c] == idx) {
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        cell_idxs[count] = idx;
-        cell_coords[count][0] = idx3[0];
-        cell_coords[count][1] = idx3[1];
-        cell_coords[count][2] = idx3[2];
-        ++count;
-      }
-    }
-    unique_cells = (1u << count) - 1u;
-  } else {
-    static_assert(RayLanes::size == 4);
-    uint32_t own[3];
-    grid_cell_indices(s, ray_pick(ray_from, lanes.index), own);
-    for (uint32_t r = 0; r < 4; ++r) {
-      for (uint32_t k = 0; k < 3; ++k) {
-        cell_coords[r][k] = lanes.shfl(own[k], r);
-      }
-      cell_idxs[r] = grid_cell_index(s, cell_coords[r]);
-      bool found = false;
-      for (uint32_t c = 0; c < r; ++c) {
-        found = found || cell_idxs[c] == cell_idxs[r];
-      }
-      if (!found) {
-        unique_cells |= 1u << r;
-      }
-    }
-  }
   uint32_t num_cells = popcount32(unique_cells);
   uint32_t dyn_order[k_max_dyn_bodies];
   uint32_t num_dyn = 0;
@@ -738,11 +720,48 @@ RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(
   return num_bodies;
 }
 
+template <typename Filter>
+RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(const World &w,
+                                                  const Vec3A *ray_from,
+                                                  const Vec3A *ray_to,
+                                                  const Filter &filter,
+                                                  uint32_t *bodies) {
+  const StaticWorldData &s = *w.s;
+  Aabb ray_aabb{ray_from[0].min(ray_to[0]), ray_from[0].max(ray_to[0])};
+  for (int i = 1; i < 4; ++i) {
+    ray_aabb = ray_aabb.combine(
+        Aabb{ray_from[i].min(ray_to[i]), ray_from[i].max(ray_to[i])});
+  }
+  uint32_t cell_idxs[4];
+  uint32_t cell_coords[4][3];
+  uint32_t count = 0;
+  for (uint32_t r = 0; r < 4; ++r) {
+    uint32_t idx3[3];
+    grid_cell_indices(s, ray_from[r], idx3);
+    uint32_t idx = grid_cell_index(s, idx3);
+    bool found = false;
+    for (uint32_t c = 0; c < count; ++c) {
+      if (cell_idxs[c] == idx) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      cell_idxs[count] = idx;
+      cell_coords[count][0] = idx3[0];
+      cell_coords[count][1] = idx3[1];
+      cell_coords[count][2] = idx3[2];
+      ++count;
+    }
+  }
+  return gather_cell_bodies(w, ray_aabb, cell_idxs, cell_coords,
+                            (1u << count) - 1u, filter, SoloRayLanes{}, bodies);
+}
+
 RS_HD void grid_ray_test(const World &w, const Vec3A *ray_from,
                          const Vec3A *ray_to, QuadRayResult &result) {
   uint32_t bodies[k_max_handles];
-  uint32_t num_bodies =
-      gather_ray_bodies(w, ray_from, ray_to, result, SoloRayLanes{}, bodies);
+  uint32_t num_bodies = gather_ray_bodies(w, ray_from, ray_to, result, bodies);
   for (uint32_t k = 0; k < num_bodies; ++k) {
     quad_ray_test_body(w, ray_from, ray_to, w.body(bodies[k]),
                        static_cast<int>(bodies[k]), result);
@@ -814,41 +833,38 @@ struct BridgeTriSingleRay {
   }
 };
 
-RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
-                                const Vec3A *ray_to, int ray,
-                                const RigidBody &co, int obj_idx,
-                                SingleRay &result) {
-  Affine3A world_to_co = Affine3A::identity();
-  bool rotated = !(co.collision_flags & k_flag_identity_transform) &&
-                 !(co.collision_flags & k_flag_no_angular_motion);
-  if (rotated) {
-    world_to_co = co.world_trans.ext_transpose();
+RS_HD void single_ray_lane_frame(const RigidBody &co, Vec3A own_from,
+                                 Vec3A own_to, const Aabb &world_aabb,
+                                 const CarRayLanes &lanes, Vec3A &from_local,
+                                 Vec3A &to_local, Aabb &ray_aabb) {
+  if (co.collision_flags & k_flag_identity_transform) {
+    from_local = own_from;
+    to_local = own_to;
+    ray_aabb = world_aabb;
+    return;
   }
-  Vec3A from_local = Vec3A::zero();
-  Vec3A to_local = Vec3A::zero();
-  Aabb ray_aabb = Aabb::zero();
-  for (int i = 0; i < 4; ++i) {
-    Vec3A f = ray_from[i];
-    Vec3A t = ray_to[i];
-    if (rotated) {
-      f = world_to_co.transform_point3a(f);
-      t = world_to_co.transform_point3a(t);
-    } else if (co.collision_flags & k_flag_no_angular_motion &&
-               !(co.collision_flags & k_flag_identity_transform)) {
-      f = f - co.world_trans.translation;
-      t = t - co.world_trans.translation;
-    }
-    Aabb segment{f.min(t), f.max(t)};
-    if (i == 0) {
-      ray_aabb = segment;
-    } else {
-      ray_aabb += segment;
-    }
-    if (i == ray) {
-      from_local = f;
-      to_local = t;
-    }
+  Vec3A f = own_from;
+  Vec3A t = own_to;
+  if (co.collision_flags & k_flag_no_angular_motion) {
+    f = f - co.world_trans.translation;
+    t = t - co.world_trans.translation;
+  } else {
+    Affine3A world_to_co = co.world_trans.ext_transpose();
+    f = world_to_co.transform_point3a(f);
+    t = world_to_co.transform_point3a(t);
   }
+  from_local = f;
+  to_local = t;
+  Aabb own{f.min(t), f.max(t)};
+  ray_aabb = shfl_aabb(lanes, own, 0);
+  for (uint32_t i = 1; i < 4; ++i) {
+    ray_aabb += shfl_aabb(lanes, own, i);
+  }
+}
+
+RS_HD void single_ray_test_shape(const World &w, const RigidBody &co,
+                                 int obj_idx, Vec3A from_local, Vec3A to_local,
+                                 const Aabb &ray_aabb, SingleRay &result) {
   BridgeTriSingleRay cb{from_local, to_local, result.closest_hit_fraction,
                         &co,        obj_idx,  &result,
                         nullptr};
@@ -862,7 +878,7 @@ RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
     SingleRayPack pack = single_ray_pack(from_local, to_local);
     if (single_ray_slab(pack.origin, pack.inv_dir, cs.local_aabb,
                         cb.hit_fraction)) {
-      compound_ray(cs, cb, from_local, to_local, ray);
+      compound_ray(cs, cb, from_local, to_local, 0);
     }
     return;
   }
@@ -882,7 +898,7 @@ RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
     SphereClosest closest{&shape.sphere};
     ConvexCastResult r;
     if (calc_point_time_of_impact(from_local, to_local, closest, r)) {
-      cb.report_hit(r.normal, r.fraction, ray);
+      cb.report_hit(r.normal, r.fraction, 0);
     }
     return;
   }
@@ -911,7 +927,7 @@ RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
         from_local.x * n.x + from_local.y * n.y + from_local.z * n.z;
     float tt = -normal_start / dir_align;
     if (tt >= 0.0f && tt < dist) {
-      cb.report_hit(plane.plane_normal, tt / dist, ray);
+      cb.report_hit(plane.plane_normal, tt / dist, 0);
     }
     return;
   }
@@ -937,23 +953,29 @@ RS_HD void single_ray_test_body(const World &w, const Vec3A *ray_from,
     ConvexShape cs = ConvexShape::hull_shape(w.hull_view(hull));
     ConvexCastResult r;
     if (calc_time_of_impact(cs, from_local, to_local, r)) {
-      cb.report_hit(r.normal, r.fraction, ray);
+      cb.report_hit(r.normal, r.fraction, 0);
     }
     return;
   }
   }
 }
 
-template <typename RayLanes>
-RS_HD void single_grid_ray_test(const World &w, const Vec3A *ray_from,
-                                const Vec3A *ray_to, int ray,
-                                const RayLanes &lanes, SingleRay &result) {
+RS_HD void lane_grid_ray_test(const World &w, Vec3A own_from, Vec3A own_to,
+                              const CarRayLanes &lanes, SingleRay &result) {
+  RayCells cells = ray_cells_lanes(*w.s, own_from, own_to, lanes);
   uint32_t bodies[k_max_handles];
   uint32_t num_bodies =
-      gather_ray_bodies(w, ray_from, ray_to, result, lanes, bodies);
+      gather_cell_bodies(w, cells.ray_aabb, cells.idxs, cells.coords,
+                         cells.unique, result, lanes, bodies);
   for (uint32_t k = 0; k < num_bodies; ++k) {
-    single_ray_test_body(w, ray_from, ray_to, ray, w.body(bodies[k]),
-                         static_cast<int>(bodies[k]), result);
+    const RigidBody &co = w.body(bodies[k]);
+    Vec3A from_local;
+    Vec3A to_local;
+    Aabb ray_aabb;
+    single_ray_lane_frame(co, own_from, own_to, cells.ray_aabb, lanes,
+                          from_local, to_local, ray_aabb);
+    single_ray_test_shape(w, co, static_cast<int>(bodies[k]), from_local,
+                          to_local, ray_aabb, result);
   }
 }
 

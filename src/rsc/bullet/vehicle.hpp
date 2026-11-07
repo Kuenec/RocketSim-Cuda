@@ -536,28 +536,14 @@ struct VehicleRL {
     cast_rays(w, sources, targets, hits);
   }
 
-  template <typename RayLanes>
-  RS_HD void cast_wheel_ray(const World &w, int wheel, const RayLanes &lanes,
+  RS_HD void cast_wheel_ray(const World &w, const CarRayLanes &lanes,
                             VehicleHit &hit) const {
     const Affine3A &trans = w.body(chassis_body_idx).world_trans;
-    Vec3A sources[k_num_wheels];
-    Vec3A targets[k_num_wheels];
-    if constexpr (RayLanes::size == 1) {
-      for (int i = 0; i < k_num_wheels; ++i) {
-        wheels[i].ray_endpoints(trans, sources[i], targets[i]);
-      }
-    } else {
-      static_assert(RayLanes::size == static_cast<uint32_t>(k_num_wheels));
-      Vec3A own_source;
-      Vec3A own_target;
-      wheels[lanes.index].ray_endpoints(trans, own_source, own_target);
-      for (uint32_t i = 0; i < k_num_wheels; ++i) {
-        sources[i] = lanes.shfl(own_source, i);
-        targets[i] = lanes.shfl(own_target, i);
-      }
-    }
-    SingleRay r{ray_pick(sources, static_cast<uint32_t>(wheel)),
-                ray_pick(targets, static_cast<uint32_t>(wheel)),
+    Vec3A source;
+    Vec3A target;
+    wheels[lanes.index].ray_endpoints(trans, source, target);
+    SingleRay r{source,
+                target,
                 static_cast<int>(chassis_body_idx),
                 static_cast<uint8_t>(k_group_default | k_group_dropshot_floor),
                 static_cast<uint8_t>(k_group_all),
@@ -566,7 +552,7 @@ struct VehicleRL {
                 -1,
                 Vec3A::zero(),
                 Vec3A::zero()};
-    single_grid_ray_test(w, sources, targets, wheel, lanes, r);
+    lane_grid_ray_test(w, source, target, lanes, r);
     hit = vehicle_hit(w, r.collision_obj_idx, r.hit_point_world,
                       r.hit_normal_world);
   }

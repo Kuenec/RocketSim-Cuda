@@ -159,7 +159,6 @@ struct SingleLane {
   RS_HDI static constexpr uint32_t group_ballot(bool pred) {
     return pred ? 1u : 0u;
   }
-  RS_HDI static SoloRayLanes car_ray_lanes() { return {}; }
   RS_HDI static void barrier() {}
 };
 
@@ -758,17 +757,20 @@ RS_HD void arena_tick_cars(const ArenaStatic &st, Arena &a, StepScratch &sc,
   World w = arena_world(st, a);
   bool dynamic_hit = false;
   if (sc.car_plan != CarPhasePlan::Sequential) {
-    if (lanes.size >= k_num_wheels * a.num_cars) {
-      for (uint32_t item = lanes.lane; item < k_num_wheels * a.num_cars;
-           item += lanes.size) {
-        uint32_t c = item / k_num_wheels;
-        int wheel = static_cast<int>(item % k_num_wheels);
-        VehicleHit hit;
-        a.cars[c].vehicle.cast_wheel_ray(w, wheel, lanes.car_ray_lanes(), hit);
-        sc.rays[c][wheel] = hit;
-        dynamic_hit = dynamic_hit || ray_hit_dynamic(w, hit);
+    if constexpr (Lanes::k_cooperative) {
+      if (lanes.size >= k_num_wheels * a.num_cars) {
+        for (uint32_t item = lanes.lane; item < k_num_wheels * a.num_cars;
+             item += lanes.size) {
+          uint32_t c = item / k_num_wheels;
+          int wheel = static_cast<int>(item % k_num_wheels);
+          VehicleHit hit;
+          a.cars[c].vehicle.cast_wheel_ray(w, lanes.car_ray_lanes(), hit);
+          sc.rays[c][wheel] = hit;
+          dynamic_hit = dynamic_hit || ray_hit_dynamic(w, hit);
+        }
       }
-    } else {
+    }
+    if (lanes.size < k_num_wheels * a.num_cars) {
       for (uint32_t c = lanes.lane; c < a.num_cars; c += lanes.size) {
         const char *car_bytes = reinterpret_cast<const char *>(&a.cars[c]);
         for (uint32_t l = 0; l < (sizeof(Car) + 127u) / 128u; ++l) {
