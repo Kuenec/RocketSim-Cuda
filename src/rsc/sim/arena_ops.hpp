@@ -42,6 +42,24 @@ RS_HD void arena_reset_pads(const ArenaStatic &st, Arena &a) {
   }
 }
 
+RS_HD void arena_set_state(const ArenaStatic &st, Arena &a,
+                           const BallState &ball, const CarState *cores,
+                           const bool *on_ground) {
+  World w = arena_world(st, a);
+  for (uint32_t c = 0; c < a.num_cars; ++c) {
+    CarState state = car_state_from_core(cores[c]);
+    state.cache.is_on_ground = on_ground[c];
+    Car &car = a.cars[c];
+    car_set_state(car, w.dyn_body(car.rigid_body_idx), state);
+    car.vehicle.reset_transient_contacts();
+    car.sticky_gate_prev = false;
+  }
+  arena_set_ball_state(st, a, ball);
+  if (st.has_pads) {
+    arena_reset_pads(st, a);
+  }
+}
+
 RS_HD void arena_reset_to_random_kickoff(const ArenaStatic &st, Arena &a,
                                          bool has_seed, uint64_t seed) {
   using namespace consts;

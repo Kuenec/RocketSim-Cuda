@@ -195,6 +195,29 @@ __global__ void kickoff_kernel(const ArenaStatic *__restrict__ st,
                                 seeds ? seeds[i] : 0);
 }
 
+__global__ void set_state_kernel(const ArenaStatic *__restrict__ st,
+                                 Arena *arenas, uint32_t num_arenas,
+                                 const uint8_t *mask,
+                                 const rocketsim_cuda::BallState *balls,
+                                 const rocketsim_cuda::CarReset *cars,
+                                 uint32_t cars_per_arena) {
+  uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_arenas || mask[i] == 0) {
+    return;
+  }
+  CarState cores[k_max_cars];
+  bool on_ground[k_max_cars];
+  for (uint32_t c = 0; c < cars_per_arena; ++c) {
+    const rocketsim_cuda::CarReset &reset =
+        cars[static_cast<size_t>(i) * cars_per_arena + c];
+    cores[c] = rocketsim_cuda::convert::core_to_internal(reset.core);
+    on_ground[c] = reset.on_ground;
+  }
+  arena_set_state(*st, arenas[i],
+                  rocketsim_cuda::convert::to_internal(balls[i]), cores,
+                  on_ground);
+}
+
 __global__ void export_kernel(const ArenaStatic *__restrict__ st,
                               const Arena *arenas, uint32_t first,
                               uint32_t count,
@@ -254,6 +277,10 @@ struct CudaBatch::Impl {
   size_t mask_capacity = 0;
   DeviceArray<uint64_t> seeds;
   size_t seeds_capacity = 0;
+  DeviceArray<rocketsim_cuda::BallState> in_balls;
+  size_t in_balls_capacity = 0;
+  DeviceArray<rocketsim_cuda::CarReset> in_cars;
+  size_t in_cars_capacity = 0;
   DeviceArray<rocketsim_cuda::ArenaInfo> out_infos;
   size_t out_infos_capacity = 0;
   DeviceArray<rocketsim_cuda::BallState> out_balls;
@@ -532,6 +559,46 @@ void CudaBatch::reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
   kickoff_kernel<<<grid_for(n, 64), 64, 0, impl_->stream>>>(
       impl_->device_view.get(), impl_->arenas.get(), n, d_mask, d_seeds);
   check(cudaGetLastError(), "kickoff kernel launch");
+}
+
+void CudaBatch::set_states_masked(const uint8_t *mask,
+                                  const rocketsim_cuda::BallState *balls,
+                                  const rocketsim_cuda::CarReset *cars,
+                                  uint32_t cars_per_arena,
+                                  rocketsim_cuda::MemorySpace space) {
+  Impl &im = *impl_;
+  uint32_t n = im.num_arenas;
+  if (n == 0) {
+    return;
+  }
+  const uint8_t *d_mask = mask;
+  const rocketsim_cuda::BallState *d_balls = balls;
+  const rocketsim_cuda::CarReset *d_cars = cars;
+  if (space == rocketsim_cuda::MemorySpace::Host) {
+    uint8_t *m = staged(im.mask, im.mask_capacity, n);
+    check(cudaMemcpyAsync(m, mask, n, cudaMemcpyHostToDevice, im.stream),
+          "state mask upload");
+    rocketsim_cuda::BallState *b = staged(im.in_balls, im.in_balls_capacity, n);
+    check(cudaMemcpyAsync(b, balls, sizeof(rocketsim_cuda::BallState) * n,
+                          cudaMemcpyHostToDevice, im.stream),
+          "ball state upload");
+    size_t car_rows = static_cast<size_t>(n) * cars_per_arena;
+    rocketsim_cuda::CarReset *c =
+        staged(im.in_cars, im.in_cars_capacity, car_rows);
+    if (car_rows != 0) {
+      check(cudaMemcpyAsync(c, cars,
+                            sizeof(rocketsim_cuda::CarReset) * car_rows,
+                            cudaMemcpyHostToDevice, im.stream),
+            "car state upload");
+    }
+    d_mask = m;
+    d_balls = b;
+    d_cars = c;
+  }
+  set_state_kernel<<<grid_for(n, 64), 64, 0, im.stream>>>(
+      im.device_view.get(), im.arenas.get(), n, d_mask, d_balls, d_cars,
+      cars_per_arena);
+  check(cudaGetLastError(), "set state kernel launch");
 }
 
 void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,

@@ -154,6 +154,11 @@ struct CarCore {
   float demo_respawn_timer;
 };
 
+struct CarReset {
+  CarCore core;
+  bool on_ground;
+};
+
 struct CurvePoint {
   float x;
   float y;
@@ -349,6 +354,7 @@ struct BatchConfig {
 MutatorConfig default_mutators(GameMode mode);
 CarBodyConfig car_body_config(CarBody body);
 CarCore car_core_default();
+BallState ball_state_default();
 
 class MeshSet {
 public:
@@ -388,6 +394,8 @@ public:
   void set_all_controls_device(const CarControls *device_controls);
   void reset_to_random_kickoff_masked(const uint8_t *mask,
                                       const uint64_t *seeds, MemorySpace space);
+  void set_states_masked(const uint8_t *mask, const BallState *balls,
+                         const CarReset *cars, MemorySpace space);
   void export_state(const StateBuffers &out, MemorySpace space);
   void *cuda_stream() const;
 

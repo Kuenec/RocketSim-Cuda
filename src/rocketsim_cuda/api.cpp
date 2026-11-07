@@ -89,6 +89,7 @@ struct HostStaging {
   rsc::PinnedRows<CarControls> controls;
   rsc::PinnedRows<uint8_t> mask;
   rsc::PinnedRows<uint64_t> seeds;
+  rsc::PinnedRows<CarReset> resets;
 };
 #endif
 
@@ -112,6 +113,8 @@ CarCore car_core_default() {
   c.boost = s.boost;
   return c;
 }
+
+BallState ball_state_default() { return to_public(rsc::ball_state_default()); }
 
 struct MeshSet::Impl {
   rsc::MeshLibrary library;
@@ -751,6 +754,58 @@ void ArenaBatch::reset_to_random_kickoff_masked(const uint8_t *mask,
       op.kickoff = {host_seeds != nullptr, host_seeds ? host_seeds[i] : 0};
       rsc::arena_apply_op(im.st->view(), im.host[i], op);
     }
+  }
+}
+
+void ArenaBatch::set_states_masked(const uint8_t *mask, const BallState *balls,
+                                   const CarReset *cars, MemorySpace space) {
+  Impl &im = *impl_;
+  require(mask != nullptr, "state mask is null");
+  require(balls != nullptr, "ball states are null");
+  require(cars != nullptr || im.num_cars == 0, "car states are null");
+  if (space == MemorySpace::Device) {
+    im.require_device(mask);
+  }
+  uint32_t first = im.num_device_arenas;
+  size_t count = im.host.size();
+  size_t car_rows = count * im.num_cars;
+  const uint8_t *host_mask = mask + first;
+  const BallState *host_balls = balls + first;
+  const CarReset *host_cars =
+      cars ? cars + static_cast<size_t>(first) * im.num_cars : nullptr;
+#ifdef RSC_HAS_CUDA
+  if (im.cuda) {
+    im.flush_controls();
+    im.cuda->set_states_masked(mask, balls, cars, im.num_cars, space);
+  }
+  if (space == MemorySpace::Device && count != 0) {
+    uint8_t *mask_rows = im.staging.mask.reserve(count);
+    im.cuda->transfer(mask_rows, host_mask, count);
+    host_mask = mask_rows;
+    BallState *ball_rows = im.staging.balls.reserve(count);
+    im.cuda->transfer(ball_rows, host_balls, sizeof(BallState) * count);
+    host_balls = ball_rows;
+    if (car_rows != 0) {
+      CarReset *car_rows_host = im.staging.resets.reserve(car_rows);
+      im.cuda->transfer(car_rows_host, host_cars, sizeof(CarReset) * car_rows);
+      host_cars = car_rows_host;
+    }
+    im.cuda->sync();
+  }
+#endif
+  rsc::CarState cores[rsc::k_max_cars];
+  bool on_ground[rsc::k_max_cars];
+  for (size_t i = 0; i < count; ++i) {
+    if (!host_mask[i]) {
+      continue;
+    }
+    for (uint32_t c = 0; c < im.num_cars; ++c) {
+      const CarReset &reset = host_cars[i * im.num_cars + c];
+      cores[c] = convert::core_to_internal(reset.core);
+      on_ground[c] = reset.on_ground;
+    }
+    rsc::arena_set_state(im.st->view(), im.host[i],
+                         convert::to_internal(host_balls[i]), cores, on_ground);
   }
 }
 
