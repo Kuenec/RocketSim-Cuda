@@ -163,6 +163,15 @@ int rsc_batch_reset_kickoff_masked(RscBatch *batch, uint8_t space,
   });
 }
 
+int rsc_batch_set_states_masked(RscBatch *batch, uint8_t space,
+                                const uint8_t *mask, const BallState *balls,
+                                const CarReset *cars) {
+  return guarded([&] {
+    batch->batch->set_states_masked(mask, balls, cars,
+                                    static_cast<MemorySpace>(space));
+  });
+}
+
 int rsc_device_alloc(size_t size, void **out) {
   return guarded([&] {
 #ifdef RSC_HAS_CUDA

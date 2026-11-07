@@ -62,6 +62,11 @@ public:
                            uint32_t cars_per_arena);
   void reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
                             rocketsim_cuda::MemorySpace space);
+  void set_states_masked(const uint8_t *mask,
+                         const rocketsim_cuda::BallState *balls,
+                         const rocketsim_cuda::CarReset *cars,
+                         uint32_t cars_per_arena,
+                         rocketsim_cuda::MemorySpace space);
   void export_state(const rocketsim_cuda::StateBuffers &out, uint32_t first,
                     uint32_t count, uint32_t cars_per_arena,
                     uint32_t pads_per_arena, rocketsim_cuda::MemorySpace space);

@@ -75,6 +75,10 @@ int rsc_batch_set_all_controls_device(
     RscBatch *batch, const rocketsim_cuda::CarControls *device_controls);
 int rsc_batch_reset_kickoff_masked(RscBatch *batch, uint8_t space,
                                    const uint8_t *mask, const uint64_t *seeds);
+int rsc_batch_set_states_masked(RscBatch *batch, uint8_t space,
+                                const uint8_t *mask,
+                                const rocketsim_cuda::BallState *balls,
+                                const rocketsim_cuda::CarReset *cars);
 int rsc_device_alloc(size_t size, void **out);
 int rsc_device_free(void *pointer);
 int rsc_device_upload(void *device, const void *host, size_t size);
