@@ -96,7 +96,9 @@ struct ContactRecord {
   bool is_swap;
   uint32_t a;
   uint32_t b;
-  ManifoldPoint point;
+  Vec3A pos_world_on_a;
+  Vec3A pos_world_on_b;
+  Vec3A normal_world_on_b;
 };
 
 struct BallWorldRecord {
@@ -274,8 +276,7 @@ struct ContactTracker {
   RS_HD void replay_job(uint32_t j) {
     const JobRecords &jr = sc->job_records[j];
     for (uint32_t k = 0; k < jr.count; ++k) {
-      push_record(jr.records[k].is_swap, jr.records[k].a, jr.records[k].b,
-                  jr.records[k].point);
+      push_record(jr.records[k]);
     }
   }
 
@@ -286,22 +287,27 @@ struct ContactTracker {
     return b.user_idx != UserInfoType::None;
   }
 
-  RS_HD void push_record(bool swap, uint32_t a, uint32_t b,
-                         const ManifoldPoint &p) {
+  RS_HD void push_record(const ContactRecord &record) {
     if (sink == RecordSink::Job) {
       JobRecords &jr = sc->job_records[job];
       if (jr.count >= k_job_records) {
         jr.overflow = true;
         return;
       }
-      jr.records[jr.count++] = {swap, a, b, p};
+      jr.records[jr.count++] = record;
       return;
     }
     if (sc->num_records >= k_max_records) {
       w->flag_error(k_error_records_overflow);
       return;
     }
-    sc->records[sc->num_records++] = {swap, a, b, p};
+    sc->records[sc->num_records++] = record;
+  }
+
+  RS_HD void push_record(bool swap, uint32_t a, uint32_t b,
+                         const ManifoldPoint &p) {
+    push_record(
+        {swap, a, b, p.pos_world_on_a, p.pos_world_on_b, p.normal_world_on_b});
   }
 
   RS_HD void callback(ManifoldPoint &cp, const RigidBody &body_a_in,
@@ -478,7 +484,7 @@ RS_HD void arena_update_tile_flags(Arena &a) {
 }
 
 RS_HDN void arena_on_car_car(Arena &a, uint32_t car_1, uint32_t car_2,
-                             const ManifoldPoint &point) {
+                             const ContactRecord &record) {
   using namespace consts;
   for (int pass = 0; pass < 2; ++pass) {
     bool is_swapped = pass == 1;
@@ -533,7 +539,7 @@ RS_HDN void arena_on_car_car(Arena &a, uint32_t car_1, uint32_t car_2,
       is_demo = attacker.info.team != victim.info.team;
     }
     Vec3A contact_point =
-        (is_swapped ? point.pos_world_on_b : point.pos_world_on_a) * bt_to_uu;
+        (is_swapped ? record.pos_world_on_b : record.pos_world_on_a) * bt_to_uu;
     if (is_demo) {
       victim.state.is_demoed = true;
       victim.state.demo_respawn_timer = a.mutators.respawn_delay;
@@ -838,30 +844,27 @@ RS_HD void arena_tick_contacts(const ArenaStatic &st, Arena &a,
           ball_on_hit(a.ball, a.cars[pa], st.mode, a.mutators, a.tick_count,
                       brb, st.world.sin_table);
           Vec3A contact_point =
-              (c.is_swap ? c.point.pos_world_on_a : c.point.pos_world_on_b) *
-              bt_to_uu;
+              (c.is_swap ? c.pos_world_on_a : c.pos_world_on_b) * bt_to_uu;
           Vec3A extra_hit_vel = (brb.lin_vel - vel_before) * bt_to_uu;
           arena_push_event(a, ArenaEventKind::CarHitBall, pa, 0, false,
                            contact_point, extra_hit_vel);
         } else if (ub == UserInfoType::Car) {
-          arena_on_car_car(a, pa, pb, c.point);
+          arena_on_car_car(a, pa, pb, c);
         } else {
           arena_push_event(a, ArenaEventKind::CarHitWorld, pa, 0, false,
-                           c.point.pos_world_on_b * bt_to_uu,
-                           c.point.normal_world_on_b);
+                           c.pos_world_on_b * bt_to_uu, c.normal_world_on_b);
           a.cars[pa].state.cache.has_world_contact_normal = true;
-          a.cars[pa].state.cache.world_contact_normal =
-              c.point.normal_world_on_b;
+          a.cars[pa].state.cache.world_contact_normal = c.normal_world_on_b;
         }
       } else if (ua == UserInfoType::Ball) {
         if (ub == UserInfoType::DropshotTile) {
           ball_on_dropshot_tile_collision(a.ball, a.tiles, pb, a.tick_count);
         } else if (ub == UserInfoType::None) {
-          Vec3A contact_point = c.point.pos_world_on_b * bt_to_uu;
+          Vec3A contact_point = c.pos_world_on_b * bt_to_uu;
           ball_on_world_hit(a.ball, w.dyn_body(c.a), st.mode,
-                            c.point.normal_world_on_b);
+                            c.normal_world_on_b);
           arena_push_event(a, ArenaEventKind::BallHitWorld, 0, 0, false,
-                           contact_point, c.point.normal_world_on_b);
+                           contact_point, c.normal_world_on_b);
         }
       }
     }
