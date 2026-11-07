@@ -760,7 +760,7 @@ RS_HD void car_apply_flip_zdamp_prepass(Car &car, World &w) {
   }
 }
 
-RS_HDN bool car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
+RS_HDI bool car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
                                 const MutatorConfig &mut,
                                 const VehicleHit *precomputed_hits,
                                 float *deferred_throttle) {
@@ -826,7 +826,7 @@ RS_HDN bool car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
   return true;
 }
 
-RS_HDN void car_post_tick_update(Car &car, World &w) {
+RS_HDI void car_post_tick_update(Car &car, World &w) {
   using namespace consts;
   constexpr float start_sq =
       car::supersonic::start_speed * car::supersonic::start_speed;

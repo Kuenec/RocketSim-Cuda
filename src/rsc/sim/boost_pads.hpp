@@ -235,7 +235,7 @@ RS_HD bool pad_any_touching(const PadUpdateScratch &sc, uint32_t num_cars) {
   return false;
 }
 
-RS_HDN bool pad_update_membership(const PadLayoutView &layout, PadState *pads,
+RS_HDI bool pad_update_membership(const PadLayoutView &layout, PadState *pads,
                                   PadUpdateScratch &sc, const Car *cars,
                                   uint32_t num_cars, float max_boost,
                                   uint64_t &touched_pads) {

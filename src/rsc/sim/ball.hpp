@@ -131,9 +131,9 @@ RS_HD void ball_finish_physics_tick(Ball &ball, const RigidBody &rb) {
   ball.state.tick_count_since_kickoff += 1;
 }
 
-RS_HDN void ball_on_hit(Ball &ball, Car &car, GameMode mode,
-                       const MutatorConfig &mut, uint64_t tick_count,
-                       RigidBody &rb, const float *sin_table) {
+RS_HDI void ball_on_hit(Ball &ball, Car &car, GameMode mode,
+                        const MutatorConfig &mut, uint64_t tick_count,
+                        RigidBody &rb, const float *sin_table) {
   using namespace consts;
   BallState &s = ball.state;
   Vec3A car_forward = rotator_forward(sin_table, car.state.phys.rot_mat.x_axis);

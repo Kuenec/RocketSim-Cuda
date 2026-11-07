@@ -602,7 +602,7 @@ struct VehicleRL {
     }
   }
 
-  RS_HDN void update(World &w, float time_step, float handbrake_val,
+  RS_HDI void update(World &w, float time_step, float handbrake_val,
                      float real_throttle, bool three_wheels,
                      const VehicleHit *precomputed_hits) {
     Affine3A trans = w.body(chassis_body_idx).world_trans;

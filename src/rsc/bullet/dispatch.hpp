@@ -103,7 +103,7 @@ RS_HD void process_mesh_collision_into(const World &w, const RigidBody &convex,
 }
 
 template <typename Callback>
-RS_HDN bool process_collision_inner(const World &w, const RigidBody &a,
+RS_HDI bool process_collision_inner(const World &w, const RigidBody &a,
                                     const RigidBody &b, Callback &callback,
                                     PersistentManifold &out) {
   if (is_mesh_convex_pair(a, b)) {
@@ -606,7 +606,7 @@ RS_HD Aabb collision_body_aabb(const RigidBody &obj) {
   return aabb;
 }
 
-RS_HDN void collision_apply_aabbs(World &w, const Aabb *aabbs) {
+RS_HDI void collision_apply_aabbs(World &w, const Aabb *aabbs) {
   for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
     uint16_t handle =
         static_cast<uint16_t>(w.a->dyn_bodies[i].broadphase_handle);

@@ -672,7 +672,7 @@ RS_HD void arena_apply_wheel_impulses(const StepScratch &sc, RigidBody &chassis,
 }
 
 template <typename Lanes>
-RS_HDN void arena_tick_vehicle_wheels(Arena &a, StepScratch &sc, World &w,
+RS_HDI void arena_tick_vehicle_wheels(Arena &a, StepScratch &sc, World &w,
                                       const Lanes &lanes, bool per_wheel) {
   uint32_t c = lanes.lane / k_num_wheels;
   int i = static_cast<int>(lanes.lane % k_num_wheels);

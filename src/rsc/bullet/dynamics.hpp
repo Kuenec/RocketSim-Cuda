@@ -75,7 +75,7 @@ RS_HD void accumulate_special(SolverScratch &sc, uint32_t obj_idx, Vec3A normal,
                                     friction, restitution, 1};
 }
 
-RS_HDN void solver_setup(World &w, SolverScratch &sc, float time_step) {
+RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
   bool skip = w.a->skip_separated_special_rows;
   sc.fixed_body_id = -1;
   sc.num_bodies = 0;
@@ -219,7 +219,7 @@ RS_HDN void solver_setup(World &w, SolverScratch &sc, float time_step) {
   }
 }
 
-RS_HDN void solver_split_iterations(World &w, SolverScratch &sc) {
+RS_HDI void solver_split_iterations(World &w, SolverScratch &sc) {
   bool skip = w.a->skip_separated_special_rows;
   int row_count = sc.num_contacts;
   for (int i = 0; i < row_count; ++i) {
@@ -247,7 +247,7 @@ RS_HDN void solver_split_iterations(World &w, SolverScratch &sc) {
   }
 }
 
-RS_HDN float solver_single_iteration(World &w, SolverScratch &sc) {
+RS_HDI float solver_single_iteration(World &w, SolverScratch &sc) {
   if (w.a->skip_separated_special_rows) {
     if (sc.num_contacts == 0) {
       return 0.0f;
@@ -322,7 +322,7 @@ RS_HD void solver_finish_body(RigidBody &body, SolverBody &s, float time_step) {
   }
 }
 
-RS_HDN void solver_finish(World &w, SolverScratch &sc, float time_step) {
+RS_HDI void solver_finish(World &w, SolverScratch &sc, float time_step) {
   for (int i = 0; i < sc.num_bodies; ++i) {
     SolverBody &s = sc.bodies[i];
     if (s.original_body >= 0) {
@@ -433,7 +433,7 @@ RS_HD void hoare_sort(uint16_t *indices, const int32_t *keys, int lo, int hi) {
   }
 }
 
-RS_HDN void island_sort_manifolds(World &w) {
+RS_HDI void island_sort_manifolds(World &w) {
   ArenaPhysics &a = *w.a;
   uint32_t ns = w.num_static();
   uint32_t nd = a.num_dyn_bodies;
