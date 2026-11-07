@@ -98,11 +98,6 @@ struct PersistentManifold {
     contact_processing_threshold = o.contact_processing_threshold;
   }
 
-  RS_HD bool matches(uint32_t a, uint32_t b) const {
-    return (body0_idx == a && body1_idx == b) ||
-           (body0_idx == b && body1_idx == a);
-  }
-
   RS_HD static float combined_friction(const RigidBody &b0,
                                        const RigidBody &b1) {
     if (b0.is_static_obj() || b1.is_static_obj()) {

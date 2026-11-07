@@ -10,9 +10,18 @@
 
 namespace rsc {
 
+static_assert(k_max_static_bodies + k_max_dyn_bodies <= 0x10000);
+
+RS_HDI uint32_t manifold_key(uint32_t body0, uint32_t body1) {
+  return body0 | (body1 << 16);
+}
+
 RS_HD int dispatcher_lookup(const ArenaPhysics &a, uint32_t b0, uint32_t b1) {
+  uint32_t forward = manifold_key(b0, b1);
+  uint32_t reverse = manifold_key(b1, b0);
   for (uint32_t i = 0; i < a.num_manifolds; ++i) {
-    if (a.manifolds[i].matches(b0, b1)) {
+    uint32_t key = a.manifold_keys[i];
+    if (key == forward || key == reverse) {
       return static_cast<int>(i);
     }
   }
@@ -25,6 +34,7 @@ RS_HD int dispatcher_insert(World &w, const PersistentManifold &m) {
     w.flag_error(k_error_manifolds_overflow);
     return -1;
   }
+  a.manifold_keys[a.num_manifolds] = manifold_key(m.body0_idx, m.body1_idx);
   a.manifolds[a.num_manifolds].copy_used_from(m);
   return static_cast<int>(a.num_manifolds++);
 }
@@ -45,6 +55,7 @@ RS_HD void dispatcher_release_manifold(World &w, uint32_t body0,
   }
   a.num_active = kept;
   if (static_cast<uint32_t>(index) != last) {
+    a.manifold_keys[index] = a.manifold_keys[last];
     a.manifolds[index].copy_used_from(a.manifolds[last]);
   }
   a.num_manifolds = last;

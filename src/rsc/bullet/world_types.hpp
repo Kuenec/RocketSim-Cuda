@@ -94,6 +94,7 @@ struct ArenaPhysics {
   uint32_t num_pairs;
   BroadphasePair pairs[k_max_pairs];
   uint32_t num_manifolds;
+  uint32_t manifold_keys[k_max_manifolds];
   PersistentManifold manifolds[k_max_manifolds];
   uint32_t num_active;
   uint16_t active[k_max_manifolds];
