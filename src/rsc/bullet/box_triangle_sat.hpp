@@ -601,20 +601,25 @@ inline constexpr int k_sat_box_edges = 12;
 inline constexpr int k_sat_candidates =
     k_sat_vertex_pairs + k_sat_corner_pairs + 3 * k_sat_box_edges;
 
-RS_HD CandidatePair sat_vertex_pair(Vec3A half, const Vec3A *q, int i) {
+RS_HD void sat_vertex_pair(CandidatePair &out, Vec3A half, const Vec3A *q,
+                           int i) {
   Vec3A point_box = clamp_point_to_aabb(q[i], half);
   Vec3A point_tri = q[i];
-  return {point_box, point_tri, (point_box - point_tri).length_squared()};
+  out.point_box = point_box;
+  out.point_tri = point_tri;
+  out.distance_sq = (point_box - point_tri).length_squared();
 }
 
-RS_HD CandidatePair sat_corner_pair(Vec3A half, const Vec3A *q, Vec3A ab,
-                                    Vec3A ac, int corner) {
+RS_HD void sat_corner_pair(CandidatePair &out, Vec3A half, const Vec3A *q,
+                           Vec3A ab, Vec3A ac, int corner) {
   const float signs[2] = {-1.0f, 1.0f};
   Vec3A box_corner{signs[corner >> 2] * half.x,
                    signs[(corner >> 1) & 1] * half.y,
                    signs[corner & 1] * half.z};
   Vec3A point_tri = closest_point_on_triangle_precomp(box_corner, q, ab, ac);
-  return {box_corner, point_tri, (box_corner - point_tri).length_squared()};
+  out.point_box = box_corner;
+  out.point_tri = point_tri;
+  out.distance_sq = (box_corner - point_tri).length_squared();
 }
 
 RS_HD Vec3A sat_box_edge_vertex(Vec3A half, int k) {
@@ -630,43 +635,50 @@ RS_HD void sat_box_edge_ends(int be, int &v0, int &v1) {
   v1 = be < 4 ? (be + 1) % 4 : (be < 8 ? 4 + (be - 3) % 4 : be - 4);
 }
 
-RS_HD CandidatePair sat_edge_pair(Vec3A tri_p, Vec3A tri_d, float tri_a,
-                                  Vec3A box_p0, Vec3A box_p1) {
+RS_HD void sat_edge_pair(CandidatePair &out, Vec3A tri_p, Vec3A tri_d,
+                         float tri_a, Vec3A box_p0, Vec3A box_p1) {
   Vec3A point_tri, point_box;
   tri_edge_vs_box_edge_precomp(tri_p, tri_d, tri_a, box_p0, box_p1, point_tri,
                                point_box);
-  return {point_box, point_tri, (point_box - point_tri).length_squared()};
+  out.point_box = point_box;
+  out.point_tri = point_tri;
+  out.distance_sq = (point_box - point_tri).length_squared();
 }
 
-RS_HD CandidatePair sat_candidate_pair(Vec3A half, const Vec3A *q,
-                                       const Vec3A *edges, int p) {
+RS_HD void sat_candidate_pair(CandidatePair &out, Vec3A half, const Vec3A *q,
+                              const Vec3A *edges, int p) {
   if (p < k_sat_vertex_pairs) {
-    return sat_vertex_pair(half, q, p);
+    sat_vertex_pair(out, half, q, p);
+    return;
   }
   if (p < k_sat_vertex_pairs + k_sat_corner_pairs) {
-    return sat_corner_pair(half, q, edges[0], q[2] - q[0],
-                           p - k_sat_vertex_pairs);
+    sat_corner_pair(out, half, q, edges[0], q[2] - q[0],
+                    p - k_sat_vertex_pairs);
+    return;
   }
   int e = p - k_sat_vertex_pairs - k_sat_corner_pairs;
   int ti = e / k_sat_box_edges;
   int v0, v1;
   sat_box_edge_ends(e % k_sat_box_edges, v0, v1);
   Vec3A tri_d = edges[ti];
-  return sat_edge_pair(q[ti], tri_d, tri_d.dot(tri_d),
-                       sat_box_edge_vertex(half, v0),
-                       sat_box_edge_vertex(half, v1));
+  sat_edge_pair(out, q[ti], tri_d, tri_d.dot(tri_d),
+                sat_box_edge_vertex(half, v0), sat_box_edge_vertex(half, v1));
 }
 
 RS_HDN void enum_aabb_triangle_pairs(Vec3A half, const Vec3A *q,
                                      const Vec3A *edges, CandidatePair *pairs) {
   int idx = 0;
   for (int i = 0; i < k_sat_vertex_pairs; ++i) {
-    pairs[idx++] = sat_vertex_pair(half, q, i);
+    Staging<CandidatePair> pair(pairs[idx++]);
+    sat_vertex_pair(pair.value(), half, q, i);
+    pair.commit();
   }
   Vec3A ab = edges[0];
   Vec3A ac = q[2] - q[0];
   for (int corner = 0; corner < k_sat_corner_pairs; ++corner) {
-    pairs[idx++] = sat_corner_pair(half, q, ab, ac, corner);
+    Staging<CandidatePair> pair(pairs[idx++]);
+    sat_corner_pair(pair.value(), half, q, ab, ac, corner);
+    pair.commit();
   }
   Vec3A c[8];
   for (int k = 0; k < 8; ++k) {
@@ -679,7 +691,9 @@ RS_HDN void enum_aabb_triangle_pairs(Vec3A half, const Vec3A *q,
     for (int be = 0; be < k_sat_box_edges; ++be) {
       int v0, v1;
       sat_box_edge_ends(be, v0, v1);
-      pairs[idx++] = sat_edge_pair(tri_p, tri_d, tri_a, c[v0], c[v1]);
+      Staging<CandidatePair> pair(pairs[idx++]);
+      sat_edge_pair(pair.value(), tri_p, tri_d, tri_a, c[v0], c[v1]);
+      pair.commit();
     }
   }
 }

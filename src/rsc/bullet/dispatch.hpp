@@ -557,12 +557,9 @@ RS_HD void dispatch_apply_pairs(World &w, Callback &callback, uint32_t num_jobs,
     const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
     uint32_t rb0_idx = proxy0.client_obj_idx;
     uint32_t rb1_idx = proxy1.client_obj_idx;
-    PairSetup setup{PairPlan::Skip, -1, Affine3A::identity()};
-    if (source == PlanSource::Inline) {
-      setup = plan_pair(w, proxy0, proxy1);
-    } else {
-      setup.plan = plans[i];
-    }
+    PairSetup setup = source == PlanSource::Inline
+                          ? plan_pair(w, proxy0, proxy1)
+                          : PairSetup{plans[i], -1, Affine3A::identity()};
     switch (setup.plan) {
     case PairPlan::Skip:
       break;
@@ -618,17 +615,19 @@ RS_HDI void collision_apply_aabbs(World &w, const Aabb *aabbs) {
   for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
     uint16_t handle =
         static_cast<uint16_t>(w.a->dyn_bodies[i].broadphase_handle);
-    sweep_set_aabb(w, handle, aabbs[i]);
-    grid_update_dynamic(w, handle, aabbs[i]);
+    sweep_set_aabb(w, handle, aabbs[i].min, aabbs[i].max);
+    grid_update_dynamic(w, handle, aabbs[i].min);
   }
 }
 
 RS_HD void collision_update_aabbs(World &w) {
-  Aabb aabbs[k_max_dyn_bodies];
   for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
-    aabbs[i] = collision_body_aabb(w.a->dyn_bodies[i]);
+    const RigidBody &body = w.a->dyn_bodies[i];
+    const Aabb aabb = collision_body_aabb(body);
+    uint16_t handle = static_cast<uint16_t>(body.broadphase_handle);
+    sweep_set_aabb(w, handle, aabb.min, aabb.max);
+    grid_update_dynamic(w, handle, aabb.min);
   }
-  collision_apply_aabbs(w, aabbs);
 }
 
 }

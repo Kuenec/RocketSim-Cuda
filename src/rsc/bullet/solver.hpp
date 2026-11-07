@@ -54,30 +54,30 @@ struct SolverBody {
   Vec3A external_torque_impulse;
   int32_t original_body;
 
-  RS_HD static SolverBody fixed() {
-    SolverBody b;
-    b.delta_lin_vel = Vec3A::zero();
-    b.delta_ang_vel = Vec3A::zero();
-    b.inv_mass = Vec3A::zero();
-    b.push_vel = Vec3A::zero();
-    b.turn_vel = Vec3A::zero();
-    b.lin_vel = Vec3A::zero();
-    b.ang_vel = Vec3A::zero();
-    b.external_force_impulse = Vec3A::zero();
-    b.external_torque_impulse = Vec3A::zero();
-    b.original_body = -1;
-    return b;
+  RS_HD void set_fixed() {
+    delta_lin_vel = Vec3A::zero();
+    delta_ang_vel = Vec3A::zero();
+    inv_mass = Vec3A::zero();
+    push_vel = Vec3A::zero();
+    turn_vel = Vec3A::zero();
+    lin_vel = Vec3A::zero();
+    ang_vel = Vec3A::zero();
+    external_force_impulse = Vec3A::zero();
+    external_torque_impulse = Vec3A::zero();
+    original_body = -1;
   }
 
-  RS_HD static SolverBody from(const RigidBody &rb) {
-    SolverBody b = fixed();
-    b.inv_mass = rb.inv_mass_splat;
-    b.lin_vel = rb.lin_vel;
-    b.ang_vel = rb.ang_vel;
-    b.external_force_impulse = rb.accum_lin_vel;
-    b.external_torque_impulse = rb.accum_ang_vel;
-    b.original_body = static_cast<int32_t>(rb.world_array_idx);
-    return b;
+  RS_HD void set_from(const RigidBody &rb) {
+    delta_lin_vel = Vec3A::zero();
+    delta_ang_vel = Vec3A::zero();
+    inv_mass = rb.inv_mass_splat;
+    push_vel = Vec3A::zero();
+    turn_vel = Vec3A::zero();
+    lin_vel = rb.lin_vel;
+    ang_vel = rb.ang_vel;
+    external_force_impulse = rb.accum_lin_vel;
+    external_torque_impulse = rb.accum_ang_vel;
+    original_body = static_cast<int32_t>(rb.world_array_idx);
   }
 
   RS_HD void internal_apply_impulse(Vec3A linear, Vec3A angular, float mag) {
@@ -137,27 +137,25 @@ struct SolverConstraint {
   int32_t solver_body_id_b;
   bool is_split_only;
 
-  RS_HD static SolverConstraint blank(int a, int b) {
-    SolverConstraint c;
-    c.rel_pos1_cross_normal = Vec3A::zero();
-    c.contact_normal_1 = Vec3A::zero();
-    c.rel_pos2_cross_normal = Vec3A::zero();
-    c.contact_normal_2 = Vec3A::zero();
-    c.angular_component_a = Vec3A::zero();
-    c.angular_component_b = Vec3A::zero();
-    c.applied_push_impulse = 0.0f;
-    c.applied_impulse = 0.0f;
-    c.friction = 0.0f;
-    c.jac_diag_ab_inv = 0.0f;
-    c.rhs = 0.0f;
-    c.lower_limit = 0.0f;
-    c.upper_limit = 0.0f;
-    c.rhs_penetration = 0.0f;
-    c.friction_idx = 0;
-    c.solver_body_id_a = a;
-    c.solver_body_id_b = b;
-    c.is_split_only = false;
-    return c;
+  RS_HD void reset(int a, int b) {
+    rel_pos1_cross_normal = Vec3A::zero();
+    contact_normal_1 = Vec3A::zero();
+    rel_pos2_cross_normal = Vec3A::zero();
+    contact_normal_2 = Vec3A::zero();
+    angular_component_a = Vec3A::zero();
+    angular_component_b = Vec3A::zero();
+    applied_push_impulse = 0.0f;
+    applied_impulse = 0.0f;
+    friction = 0.0f;
+    jac_diag_ab_inv = 0.0f;
+    rhs = 0.0f;
+    lower_limit = 0.0f;
+    upper_limit = 0.0f;
+    rhs_penetration = 0.0f;
+    friction_idx = 0;
+    solver_body_id_a = a;
+    solver_body_id_b = b;
+    is_split_only = false;
   }
 
   RS_HD void setup_split(const RigidBody *rb0, const RigidBody *rb1,

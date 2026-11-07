@@ -1253,8 +1253,9 @@ RS_HD void arena_test_team_triangles(const LaneGroup &lanes) {
        u += lanes.team_size) {
     const TeamSatSlot &s = ts.slots[u / sat::k_sat_candidates];
     int p = static_cast<int>(u % sat::k_sat_candidates);
-    ts.pairs[u / sat::k_sat_candidates][p] =
-        sat::sat_candidate_pair(s.half, s.q, s.state.edges, p);
+    Staging<sat::CandidatePair> pair(ts.pairs[u / sat::k_sat_candidates][p]);
+    sat::sat_candidate_pair(pair.value(), s.half, s.q, s.state.edges, p);
+    pair.commit();
   }
   lanes.barrier();
   for (uint32_t e = lanes.team_lane; e < used; e += lanes.team_size) {

@@ -243,12 +243,14 @@ RS_HD void sweep_update_axis(World &w, int axis, uint16_t handle, uint16_t qmin,
   }
 }
 
-RS_HD void sweep_set_aabb(World &w, uint16_t handle, Aabb aabb) {
-  w.dyn_proxy(handle).aabb = aabb;
+RS_HD void sweep_set_aabb(World &w, uint16_t handle, Vec3A min, Vec3A max) {
+  BroadphaseProxy &proxy = w.dyn_proxy(handle);
+  proxy.aabb.min = min;
+  proxy.aabb.max = max;
   uint16_t qmin[3];
   uint16_t qmax[3];
-  sweep_quantize_point(aabb.min, 0, qmin);
-  sweep_quantize_point(aabb.max, 1, qmax);
+  sweep_quantize_point(min, 0, qmin);
+  sweep_quantize_point(max, 1, qmax);
   sweep_update_axis(w, 0, handle, qmin[0], qmax[0]);
   sweep_update_axis(w, 1, handle, qmin[1], qmax[1]);
   sweep_update_axis(w, 2, handle, qmin[2], qmax[2]);
@@ -298,10 +300,10 @@ RS_HD void grid_cell_indices(const StaticWorldData &s, Vec3A pos,
   }
 }
 
-RS_HD void grid_update_dynamic(World &w, uint16_t handle, Aabb aabb) {
+RS_HD void grid_update_dynamic(World &w, uint16_t handle, Vec3A min) {
   BroadphaseProxy &p = w.dyn_proxy(handle);
   uint32_t idx[3];
-  grid_cell_indices(*w.s, aabb.min, idx);
+  grid_cell_indices(*w.s, min, idx);
   uint32_t new_idx = grid_cell_index(*w.s, idx);
   if (new_idx != p.cell_idx) {
     p.cell_idx = new_idx;

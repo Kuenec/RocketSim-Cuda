@@ -598,7 +598,7 @@ struct VehicleRL {
   RS_HDI void update(World &w, float time_step, float handbrake_val,
                      float real_throttle, bool three_wheels,
                      const VehicleHit *precomputed_hits) {
-    Affine3A trans = w.body(chassis_body_idx).world_trans;
+    ConstLocal<Affine3A> trans = w.body(chassis_body_idx).world_trans;
     Vec3A chassis_translation = trans.translation;
     float friction_scale = w.body(chassis_body_idx).get_mass() / 3.0f;
     Vec3A sources[k_num_wheels];

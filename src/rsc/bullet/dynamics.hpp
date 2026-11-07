@@ -14,7 +14,9 @@ RS_HD int solver_fixed_body(SolverScratch &sc) {
   }
   int id = sc.num_bodies;
   sc.fixed_body_id = id;
-  sc.bodies[sc.num_bodies++] = SolverBody::fixed();
+  Staging<SolverBody> body(sc.bodies[sc.num_bodies++]);
+  body.value().set_fixed();
+  body.commit();
   return id;
 }
 
@@ -29,7 +31,9 @@ RS_HD int solver_get_or_init_body(World &w, SolverScratch &sc, uint32_t idx) {
   if (rb.inv_mass != 0.0f) {
     int id = sc.num_bodies;
     rb.companion_id = id;
-    sc.bodies[sc.num_bodies++] = SolverBody::from(rb);
+    Staging<SolverBody> body(sc.bodies[sc.num_bodies++]);
+    body.value().set_from(rb);
+    body.commit();
     return id;
   }
   int id = solver_fixed_body(sc);
@@ -37,23 +41,13 @@ RS_HD int solver_get_or_init_body(World &w, SolverScratch &sc, uint32_t idx) {
   return id;
 }
 
-RS_HD bool push_contact(World &w, SolverScratch &sc,
-                        const SolverConstraint &c) {
-  if (sc.num_contacts >= k_max_constraints) {
-    w.flag_error(k_error_solver_overflow);
+RS_HD bool solver_rows_full(World &w, const SolverScratch &sc,
+                            bool with_friction) {
+  if (sc.num_contacts < k_max_constraints &&
+      (!with_friction || sc.num_frictions < k_max_constraints)) {
     return false;
   }
-  sc.contacts[sc.num_contacts++] = c;
-  return true;
-}
-
-RS_HD bool push_friction(World &w, SolverScratch &sc,
-                         const SolverConstraint &c) {
-  if (sc.num_frictions >= k_max_constraints) {
-    w.flag_error(k_error_solver_overflow);
-    return false;
-  }
-  sc.frictions[sc.num_frictions++] = c;
+  w.flag_error(k_error_solver_overflow);
   return true;
 }
 
@@ -90,7 +84,9 @@ RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
     }
     int id = sc.num_bodies;
     rb.companion_id = id;
-    sc.bodies[sc.num_bodies++] = SolverBody::from(rb);
+    Staging<SolverBody> body(sc.bodies[sc.num_bodies++]);
+    body.value().set_from(rb);
+    body.commit();
   }
   for (uint32_t ai = 0; ai < w.a->num_active; ++ai) {
     PersistentManifold &m = w.a->manifolds[w.a->active[ai]];
@@ -118,8 +114,11 @@ RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
       const RigidBody *rb0 = sa.original_body >= 0 ? &body0 : nullptr;
       const RigidBody *rb1 = sb.original_body >= 0 ? &body1 : nullptr;
       if (cp.is_special) {
-        if (!skip || cp.distance_1 < 0.0f) {
-          SolverConstraint c = SolverConstraint::blank(id_a, id_b);
+        if ((!skip || cp.distance_1 < 0.0f) &&
+            !solver_rows_full(w, sc, false)) {
+          Staging<SolverConstraint> row(sc.contacts[sc.num_contacts++]);
+          SolverConstraint &c = row.value();
+          c.reset(id_a, id_b);
           c.friction_idx = -1;
           c.friction = cp.combined_friction;
           c.lower_limit = 0.0f;
@@ -129,7 +128,7 @@ RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
           if (skip) {
             c.make_dynamic_side_a(rb0 == nullptr && rb1 != nullptr);
           }
-          push_contact(w, sc, c);
+          row.commit();
         }
         bool has_side = true;
         uint32_t obj_idx = 0;
@@ -160,22 +159,29 @@ RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
         }
         continue;
       }
+      if (solver_rows_full(w, sc, true)) {
+        continue;
+      }
       int friction_idx = sc.num_contacts;
       Vec3A lat = calc_lat_friction_dir(cp, sa, sb, rel_pos1, rel_pos2);
-      SolverConstraint c = SolverConstraint::blank(id_a, id_b);
+      Staging<SolverConstraint> contact(sc.contacts[sc.num_contacts++]);
+      SolverConstraint &c = contact.value();
+      c.reset(id_a, id_b);
       c.friction_idx = friction_idx;
       c.friction = cp.combined_friction;
       c.lower_limit = 0.0f;
       c.upper_limit = 1e10f;
       c.setup_contact(sa, sb, rb0, rb1, rel_pos1, rel_pos2, cp, time_step);
-      push_contact(w, sc, c);
-      SolverConstraint f = SolverConstraint::blank(id_a, id_b);
+      contact.commit();
+      Staging<SolverConstraint> friction(sc.frictions[sc.num_frictions++]);
+      SolverConstraint &f = friction.value();
+      f.reset(id_a, id_b);
       f.friction_idx = friction_idx;
       f.lower_limit = -cp.combined_friction;
       f.upper_limit = cp.combined_friction;
       f.friction = cp.combined_friction;
       f.setup_friction(sa, sb, rb0, rb1, rel_pos1, rel_pos2, lat);
-      push_friction(w, sc, f);
+      friction.commit();
     }
   }
   w.a->num_active = 0;
@@ -200,22 +206,29 @@ RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
     pt.distance_1 = 0.0f;
     pt.applied_impulse = 0.0f;
     const RigidBody *rb0 = sa.original_body >= 0 ? &body : nullptr;
+    if (solver_rows_full(w, sc, true)) {
+      continue;
+    }
     int friction_idx = sc.num_contacts;
-    SolverConstraint c = SolverConstraint::blank(id_a, id_b);
+    Staging<SolverConstraint> contact(sc.contacts[sc.num_contacts++]);
+    SolverConstraint &c = contact.value();
+    c.reset(id_a, id_b);
     c.friction_idx = friction_idx;
     c.friction = pt.combined_friction;
     c.lower_limit = 0.0f;
     c.upper_limit = 1e10f;
     c.setup_contact(sa, sb, rb0, nullptr, rel_pos1, rel_pos2, pt, time_step);
-    push_contact(w, sc, c);
+    contact.commit();
     Vec3A lat = calc_lat_friction_dir(pt, sa, sb, rel_pos1, rel_pos2);
-    SolverConstraint f = SolverConstraint::blank(id_a, id_b);
+    Staging<SolverConstraint> friction(sc.frictions[sc.num_frictions++]);
+    SolverConstraint &f = friction.value();
+    f.reset(id_a, id_b);
     f.friction_idx = friction_idx;
     f.lower_limit = -pt.combined_friction;
     f.upper_limit = pt.combined_friction;
     f.friction = pt.combined_friction;
     f.setup_friction(sa, sb, rb0, nullptr, rel_pos1, rel_pos2, lat);
-    push_friction(w, sc, f);
+    friction.commit();
   }
 }
 

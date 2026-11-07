@@ -25,6 +25,35 @@
 
 namespace rsc {
 
+#ifdef __CUDA_ARCH__
+template <typename T> using ConstLocal = const T;
+#else
+template <typename T> using ConstLocal = const T &;
+#endif
+
+template <typename T> class Staging {
+public:
+  RS_HDI explicit Staging(T &slot) : slot_(slot) {}
+  RS_HDI T &value() {
+#ifdef __CUDA_ARCH__
+    return staged_;
+#else
+    return slot_;
+#endif
+  }
+  RS_HDI void commit() {
+#ifdef __CUDA_ARCH__
+    slot_ = staged_;
+#endif
+  }
+
+private:
+  T &slot_;
+#ifdef __CUDA_ARCH__
+  T staged_;
+#endif
+};
+
 RS_HDI uint32_t f32_to_u32(float f) {
 #ifdef __CUDA_ARCH__
   return __float_as_uint(f);
