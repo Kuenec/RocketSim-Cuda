@@ -604,6 +604,16 @@ struct CarRayLanes {
   }
 };
 
+RS_HDI Vec3A ray_pick(const Vec3A *rays, uint32_t i) {
+  Vec3A picked = rays[0];
+  for (uint32_t k = 1; k < 4; ++k) {
+    if (i == k) {
+      picked = rays[k];
+    }
+  }
+  return picked;
+}
+
 template <typename Filter, typename RayLanes>
 RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(
     const World &w, const Vec3A *ray_from, const Vec3A *ray_to,
@@ -614,34 +624,50 @@ RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(
     ray_aabb = ray_aabb.combine(
         Aabb{ray_from[i].min(ray_to[i]), ray_from[i].max(ray_to[i])});
   }
-  uint32_t own_cells[4][3] = {};
-  for (uint32_t r = lanes.index; r < 4; r += RayLanes::size) {
-    grid_cell_indices(s, ray_from[r], own_cells[r]);
-  }
   uint32_t cell_idxs[4];
   uint32_t cell_coords[4][3];
-  int num_cells = 0;
-  for (uint32_t r = 0; r < 4; ++r) {
-    uint32_t owner = r % RayLanes::size;
-    uint32_t idx3[3] = {lanes.shfl(own_cells[r][0], owner),
-                        lanes.shfl(own_cells[r][1], owner),
-                        lanes.shfl(own_cells[r][2], owner)};
-    uint32_t idx = grid_cell_index(s, idx3);
-    bool found = false;
-    for (int c = 0; c < num_cells; ++c) {
-      if (cell_idxs[c] == idx) {
-        found = true;
-        break;
+  uint32_t unique_cells = 0;
+  if constexpr (RayLanes::size == 1) {
+    uint32_t count = 0;
+    for (uint32_t r = 0; r < 4; ++r) {
+      uint32_t idx3[3];
+      grid_cell_indices(s, ray_from[r], idx3);
+      uint32_t idx = grid_cell_index(s, idx3);
+      bool found = false;
+      for (uint32_t c = 0; c < count; ++c) {
+        if (cell_idxs[c] == idx) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        cell_idxs[count] = idx;
+        cell_coords[count][0] = idx3[0];
+        cell_coords[count][1] = idx3[1];
+        cell_coords[count][2] = idx3[2];
+        ++count;
       }
     }
-    if (!found) {
-      cell_idxs[num_cells] = idx;
-      cell_coords[num_cells][0] = idx3[0];
-      cell_coords[num_cells][1] = idx3[1];
-      cell_coords[num_cells][2] = idx3[2];
-      ++num_cells;
+    unique_cells = (1u << count) - 1u;
+  } else {
+    static_assert(RayLanes::size == 4);
+    uint32_t own[3];
+    grid_cell_indices(s, ray_pick(ray_from, lanes.index), own);
+    for (uint32_t r = 0; r < 4; ++r) {
+      for (uint32_t k = 0; k < 3; ++k) {
+        cell_coords[r][k] = lanes.shfl(own[k], r);
+      }
+      cell_idxs[r] = grid_cell_index(s, cell_coords[r]);
+      bool found = false;
+      for (uint32_t c = 0; c < r; ++c) {
+        found = found || cell_idxs[c] == cell_idxs[r];
+      }
+      if (!found) {
+        unique_cells |= 1u << r;
+      }
     }
   }
+  uint32_t num_cells = popcount32(unique_cells);
   uint32_t dyn_order[k_max_dyn_bodies];
   uint32_t num_dyn = 0;
   for (uint32_t d = 0; d < w.a->num_dyn_bodies; ++d) {
@@ -658,7 +684,10 @@ RS_HOST_NOINLINE RS_HD uint32_t gather_ray_bodies(
   uint32_t seen_static[k_cell_mask_words] = {};
   uint32_t seen_dyn = 0;
   uint32_t num_bodies = 0;
-  for (int c = 0; c < num_cells; ++c) {
+  for (uint32_t c = 0; c < 4; ++c) {
+    if (!(unique_cells & (1u << c))) {
+      continue;
+    }
     const uint32_t *mask =
         s.cell_static_masks + cell_idxs[c] * s.cell_mask_words;
     for (uint32_t m = 0; m < s.cell_mask_words; ++m) {

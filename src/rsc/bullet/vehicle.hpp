@@ -540,17 +540,24 @@ struct VehicleRL {
   RS_HD void cast_wheel_ray(const World &w, int wheel, const RayLanes &lanes,
                             VehicleHit &hit) const {
     const Affine3A &trans = w.body(chassis_body_idx).world_trans;
-    Vec3A sources[k_num_wheels] = {};
-    Vec3A targets[k_num_wheels] = {};
-    for (uint32_t i = lanes.index; i < k_num_wheels; i += RayLanes::size) {
-      wheels[i].ray_endpoints(trans, sources[i], targets[i]);
+    Vec3A sources[k_num_wheels];
+    Vec3A targets[k_num_wheels];
+    if constexpr (RayLanes::size == 1) {
+      for (int i = 0; i < k_num_wheels; ++i) {
+        wheels[i].ray_endpoints(trans, sources[i], targets[i]);
+      }
+    } else {
+      static_assert(RayLanes::size == static_cast<uint32_t>(k_num_wheels));
+      Vec3A own_source;
+      Vec3A own_target;
+      wheels[lanes.index].ray_endpoints(trans, own_source, own_target);
+      for (uint32_t i = 0; i < k_num_wheels; ++i) {
+        sources[i] = lanes.shfl(own_source, i);
+        targets[i] = lanes.shfl(own_target, i);
+      }
     }
-    for (uint32_t i = 0; i < k_num_wheels; ++i) {
-      sources[i] = lanes.shfl(sources[i], i % RayLanes::size);
-      targets[i] = lanes.shfl(targets[i], i % RayLanes::size);
-    }
-    SingleRay r{sources[wheel],
-                targets[wheel],
+    SingleRay r{ray_pick(sources, static_cast<uint32_t>(wheel)),
+                ray_pick(targets, static_cast<uint32_t>(wheel)),
                 static_cast<int>(chassis_body_idx),
                 static_cast<uint8_t>(k_group_default | k_group_dropshot_floor),
                 static_cast<uint8_t>(k_group_all),
