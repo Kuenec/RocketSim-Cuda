@@ -24,7 +24,7 @@ Results are only guaranteed against a reference built on a machine with the same
 
 ## Build
 
-Requirements: CMake 3.28+, Ninja, a C++20 compiler, and the CUDA toolkit (tested with CUDA 13.4 and GCC 16 on an RTX 5070). The Rust harness additionally needs a Rust toolchain.
+Requirements: CMake 3.28+, Ninja, a C++20 compiler, and the CUDA toolkit (tested with CUDA 13.4, Clang 23, and GCC 16 on an RTX 5070). The Rust harness additionally needs a Rust toolchain.
 
 ```bash
 cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=native
@@ -34,7 +34,7 @@ cmake -S . -B build/cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHI
 cmake --build build/cmake
 ```
 
-`-DRSC_ENABLE_CUDA=OFF` builds the CPU backend only. `-DRSC_NATIVE_ARCH=ON` compiles host code for the build machine's CPU (`-march=native`), which makes the CPU backend about 6 percent faster on the reference machine without changing results, but produces binaries that may not run on older CPUs. The library target is `rocketsim_cuda` (static); `rocketsim_cuda_c` is a shared C ABI used by the verification harness.
+`-DRSC_ENABLE_CUDA=OFF` builds the CPU backend only. CMake uses `clang++` when it is installed. With Clang, the CPU tick is compiled in its own translation unit with internal linkage, and on x86-64 a second copy is compiled for AVX2 and FMA; the library runs that copy on CPUs that support both and the portable copy on others, and both give identical results. `-DRSC_NATIVE_ARCH=ON` compiles all host code for the build machine's CPU (`-march=native`) instead, without changing results, but produces binaries that may not run on older CPUs. The library target is `rocketsim_cuda` (static); `rocketsim_cuda_c` is a shared C ABI used by the verification harness.
 
 Collision meshes are not included. Place the `.cmf` files dumped from Rocket League in `collision_meshes/soccar`, `collision_meshes/hoops`, and `collision_meshes/dropshot`, as for upstream RocketSim.
 
