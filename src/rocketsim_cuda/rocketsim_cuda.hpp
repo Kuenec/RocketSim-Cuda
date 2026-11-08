@@ -297,6 +297,7 @@ struct CarEventCounts {
   uint32_t demos_received;
   uint32_t boost_pickups;
   uint32_t landed;
+  uint64_t last_hit_ball_tick;
 };
 
 struct EventCounts {

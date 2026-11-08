@@ -371,7 +371,7 @@ RS_HD EventCounts to_public(const rsc::ArenaEventCounters &c) {
     const rsc::CarEventCounters &s = c.cars[i];
     r.cars[i] = {s.hit_ball,      s.hit_world,      s.bumps_dealt,
                  s.demos_dealt,   s.bumps_received, s.demos_received,
-                 s.boost_pickups, s.landed};
+                 s.boost_pickups, s.landed,         s.last_hit_ball_tick};
   }
   return r;
 }

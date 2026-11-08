@@ -666,7 +666,11 @@ fn accumulate_counts(arena: &Arena, expected: &mut ffi::EventCounts) {
     for event in arena.get_last_step_events() {
         match event {
             ArenaEvent::BallHitWorld(_) => expected.ball_hit_world += 1,
-            ArenaEvent::CarHitBall(e) => expected.cars[e.car_idx].hit_ball += 1,
+            ArenaEvent::CarHitBall(e) => {
+                let car = &mut expected.cars[e.car_idx];
+                car.hit_ball += 1;
+                car.last_hit_ball_tick = arena.tick_count() - 1;
+            }
             ArenaEvent::CarHitCar(e) => {
                 if e.is_demo {
                     expected.cars[e.bumper_car_idx].demos_dealt += 1;
@@ -698,6 +702,7 @@ fn check_counts(expected: &ffi::EventCounts, got: &ffi::EventCounts) -> Result<(
             && a.demos_received == b.demos_received
             && a.boost_pickups == b.boost_pickups
             && a.landed == b.landed
+            && a.last_hit_ball_tick == b.last_hit_ball_tick
     });
     let goal_ok = expected.goal_scored == got.goal_scored
         && (!expected.goal_scored || expected.goal_tick == got.goal_tick);

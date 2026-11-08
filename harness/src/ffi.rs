@@ -271,6 +271,7 @@ pub struct CarEventCounts {
     pub demos_received: u32,
     pub boost_pickups: u32,
     pub landed: u32,
+    pub last_hit_ball_tick: u64,
 }
 
 #[repr(C)]

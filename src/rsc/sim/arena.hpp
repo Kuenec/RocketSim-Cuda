@@ -55,6 +55,7 @@ struct CarEventCounters {
   uint32_t demos_received;
   uint32_t boost_pickups;
   uint32_t landed;
+  uint64_t last_hit_ball_tick;
 };
 
 struct ArenaEventCounters {
@@ -453,6 +454,7 @@ RS_HD void arena_count_events(Arena &a) {
       break;
     case ArenaEventKind::CarHitBall:
       c.cars[e.car_idx].hit_ball += 1;
+      c.cars[e.car_idx].last_hit_ball_tick = a.tick_count - 1;
       break;
     case ArenaEventKind::CarHitCar:
       if (e.is_demo) {
