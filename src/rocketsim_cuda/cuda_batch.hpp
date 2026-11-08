@@ -68,8 +68,9 @@ public:
                          uint32_t cars_per_arena,
                          rocketsim_cuda::MemorySpace space);
   void export_state(const rocketsim_cuda::StateBuffers &out, uint32_t first,
-                    uint32_t count, uint32_t cars_per_arena,
-                    uint32_t pads_per_arena, rocketsim_cuda::MemorySpace space);
+                    uint32_t count, const uint8_t *mask,
+                    uint32_t cars_per_arena, uint32_t pads_per_arena,
+                    rocketsim_cuda::MemorySpace space);
   void step(uint32_t ticks);
   void set_active(uint32_t count);
   StepTiming take_step_timing();

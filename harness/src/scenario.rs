@@ -543,7 +543,9 @@ pub fn run(
         }
         if scenario.ticks_per_step > 1 {
             ours.step_async(span)?;
-            ours.sync()?;
+            if backend.has_device_io() || (tick / scenario.ticks_per_step).is_multiple_of(2) {
+                ours.sync()?;
+            }
         } else {
             ours.step(span)?;
         }

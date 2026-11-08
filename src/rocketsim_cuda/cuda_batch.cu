@@ -220,10 +220,10 @@ __global__ void set_state_kernel(const ArenaStatic *__restrict__ st,
 
 __global__ void export_kernel(const ArenaStatic *__restrict__ st,
                               const Arena *arenas, uint32_t first,
-                              uint32_t count,
+                              uint32_t count, const uint8_t *mask,
                               rocketsim_cuda::StateBuffers out) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= count) {
+  if (i >= count || (mask && !mask[first + i])) {
     return;
   }
   rocketsim_cuda::convert::export_arena(*st, arenas[first + i], i, out);
@@ -603,7 +603,8 @@ void CudaBatch::set_states_masked(const uint8_t *mask,
 
 void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
                              uint32_t first, uint32_t count,
-                             uint32_t cars_per_arena, uint32_t pads_per_arena,
+                             const uint8_t *mask, uint32_t cars_per_arena,
+                             uint32_t pads_per_arena,
                              rocketsim_cuda::MemorySpace space) {
   if (count == 0) {
     return;
@@ -634,7 +635,7 @@ void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
                          : nullptr;
   }
   export_kernel<<<grid_for(count, 64), 64, 0, im.stream>>>(
-      im.device_view.get(), im.arenas.get(), first, count, target);
+      im.device_view.get(), im.arenas.get(), first, count, mask, target);
   check(cudaGetLastError(), "export kernel launch");
   if (!host) {
     return;

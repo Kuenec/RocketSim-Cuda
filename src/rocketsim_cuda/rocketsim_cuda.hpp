@@ -397,6 +397,8 @@ public:
   void set_states_masked(const uint8_t *mask, const BallState *balls,
                          const CarReset *cars, MemorySpace space);
   void export_state(const StateBuffers &out, MemorySpace space);
+  void export_state_masked(const uint8_t *mask, const StateBuffers &out,
+                           MemorySpace space);
   void *cuda_stream() const;
 
   void step(uint32_t ticks);
