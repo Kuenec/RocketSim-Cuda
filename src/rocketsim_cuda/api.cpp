@@ -831,11 +831,11 @@ void ArenaBatch::set_all_controls(std::span<const CarControls> controls) {
   }
 }
 
+#ifdef RSC_HAS_CUDA
 void ArenaBatch::set_all_controls_device(const CarControls *device_controls,
                                          uint32_t delay_ticks) {
   Impl &im = *impl_;
   im.require_device(device_controls);
-#ifdef RSC_HAS_CUDA
   if (delay_ticks > 0) {
     im.finish_cpu_step();
     im.rebalance_if_due();
@@ -869,8 +869,13 @@ void ArenaBatch::set_all_controls_device(const CarControls *device_controls,
     im.host[i / im.num_cars].cars[i % im.num_cars].state.controls =
         convert::to_internal(rows[i]);
   }
-#endif
 }
+#else
+void ArenaBatch::set_all_controls_device(const CarControls *device_controls,
+                                         uint32_t) {
+  impl_->require_device(device_controls);
+}
+#endif
 
 void ArenaBatch::reset_to_random_kickoff_masked(const uint8_t *mask,
                                                 const uint64_t *seeds,
@@ -923,12 +928,12 @@ void ArenaBatch::set_states_masked(const uint8_t *mask, const BallState *balls,
   }
   uint32_t first = im.num_device_arenas;
   size_t count = im.host.size();
-  size_t car_rows = count * im.num_cars;
   const uint8_t *host_mask = mask + first;
   const BallState *host_balls = balls + first;
   const CarReset *host_cars =
       cars ? cars + static_cast<size_t>(first) * im.num_cars : nullptr;
 #ifdef RSC_HAS_CUDA
+  size_t car_rows = count * im.num_cars;
   if (im.cuda) {
     im.flush_controls();
     im.cuda->set_states_masked(mask, balls, cars, im.num_cars, space);
