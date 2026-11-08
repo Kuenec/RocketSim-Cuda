@@ -142,9 +142,11 @@ __global__ void resident_step_kernel(const ArenaStatic *__restrict__ st,
                                      Arena *arenas, StepScratch *scratch,
                                      TeamSatScratch *team_sat,
                                      uint32_t num_arenas,
-                                     uint32_t lanes_per_arena, uint32_t ticks) {
+                                     uint32_t lanes_per_arena, uint32_t ticks,
+                                     bool reset_counters) {
   step_arena_block(st, arenas, scratch, team_sat, num_arenas, lanes_per_arena,
-                   ticks, blockIdx.x, blockIdx.x, __activemask());
+                   ticks, reset_counters, blockIdx.x, blockIdx.x,
+                   __activemask());
 }
 
 static_assert(sizeof(Arena) % sizeof(uint64_t) == 0);
@@ -273,6 +275,11 @@ struct CudaBatch::Impl {
   DeviceArray<uint32_t> next_block;
   DeviceArray<rocketsim_cuda::CarControls> controls;
   size_t controls_capacity = 0;
+  DeviceArray<rocketsim_cuda::CarControls> queued_controls;
+  size_t queued_capacity = 0;
+  uint32_t queued_cars_per_arena = 0;
+  uint32_t queued_after = 0;
+  bool has_queue = false;
   DeviceArray<uint8_t> mask;
   size_t mask_capacity = 0;
   DeviceArray<uint64_t> seeds;
@@ -535,6 +542,25 @@ void CudaBatch::set_controls_device(const rocketsim_cuda::CarControls *controls,
   check(cudaGetLastError(), "controls kernel launch");
 }
 
+void CudaBatch::queue_controls_device(
+    const rocketsim_cuda::CarControls *controls, uint32_t cars_per_arena,
+    uint32_t after_ticks) {
+  Impl &im = *impl_;
+  uint32_t total = im.num_arenas * cars_per_arena;
+  if (total == 0) {
+    return;
+  }
+  rocketsim_cuda::CarControls *queued =
+      staged(im.queued_controls, im.queued_capacity, total);
+  check(cudaMemcpyAsync(queued, controls,
+                        sizeof(rocketsim_cuda::CarControls) * total,
+                        cudaMemcpyDeviceToDevice, im.stream),
+        "queued controls copy");
+  im.queued_cars_per_arena = cars_per_arena;
+  im.queued_after = after_ticks;
+  im.has_queue = true;
+}
+
 void CudaBatch::reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
                                      rocketsim_cuda::MemorySpace space) {
   uint32_t n = impl_->num_arenas;
@@ -649,34 +675,53 @@ void CudaBatch::export_state(const rocketsim_cuda::StateBuffers &out,
   sync();
 }
 
-void CudaBatch::step(uint32_t ticks) {
-  Impl &im = *impl_;
-  if (im.num_arenas == 0) {
-    return;
-  }
+static void launch_ticks(CudaBatch::Impl &im, uint32_t ticks,
+                         bool reset_counters) {
   bool persistent = im.blocks > im.slot_blocks;
   if (persistent) {
     order_blocks_kernel<<<1, 32, 0, im.stream>>>(
         im.block_cycles.get(), im.blocks, im.block_order.get(),
         im.next_block.get());
     check(cudaGetLastError(), "order kernel launch");
+    persistent_step_kernel<<<im.slot_blocks, im.block_size, 0, im.stream>>>(
+        im.device_view.get(), im.arenas.get(), im.scratch.get(),
+        im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks,
+        reset_counters, im.blocks, im.block_order.get(), im.block_cycles.get(),
+        im.next_block.get());
+  } else {
+    resident_step_kernel<<<im.blocks, im.block_size, 0, im.stream>>>(
+        im.device_view.get(), im.arenas.get(), im.scratch.get(),
+        im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks,
+        reset_counters);
+  }
+  check(cudaGetLastError(), "step kernel launch");
+}
+
+void CudaBatch::step(uint32_t ticks) {
+  Impl &im = *impl_;
+  bool queued = im.has_queue;
+  im.has_queue = false;
+  if (im.num_arenas == 0) {
+    return;
   }
   bool timed = im.timed_launches < k_timed_launches;
   if (timed) {
     check(cudaEventRecord(im.launch_events[2 * im.timed_launches], im.stream),
           "launch start event");
   }
-  if (persistent) {
-    persistent_step_kernel<<<im.slot_blocks, im.block_size, 0, im.stream>>>(
-        im.device_view.get(), im.arenas.get(), im.scratch.get(),
-        im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks, im.blocks,
-        im.block_order.get(), im.block_cycles.get(), im.next_block.get());
+  if (queued) {
+    uint32_t total = im.num_arenas * im.queued_cars_per_arena;
+    launch_ticks(im, im.queued_after, true);
+    controls_kernel<<<grid_for(total, 256), 256, 0, im.stream>>>(
+        im.arenas.get(), im.queued_controls.get(), nullptr,
+        im.queued_cars_per_arena, total);
+    check(cudaGetLastError(), "queued controls kernel launch");
+    if (ticks > im.queued_after) {
+      launch_ticks(im, ticks - im.queued_after, false);
+    }
   } else {
-    resident_step_kernel<<<im.blocks, im.block_size, 0, im.stream>>>(
-        im.device_view.get(), im.arenas.get(), im.scratch.get(),
-        im.team_sat.get(), im.num_arenas, im.lanes_per_arena, ticks);
+    launch_ticks(im, ticks, true);
   }
-  check(cudaGetLastError(), "step kernel launch");
   if (timed) {
     check(
         cudaEventRecord(im.launch_events[2 * im.timed_launches + 1], im.stream),

@@ -10,7 +10,8 @@ __device__ __forceinline__ void
 step_arena_block(const ArenaStatic *__restrict__ st, Arena *arenas,
                  StepScratch *scratch, TeamSatScratch *team_sat,
                  uint32_t num_arenas, uint32_t lanes_per_arena, uint32_t ticks,
-                 uint32_t block, uint32_t slot, uint32_t block_mask) {
+                 bool reset_counters, uint32_t block, uint32_t slot,
+                 uint32_t block_mask) {
   uint32_t thread = block * blockDim.x + threadIdx.x;
   uint32_t i = thread / lanes_per_arena;
   uint32_t live = __ballot_sync(block_mask, i < num_arenas);
@@ -27,7 +28,7 @@ step_arena_block(const ArenaStatic *__restrict__ st, Arena *arenas,
                   scratch + (slot_thread - team_lane) / lanes_per_arena,
                   team_sat + slot};
   Arena &a = arenas[i];
-  if (lanes.leader()) {
+  if (reset_counters && lanes.leader()) {
     a.counters = ArenaEventCounters{};
   }
   for (uint32_t t = 0; t < ticks; ++t) {
@@ -38,7 +39,7 @@ step_arena_block(const ArenaStatic *__restrict__ st, Arena *arenas,
 __global__ void persistent_step_kernel(
     const ArenaStatic *__restrict__ st, Arena *arenas, StepScratch *scratch,
     TeamSatScratch *team_sat, uint32_t num_arenas, uint32_t lanes_per_arena,
-    uint32_t ticks, uint32_t blocks, const uint32_t *block_order,
-    uint32_t *block_cycles, uint32_t *next_block);
+    uint32_t ticks, bool reset_counters, uint32_t blocks,
+    const uint32_t *block_order, uint32_t *block_cycles, uint32_t *next_block);
 
 }

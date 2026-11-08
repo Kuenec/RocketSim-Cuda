@@ -60,6 +60,8 @@ public:
                              const uint8_t *mask, uint32_t cars_per_arena);
   void set_controls_device(const rocketsim_cuda::CarControls *controls,
                            uint32_t cars_per_arena);
+  void queue_controls_device(const rocketsim_cuda::CarControls *controls,
+                             uint32_t cars_per_arena, uint32_t after_ticks);
   void reset_kickoff_masked(const uint8_t *mask, const uint64_t *seeds,
                             rocketsim_cuda::MemorySpace space);
   void set_states_masked(const uint8_t *mask,

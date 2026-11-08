@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -141,6 +142,9 @@ bool MeshSet::has_game_mode(GameMode mode) const {
 
 struct StepJob {
   uint32_t ticks;
+  uint32_t delay_ticks;
+  const rsc::CarControls *delayed;
+  uint32_t num_cars;
 };
 
 struct ExportJob {
@@ -229,7 +233,15 @@ private:
       for (size_t i = pool.claim(); i < pool.arenas_.size(); i = pool.claim()) {
         rsc::Arena &a = pool.arenas_[i];
         a.counters = rsc::ArenaEventCounters{};
-        pool.step(a, *pool.scratch_[worker], job.ticks);
+        if (job.delayed == nullptr) {
+          pool.step(a, *pool.scratch_[worker], job.ticks);
+        } else {
+          pool.step(a, *pool.scratch_[worker], job.delay_ticks);
+          for (uint32_t c = 0; c < job.num_cars; ++c) {
+            a.cars[c].state.controls = job.delayed[i * job.num_cars + c];
+          }
+          pool.step(a, *pool.scratch_[worker], job.ticks - job.delay_ticks);
+        }
         ++done;
       }
       return done;
@@ -327,6 +339,8 @@ struct ArenaBatch::Impl {
   std::deque<rsc::Arena> host;
   std::unique_ptr<CpuPool> cpu_pool;
   bool cpu_step_running = false;
+  uint32_t controls_delay = 0;
+  std::vector<rsc::CarControls> delayed_host;
   bool balance = false;
   uint32_t balance_cpu_steps = 0;
   double balance_cpu_ms = 0.0;
@@ -569,15 +583,25 @@ struct ArenaBatch::Impl {
 
   void launch_step(uint32_t ticks) {
     finish_cpu_step();
+    const uint32_t delay = controls_delay;
+    controls_delay = 0;
+    if (delay > ticks) {
+      throw std::invalid_argument(
+          "delayed controls switch after " + std::to_string(delay) +
+          " ticks but the step runs " + std::to_string(ticks));
+    }
 #ifdef RSC_HAS_CUDA
-    rebalance_if_due();
+    if (delay == 0) {
+      rebalance_if_due();
+    }
     if (num_device_arenas > 0) {
       flush_controls();
       cuda->step(ticks);
     }
 #endif
     if (cpu_pool && !host.empty()) {
-      cpu_pool->launch(StepJob{ticks});
+      cpu_pool->launch(StepJob{
+          ticks, delay, delay > 0 ? delayed_host.data() : nullptr, num_cars});
       cpu_step_running = true;
     }
   }
@@ -807,12 +831,22 @@ void ArenaBatch::set_all_controls(std::span<const CarControls> controls) {
   }
 }
 
-void ArenaBatch::set_all_controls_device(const CarControls *device_controls) {
+void ArenaBatch::set_all_controls_device(const CarControls *device_controls,
+                                         uint32_t delay_ticks) {
   Impl &im = *impl_;
   im.require_device(device_controls);
 #ifdef RSC_HAS_CUDA
+  if (delay_ticks > 0) {
+    im.finish_cpu_step();
+    im.rebalance_if_due();
+  }
   im.flush_controls();
-  im.cuda->set_controls_device(device_controls, im.num_cars);
+  if (delay_ticks == 0) {
+    im.cuda->set_controls_device(device_controls, im.num_cars);
+  } else {
+    im.cuda->queue_controls_device(device_controls, im.num_cars, delay_ticks);
+  }
+  im.controls_delay = delay_ticks;
   size_t host_slots = im.host.size() * im.num_cars;
   if (host_slots == 0) {
     return;
@@ -824,6 +858,13 @@ void ArenaBatch::set_all_controls_device(const CarControls *device_controls) {
                     sizeof(CarControls) * host_slots);
   im.cuda->sync();
   im.finish_cpu_step();
+  if (delay_ticks > 0) {
+    im.delayed_host.resize(host_slots);
+    for (size_t i = 0; i < host_slots; ++i) {
+      im.delayed_host[i] = convert::to_internal(rows[i]);
+    }
+    return;
+  }
   for (size_t i = 0; i < host_slots; ++i) {
     im.host[i / im.num_cars].cars[i % im.num_cars].state.controls =
         convert::to_internal(rows[i]);

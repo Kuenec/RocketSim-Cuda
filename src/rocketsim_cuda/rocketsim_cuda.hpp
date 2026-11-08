@@ -392,7 +392,8 @@ public:
   void set_car_controls(uint32_t arena, uint32_t car,
                         const CarControls &controls);
   void set_all_controls(std::span<const CarControls> controls);
-  void set_all_controls_device(const CarControls *device_controls);
+  void set_all_controls_device(const CarControls *device_controls,
+                               uint32_t delay_ticks = 0);
   void reset_to_random_kickoff_masked(const uint8_t *mask,
                                       const uint64_t *seeds, MemorySpace space);
   void set_states_masked(const uint8_t *mask, const BallState *balls,
