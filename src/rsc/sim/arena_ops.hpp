@@ -12,6 +12,26 @@ RS_HD void arena_set_ball_state(const ArenaStatic &st, Arena &a,
   ball_set_state(a.ball, w.dyn_body(a.ball.rigid_body_idx), state);
 }
 
+RS_HD void arena_sleep_ball(const ArenaStatic &st, Arena &a) {
+  World w = arena_world(st, a);
+  RigidBody &rb = w.dyn_body(a.ball.rigid_body_idx);
+  a.ball.state.phys.vel = Vec3A::zero();
+  a.ball.state.phys.ang_vel = Vec3A::zero();
+  rb.lin_vel = Vec3A::zero();
+  rb.ang_vel = Vec3A::zero();
+  rb.clear_accum_vels();
+  rb.activation = ActivationState::Sleeping;
+  a.ball.state.activation_state = ActivationState::Sleeping;
+  a.ball.state.deactivation_time = rb.deactivation_time;
+}
+
+RS_HD void arena_wake_ball(const ArenaStatic &st, Arena &a) {
+  World w = arena_world(st, a);
+  a.ball.state.activation_state = ActivationState::Active;
+  a.ball.state.deactivation_time = 0.0f;
+  w.dyn_body(a.ball.rigid_body_idx).force_activate();
+}
+
 RS_HD void arena_set_car_state_full(const ArenaStatic &st, Arena &a,
                                     uint32_t car_idx, const CarState &state) {
   World w = arena_world(st, a);
@@ -33,7 +53,6 @@ RS_HD void arena_set_tile_states(Arena &a, const TileStates &tiles) {
 }
 
 RS_HD void arena_reset_pads(const ArenaStatic &st, Arena &a) {
-  a.pad_lists_unchecked = false;
   a.touched_pads = 0;
   for (uint32_t i = 0; i < st.pads.num_pads; ++i) {
     a.pads[i].has_gave_tick = false;
@@ -232,6 +251,51 @@ struct KickoffOp {
   uint64_t seed;
 };
 
+struct BodyStateOp {
+  Mat3A inv_inertia_tensor_world;
+  Mat3A interp_world_basis;
+  float linear_sleeping_threshold;
+  float angular_sleeping_threshold;
+};
+
+RS_HD void arena_set_body_state(Arena &a, uint32_t dyn_body,
+                                const BodyStateOp &op) {
+  RigidBody &rb = a.phys.dyn_bodies[dyn_body];
+  rb.inv_inertia_tensor_world = op.inv_inertia_tensor_world;
+  rb.interp_world_trans.matrix3 = op.interp_world_basis;
+  rb.linear_sleeping_threshold = op.linear_sleeping_threshold;
+  rb.angular_sleeping_threshold = op.angular_sleeping_threshold;
+}
+
+RS_HD ManifoldPoint manifold_point_reversed(const ManifoldPoint &p) {
+  ManifoldPoint r = p;
+  r.local_point_a = p.local_point_b;
+  r.local_point_b = p.local_point_a;
+  r.pos_world_on_a = p.pos_world_on_b;
+  r.pos_world_on_b = p.pos_world_on_a;
+  r.normal_world_on_b = -p.normal_world_on_b;
+  return r;
+}
+
+RS_HD void arena_set_contact_manifold(const ArenaStatic &st, Arena &a,
+                                      const PersistentManifold &op) {
+  World w = arena_world(st, a);
+  int index = dispatcher_lookup(a.phys, op.body0_idx, op.body1_idx);
+  if (index < 0) {
+    dispatcher_insert(w, op);
+    return;
+  }
+  PersistentManifold &stored = a.phys.manifolds[index];
+  bool reversed = stored.body0_idx != op.body0_idx;
+  stored.contact_breaking_threshold = op.contact_breaking_threshold;
+  stored.contact_processing_threshold = op.contact_processing_threshold;
+  stored.num_points = op.num_points;
+  for (int i = 0; i < op.num_points; ++i) {
+    stored.points[i] =
+        reversed ? manifold_point_reversed(op.points[i]) : op.points[i];
+  }
+}
+
 enum class ArenaOpKind : uint8_t {
   SetCarCore,
   SetCarFull,
@@ -240,7 +304,11 @@ enum class ArenaOpKind : uint8_t {
   SetTiles,
   SetMutators,
   Kickoff,
-  SetControls
+  SetControls,
+  SleepBall,
+  WakeBall,
+  SetBodyState,
+  SetContactManifold
 };
 
 struct ArenaOp {
@@ -254,6 +322,8 @@ struct ArenaOp {
     MutatorOp mutators;
     KickoffOp kickoff;
     CarControls controls;
+    BodyStateOp body_state;
+    PersistentManifold manifold;
   };
 };
 
@@ -306,6 +376,8 @@ RS_HD void arena_set_mutator_config(const ArenaStatic &st, Arena &a,
     props.damping_factor = op.ball_damping_factor;
     props.invalidate_contacts = geometry_changed;
     world_update_body_properties(w, a.ball.rigid_body_idx, props);
+    a.ball.state.activation_state = ActivationState::Active;
+    a.ball.state.deactivation_time = 0.0f;
   }
   a.mutators = mutators;
 }
@@ -313,7 +385,6 @@ RS_HD void arena_set_mutator_config(const ArenaStatic &st, Arena &a,
 RS_HD void arena_set_pad_state(const ArenaStatic &st, Arena &a, uint32_t idx,
                                const PadOp &op) {
   PadState &pad = a.pads[idx];
-  a.pad_lists_unchecked = true;
   if (op.num_touching > 0) {
     a.touched_pads |= pad_bit(idx);
   } else {
@@ -362,6 +433,18 @@ RS_HD void arena_apply_op(const ArenaStatic &st, Arena &a, const ArenaOp &op) {
     break;
   case ArenaOpKind::SetControls:
     a.cars[op.index].state.controls = op.controls;
+    break;
+  case ArenaOpKind::SleepBall:
+    arena_sleep_ball(st, a);
+    break;
+  case ArenaOpKind::WakeBall:
+    arena_wake_ball(st, a);
+    break;
+  case ArenaOpKind::SetBodyState:
+    arena_set_body_state(a, op.index, op.body_state);
+    break;
+  case ArenaOpKind::SetContactManifold:
+    arena_set_contact_manifold(st, a, op.manifold);
     break;
   }
 }

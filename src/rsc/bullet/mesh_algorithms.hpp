@@ -66,10 +66,41 @@ RS_HD GateMeshParams gate_mesh_params(const RigidBody &compound_obj,
           no_angular || identity};
 }
 
+#ifdef RSC_BOX_TRIANGLE_GJK
+
+inline constexpr float k_gjk_loop_max_distance = 10.0f;
+
+struct BoxTriangleGjkContact {
+  bool found;
+  BoxTriangleSatContact contact;
+
+  RS_HD void add_contact_point(Vec3A, Vec3A point_on_b_world, float depth) {
+    found = true;
+    contact = {point_on_b_world, depth};
+  }
+};
+
+RS_HD void gate_triangle_gjk(const GateMeshParams &p, const Affine3A &tri_trans,
+                             Epa2 &epa, GateTriangle &t) {
+  GjkPairDetector detector;
+  detector.init(p.margin, 0.0f);
+  BoxTriangleGjkContact result{false, {}};
+  detector.get_closest_points(
+      p.box_trans, tri_trans, k_gjk_loop_max_distance * k_gjk_loop_max_distance,
+      ConvexShape::box(p.half, p.margin),
+      ConvexShape::triangle(t.q[0], t.q[1], t.q[2]), epa, result);
+  t.hit = result.found && result.contact.distance < p.maximum_distance;
+  t.contact = result.contact;
+}
+
+#else
+
 RS_HD void gate_triangle_sat(const GateMeshParams &p, GateTriangle &t) {
   t.hit = box_triangle_sat(p.box_trans, p.half, p.margin, t.q,
                            p.maximum_distance, t.contact);
 }
+
+#endif
 
 RS_HD bool gate_triangle_overlaps(const GateMeshParams &p,
                                   const TriangleShape &tri) {
@@ -103,12 +134,19 @@ template <typename Sink> struct GateTriangleCollector {
     if (!gate_triangle_overlaps(*params, tri)) {
       return;
     }
+#ifdef RSC_BOX_TRIANGLE_GJK
+    sink->push({triangle_idx,
+                {tri.points[0], tri.points[1], tri.points[2]},
+                false,
+                {}});
+#else
     if (!have_mesh_to_box) {
       mesh_to_box =
           mesh_to_box_transform(params->box_trans, *tri_trans, params->flat);
       have_mesh_to_box = true;
     }
     sink->push(gate_triangle_in_box(mesh_to_box, tri, triangle_idx));
+#endif
   }
 };
 
@@ -157,7 +195,12 @@ template <typename Callback> struct GateSerialSink {
   GateManifoldBuilder<Callback> *builder;
 
   RS_HD void push(GateTriangle t) {
+#ifdef RSC_BOX_TRIANGLE_GJK
+    gate_triangle_gjk(*params, builder->tri_obj->world_trans,
+                      builder->callback->epa_workspace(), t);
+#else
     gate_triangle_sat(*params, t);
+#endif
     builder->add(t);
   }
 };

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "rsc/bullet/game_rotation.hpp"
 #include "rsc/bullet/shapes.hpp"
 #include "rsc/math/libm.hpp"
 #include "rsc/math/vec.hpp"
@@ -41,39 +42,12 @@ RS_HD Quat quat_from_axis_angle_simd(Vec3A axis, float angle) {
   return {v.x, v.y, v.z, c};
 }
 
-RS_HD Vec3A quat_mul_vec3a(Quat q, Vec3A rhs) {
-  Vec3A b{q.x, q.y, q.z};
-  float w = q.w;
-  float b2 = b.dot(b);
-  float rb = rhs.dot(b);
-  Vec3A c = b.cross(rhs);
-  float ww_b2 = w * w - b2;
-  float rb2 = rb * 2.0f;
-  float w2 = w * 2.0f;
-  return {(rhs.x * ww_b2 + b.x * rb2) + c.x * w2,
-          (rhs.y * ww_b2 + b.y * rb2) + c.y * w2,
-          (rhs.z * ww_b2 + b.z * rb2) + c.z * w2};
-}
-
-RS_HD void integrate_trans(Affine3A &cur_trans, Quat &cur_rot, Vec3A lin_vel,
-                           Vec3A ang_vel, float time_step) {
+RS_HD void integrate_trans(Affine3A &cur_trans, Quat &cur_rot,
+                           Quat basis_rotation, Vec3A lin_vel, Vec3A ang_vel,
+                           float time_step) {
   integrate_trans_no_rot(cur_trans.translation, lin_vel, time_step);
-  float angle = ang_vel.length();
-  if (angle * time_step > k_frac_pi_4) {
-    angle = k_frac_pi_4 / time_step;
-  }
-  float half_angle = angle * time_step * 0.5f;
-  float scale;
-  if (angle < 0.001f) {
-    scale = 0.5f * time_step -
-            time_step * time_step * time_step * 0.020833334f * angle * angle;
-  } else {
-    scale = sinf_glibc(half_angle) / angle;
-  }
-  Vec3A axis = ang_vel * scale;
-  Quat dorn{axis.x, axis.y, axis.z, cosf_glibc(half_angle)};
-  cur_rot = (dorn * cur_rot).normalize();
-  cur_trans.matrix3 = mat3a_from_quat(cur_rot);
+  game_integrate_orientation(cur_trans.matrix3, cur_rot, basis_rotation,
+                             ang_vel, time_step);
 }
 
 struct RigidBodyConstructionInfo {
@@ -105,6 +79,8 @@ struct RigidBodyConstructionInfo {
 struct RigidBody {
   Affine3A world_trans;
   Quat world_quat;
+  Quat basis_rotation_memo;
+  bool basis_rotation_known;
   Shape shape;
   ActivationState activation;
   uint32_t broadphase_handle;
@@ -168,7 +144,12 @@ struct RigidBody {
       }
     }
     rb.world_trans = info.start_world_trans;
-    rb.world_quat = quat_from_mat3a(info.start_world_trans.matrix3);
+    rb.world_quat =
+        bullet_quat_from_basis_columns(info.start_world_trans.matrix3.x_axis,
+                                       info.start_world_trans.matrix3.y_axis,
+                                       info.start_world_trans.matrix3.z_axis);
+    rb.basis_rotation_memo = Quat::identity();
+    rb.basis_rotation_known = false;
     rb.shape = info.collision_shape;
     rb.activation = ActivationState::Active;
     rb.broadphase_handle = 0;
@@ -238,10 +219,12 @@ struct RigidBody {
       t.matrix3 = Mat3A::identity();
       q = Quat::identity();
     } else {
-      q = quat_from_mat3a(t.matrix3);
+      q = bullet_quat_from_basis_columns(t.matrix3.x_axis, t.matrix3.y_axis,
+                                         t.matrix3.z_axis);
     }
     world_quat = q;
     world_trans = t;
+    basis_rotation_known = false;
     update_transform_flags();
   }
 
@@ -252,7 +235,20 @@ struct RigidBody {
     }
     world_trans = t;
     world_quat = q;
+    basis_rotation_known = false;
     update_transform_flags();
+  }
+
+  RS_HD Quat basis_rotation() {
+    if (!basis_rotation_known) {
+      remember_basis_rotation(game_basis_rotation(world_trans.matrix3));
+    }
+    return basis_rotation_memo;
+  }
+
+  RS_HD void remember_basis_rotation(Quat rotation) {
+    basis_rotation_memo = rotation;
+    basis_rotation_known = true;
   }
 
   RS_HD void set_world_pos(Vec3A pos) {
@@ -314,19 +310,27 @@ struct RigidBody {
     }
   }
 
-  RS_HD Affine3A predict_integration_trans(float time_step) const {
+  RS_HD Affine3A predict_integration_trans_and_rot(float time_step,
+                                                   Quat &quat) {
     Affine3A trans = world_trans;
-    Quat quat = world_quat;
+    quat = world_quat;
     if (collision_flags & k_flag_no_angular_motion) {
       integrate_trans_no_rot(trans.translation, lin_vel, time_step);
     } else {
-      integrate_trans(trans, quat, lin_vel, ang_vel, time_step);
+      integrate_trans(trans, quat, basis_rotation(), lin_vel, ang_vel,
+                      time_step);
     }
     return trans;
   }
 
-  RS_HD void set_center_of_mass_trans(const Affine3A &xform) {
-    set_world_trans(xform);
+  RS_HD Affine3A predict_integration_trans(float time_step) {
+    Quat quat;
+    return predict_integration_trans_and_rot(time_step, quat);
+  }
+
+  RS_HD void set_center_of_mass_trans_and_rot(const Affine3A &xform,
+                                              Quat quat) {
+    set_world_trans_and_rot(xform, quat);
     interp_world_trans = world_trans;
     update_inertia_tensor();
   }

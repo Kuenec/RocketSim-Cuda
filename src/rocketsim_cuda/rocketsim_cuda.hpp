@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,13 @@ enum class CarBody : uint8_t {
 };
 
 enum class TileDamageState : uint8_t { Full, Damaged, Broken };
+
+enum class ActivationState : uint8_t {
+  Active,
+  Sleeping,
+  DisableSimulation,
+  WantsDeactivation
+};
 
 inline constexpr uint32_t k_max_cars = 8;
 inline constexpr uint32_t k_max_boost_pads = 48;
@@ -206,6 +214,8 @@ struct BallState {
   HeatseekerInfo hs_info;
   DropshotInfo ds_info;
   uint64_t tick_count_since_kickoff;
+  ActivationState activation_state;
+  float deactivation_time;
 };
 
 struct BoostPadConfig {
@@ -321,6 +331,103 @@ struct PadStateView {
   uint32_t touching[k_max_cars];
 };
 
+inline constexpr uint32_t k_max_contact_points = 4;
+
+struct Mat3 {
+  Vec3 x_axis;
+  Vec3 y_axis;
+  Vec3 z_axis;
+};
+
+struct Transform {
+  Mat3 matrix3;
+  Vec3 translation;
+};
+
+struct Aabb {
+  Vec3 min;
+  Vec3 max;
+};
+
+struct BodyInfo {
+  UserInfoType kind;
+  Transform world_transform;
+  Aabb aabb;
+  float contact_breaking_threshold;
+  float contact_processing_threshold;
+  uint32_t collision_order;
+  uint8_t collision_flags;
+
+  Vec3 world_point(Vec3 local_point) const;
+};
+
+struct BodyState {
+  Mat3 inv_inertia_tensor_world;
+  Mat3 interp_world_basis;
+  float linear_sleeping_threshold;
+  float angular_sleeping_threshold;
+};
+
+struct ContactPoint {
+  Vec3 local_point_a;
+  Vec3 local_point_b;
+  Vec3 pos_world_on_a;
+  Vec3 pos_world_on_b;
+  Vec3 normal_world_on_b;
+  float distance;
+  float combined_friction;
+  float combined_restitution;
+  float applied_impulse;
+  bool is_special;
+};
+
+struct ContactManifold {
+  uint32_t body0;
+  uint32_t body1;
+  float contact_breaking_threshold;
+  float contact_processing_threshold;
+  uint32_t num_points;
+  ContactPoint points[k_max_contact_points];
+};
+
+enum class StateErrorKind : uint8_t {
+  UnknownBody,
+  UnknownManifoldBody,
+  SameBodyPair,
+  DuplicateBodyPair,
+  TooManyPoints,
+  NonFinitePoint,
+  NormalNotUnit,
+  NegativeAppliedImpulse,
+  InvalidBreakingThreshold,
+  InvalidProcessingThreshold,
+  NonFiniteBodyState,
+  NegativeSleepingThreshold
+};
+
+enum class BodyStateField : uint8_t {
+  InvInertiaTensorWorld,
+  InterpWorldBasis,
+  LinearSleepingThreshold,
+  AngularSleepingThreshold
+};
+
+struct StateErrorInfo {
+  StateErrorKind kind;
+  BodyStateField field;
+  uint32_t manifold;
+  uint32_t body;
+  uint32_t point;
+  uint32_t points;
+};
+
+class StateError : public std::runtime_error {
+public:
+  explicit StateError(const StateErrorInfo &error);
+
+  StateErrorInfo info;
+};
+
 enum class MemorySpace : uint8_t { Host, Device };
 
 struct StateBuffers {
@@ -420,11 +527,23 @@ public:
   void set_car_state(uint32_t arena, uint32_t car, const CarCore &core);
   void set_car_state_full(uint32_t arena, uint32_t car, const CarState &state);
   void set_ball_state(uint32_t arena, const BallState &state);
+  void sleep_ball(uint32_t arena);
+  void wake_ball(uint32_t arena);
   void set_boost_pad_state(uint32_t arena, uint32_t pad,
                            const BoostPadState &state);
   void set_tile_states(uint32_t arena, const TileStates &states);
   void set_mutator_config(uint32_t arena, const MutatorConfig &mutators);
   void reset_to_random_kickoff(uint32_t arena, std::optional<uint64_t> seed);
+
+  uint32_t physics_body_count(uint32_t arena);
+  uint32_t ball_body_id(uint32_t arena);
+  std::optional<uint32_t> car_body_id(uint32_t arena, uint32_t car);
+  BodyInfo body_info(uint32_t arena, uint32_t body);
+  BodyState body_state(uint32_t arena, uint32_t body);
+  void set_body_state(uint32_t arena, uint32_t body, const BodyState &state);
+  std::vector<ContactManifold> contact_manifolds(uint32_t arena);
+  void set_contact_manifolds(uint32_t arena,
+                             std::span<const ContactManifold> manifolds);
 
   void copy_arenas(const ArenaBatch &source,
                    std::span<const uint32_t> source_arenas,

@@ -8,6 +8,9 @@
 
 namespace rsc {
 
+inline constexpr int32_t k_no_solver_body = -1;
+inline constexpr int32_t k_rowless_solver_body = -2;
+
 RS_HD int solver_fixed_body(SolverScratch &sc) {
   if (sc.fixed_body_id >= 0) {
     return sc.fixed_body_id;
@@ -28,7 +31,7 @@ RS_HD int solver_get_or_init_body(World &w, SolverScratch &sc, uint32_t idx) {
   if (rb.companion_id >= 0) {
     return rb.companion_id;
   }
-  if (rb.inv_mass != 0.0f) {
+  if (rb.is_active() || rb.inv_mass != 0.0f) {
     int id = sc.num_bodies;
     rb.companion_id = id;
     Staging<SolverBody> body(sc.bodies[sc.num_bodies++]);
@@ -39,6 +42,16 @@ RS_HD int solver_get_or_init_body(World &w, SolverScratch &sc, uint32_t idx) {
   int id = solver_fixed_body(sc);
   rb.companion_id = id;
   return id;
+}
+
+RS_HD void solver_keep_rowless_body(World &w, uint32_t idx) {
+  if (idx < w.num_static()) {
+    return;
+  }
+  RigidBody &rb = w.dyn_body(idx);
+  if (rb.companion_id == k_no_solver_body && rb.inv_mass != 0.0f) {
+    rb.companion_id = k_rowless_solver_body;
+  }
 }
 
 RS_HD bool solver_rows_full(World &w, const SolverScratch &sc,
@@ -78,26 +91,17 @@ RS_HDI void solver_setup(World &w, SolverScratch &sc, float time_step) {
   sc.num_specials = 0;
   for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
     RigidBody &rb = w.a->dyn_bodies[i];
-    rb.companion_id = -1;
-    if (!rb.is_active()) {
-      continue;
-    }
-    int id = sc.num_bodies;
-    rb.companion_id = id;
-    Staging<SolverBody> body(sc.bodies[sc.num_bodies++]);
-    body.value().set_from(rb);
-    body.commit();
+    rb.companion_id = rb.is_active() ? k_rowless_solver_body : k_no_solver_body;
   }
   for (uint32_t ai = 0; ai < w.a->num_active; ++ai) {
     PersistentManifold &m = w.a->manifolds[w.a->active[ai]];
+    if (m.num_points == 0) {
+      solver_keep_rowless_body(w, m.body0_idx);
+      solver_keep_rowless_body(w, m.body1_idx);
+      continue;
+    }
     int id_a = solver_get_or_init_body(w, sc, m.body0_idx);
     int id_b = solver_get_or_init_body(w, sc, m.body1_idx);
-    if (m.body0_idx >= w.num_static()) {
-      w.dyn_body(m.body0_idx).companion_id = id_a;
-    }
-    if (m.body1_idx >= w.num_static()) {
-      w.dyn_body(m.body1_idx).companion_id = id_b;
-    }
     const RigidBody &body0 = w.body(m.body0_idx);
     const RigidBody &body1 = w.body(m.body1_idx);
     Vec3A trans0 = body0.world_trans.translation;
@@ -309,23 +313,11 @@ RS_HDI float solver_single_iteration(World &w, SolverScratch &sc) {
   return lsr;
 }
 
-RS_HD void solver_finish_body(RigidBody &body, SolverBody &s, float time_step) {
-  s.lin_vel += s.delta_lin_vel;
-  s.ang_vel += s.delta_ang_vel;
-  if (s.push_vel.length_squared() != 0.0f ||
-      s.turn_vel.length_squared() != 0.0f) {
-    Affine3A world_trans = body.world_trans;
-    if (body.collision_flags & k_flag_no_angular_motion) {
-      integrate_trans_no_rot(world_trans.translation, s.push_vel, time_step);
-    } else {
-      Quat world_rot = body.world_quat;
-      integrate_trans(world_trans, world_rot, s.push_vel,
-                      s.turn_vel * k_split_impulse_turn_erp, time_step);
-    }
-    body.set_world_trans(world_trans);
-  }
-  Vec3A lin = s.lin_vel + s.external_force_impulse;
-  Vec3A ang = s.ang_vel + s.external_torque_impulse;
+RS_HD void solver_store_velocities(RigidBody &body, Vec3A lin_vel,
+                                   Vec3A ang_vel, Vec3A external_force_impulse,
+                                   Vec3A external_torque_impulse) {
+  Vec3A lin = lin_vel + external_force_impulse;
+  Vec3A ang = ang_vel + external_torque_impulse;
   bool was_sleeping = body.activation == ActivationState::Sleeping;
   body.lin_vel = lin;
   body.ang_vel = ang;
@@ -335,25 +327,47 @@ RS_HD void solver_finish_body(RigidBody &body, SolverBody &s, float time_step) {
   }
 }
 
-RS_HDI void solver_finish(World &w, SolverScratch &sc, float time_step) {
-  for (int i = 0; i < sc.num_bodies; ++i) {
-    SolverBody &s = sc.bodies[i];
-    if (s.original_body >= 0) {
-      solver_finish_body(w.dyn_body(static_cast<uint32_t>(s.original_body)), s,
-                         time_step);
+RS_HD void solver_finish_body(RigidBody &body, const SolverBody &s,
+                              float time_step) {
+  Vec3A lin_vel = s.lin_vel + s.delta_lin_vel;
+  Vec3A ang_vel = s.ang_vel + s.delta_ang_vel;
+  if (s.push_vel.length_squared() != 0.0f ||
+      s.turn_vel.length_squared() != 0.0f) {
+    Affine3A world_trans = body.world_trans;
+    Quat world_rot = body.world_quat;
+    if (body.collision_flags & k_flag_no_angular_motion) {
+      integrate_trans_no_rot(world_trans.translation, s.push_vel, time_step);
+    } else {
+      integrate_trans(world_trans, world_rot, body.basis_rotation(), s.push_vel,
+                      s.turn_vel * k_split_impulse_turn_erp, time_step);
     }
+    body.set_world_trans_and_rot(world_trans, world_rot);
   }
+  solver_store_velocities(body, lin_vel, ang_vel, s.external_force_impulse,
+                          s.external_torque_impulse);
 }
 
-RS_HD void dynamics_finish_body(ArenaPhysics &a, SolverScratch &sc, uint32_t i,
-                                float time_step) {
+RS_HD void dynamics_finish_body(ArenaPhysics &a, const SolverScratch &sc,
+                                uint32_t i, float time_step) {
   RigidBody &body = a.dyn_bodies[i];
+  if (body.companion_id == k_rowless_solver_body) {
+    solver_store_velocities(body, body.lin_vel + Vec3A::zero(),
+                            body.ang_vel + Vec3A::zero(), body.accum_lin_vel,
+                            body.accum_ang_vel);
+    return;
+  }
   if (body.companion_id < 0) {
     return;
   }
-  SolverBody &s = sc.bodies[body.companion_id];
+  const SolverBody &s = sc.bodies[body.companion_id];
   if (s.original_body >= 0) {
     solver_finish_body(body, s, time_step);
+  }
+}
+
+RS_HDI void solver_finish(World &w, const SolverScratch &sc, float time_step) {
+  for (uint32_t i = 0; i < w.a->num_dyn_bodies; ++i) {
+    dynamics_finish_body(*w.a, sc, i, time_step);
   }
 }
 
@@ -496,7 +510,13 @@ RS_HDI void island_sort_manifolds(World &w) {
       a.dyn_bodies[i].sleep();
     }
   }
-  if (a.num_active <= 1) {
+  uint32_t with_points = 0;
+  for (uint32_t i = 0; i < a.num_active; ++i) {
+    if (a.manifolds[a.active[i]].num_points != 0) {
+      ++with_points;
+    }
+  }
+  if (with_points <= 1) {
     return;
   }
   int32_t keys[k_max_manifolds];
@@ -531,6 +551,43 @@ RS_HD void dynamics_predict_body(ArenaPhysics &a, uint32_t i, float time_step) {
   body.interp_world_trans = body.predict_integration_trans(time_step);
 }
 
+RS_HD void dynamics_predict_bodies(ArenaPhysics &a, float time_step) {
+  RigidBody *rotating[k_max_dyn_bodies];
+  const Mat3A *bases[k_max_dyn_bodies];
+  Quat steps[k_max_dyn_bodies];
+  uint32_t n = 0;
+  for (uint32_t i = 0; i < a.num_dyn_bodies; ++i) {
+    RigidBody &body = a.dyn_bodies[i];
+    if (body.is_active()) {
+      body.add_linear_impulse(a.gravity * time_step, false, true);
+    }
+    if (body.activation == ActivationState::Sleeping) {
+      body.interp_world_trans = body.world_trans;
+      continue;
+    }
+    body.apply_damping();
+    body.interp_world_trans.translation = body.world_trans.translation;
+    integrate_trans_no_rot(body.interp_world_trans.translation, body.lin_vel,
+                           time_step);
+    if (body.collision_flags & k_flag_no_angular_motion) {
+      body.interp_world_trans.matrix3 = body.world_trans.matrix3;
+      continue;
+    }
+    steps[n] = game_rotation_step(body.ang_vel, time_step);
+    bases[n] = &body.world_trans.matrix3;
+    rotating[n++] = &body;
+  }
+  Quat sources[k_max_dyn_bodies];
+  Quat rotations[k_max_dyn_bodies];
+  Mat3A columns[k_max_dyn_bodies];
+  game_basis_rotations(bases, n, sources);
+  game_apply_rotation_steps(steps, sources, n, rotations, columns);
+  for (uint32_t k = 0; k < n; ++k) {
+    rotating[k]->remember_basis_rotation(sources[k]);
+    rotating[k]->interp_world_trans.matrix3 = columns[k];
+  }
+}
+
 RS_HD void dynamics_solve(World &w, SolverScratch &sc, float time_step) {
   ArenaPhysics &a = *w.a;
   island_sort_manifolds(w);
@@ -544,7 +601,9 @@ RS_HD void dynamics_integrate_body(ArenaPhysics &a, uint32_t i,
                                    float time_step) {
   RigidBody &body = a.dyn_bodies[i];
   if (body.is_active()) {
-    body.set_center_of_mass_trans(body.predict_integration_trans(time_step));
+    Quat quat;
+    Affine3A trans = body.predict_integration_trans_and_rot(time_step, quat);
+    body.set_center_of_mass_trans_and_rot(trans, quat);
   }
   body.update_activation_state(time_step);
 }

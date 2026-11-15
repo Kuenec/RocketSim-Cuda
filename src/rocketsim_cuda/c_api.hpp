@@ -117,6 +117,32 @@ int rsc_batch_set_car_state_full(RscBatch *batch, uint32_t arena, uint32_t car,
                                  const rocketsim_cuda::CarState *state);
 int rsc_batch_set_ball_state(RscBatch *batch, uint32_t arena,
                              const rocketsim_cuda::BallState *state);
+int rsc_batch_sleep_ball(RscBatch *batch, uint32_t arena);
+int rsc_batch_wake_ball(RscBatch *batch, uint32_t arena);
+int rsc_batch_physics_body_count(RscBatch *batch, uint32_t arena,
+                                 uint32_t *out);
+int rsc_batch_ball_body_id(RscBatch *batch, uint32_t arena, uint32_t *out);
+int rsc_batch_car_body_id(RscBatch *batch, uint32_t arena, uint32_t car,
+                          uint32_t *out, uint8_t *found);
+int rsc_batch_body_info(RscBatch *batch, uint32_t arena, uint32_t body,
+                        rocketsim_cuda::BodyInfo *out,
+                        rocketsim_cuda::StateErrorInfo *error);
+void rsc_body_info_world_point(const rocketsim_cuda::BodyInfo *info,
+                               const rocketsim_cuda::Vec3 *local_point,
+                               rocketsim_cuda::Vec3 *out);
+int rsc_batch_body_state(RscBatch *batch, uint32_t arena, uint32_t body,
+                         rocketsim_cuda::BodyState *out,
+                         rocketsim_cuda::StateErrorInfo *error);
+int rsc_batch_set_body_state(RscBatch *batch, uint32_t arena, uint32_t body,
+                             const rocketsim_cuda::BodyState *state,
+                             rocketsim_cuda::StateErrorInfo *error);
+int rsc_batch_contact_manifolds(RscBatch *batch, uint32_t arena,
+                                rocketsim_cuda::ContactManifold *out,
+                                uint32_t capacity, uint32_t *count);
+int rsc_batch_set_contact_manifolds(
+    RscBatch *batch, uint32_t arena,
+    const rocketsim_cuda::ContactManifold *manifolds, uint32_t count,
+    rocketsim_cuda::StateErrorInfo *error);
 int rsc_batch_set_pad_state(RscBatch *batch, uint32_t arena, uint32_t pad,
                             float cooldown, const uint32_t *touching,
                             uint32_t num_touching);

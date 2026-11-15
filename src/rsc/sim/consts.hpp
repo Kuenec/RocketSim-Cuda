@@ -88,8 +88,8 @@ inline constexpr float yaw_limit_deg = 45.572994f;
 inline constexpr float pitch_limit_deg = 36.869896f;
 }
 namespace drive {
-inline constexpr float throttle_torque_amount = mass_bt * 400.0f;
-inline constexpr float brake_torque_amount = mass_bt * (14.25f + (1.0f / 3.0f));
+inline constexpr float engine_force_uu = 288000.0f;
+inline constexpr float brake_force_uu = 10500.0f;
 inline constexpr float stopping_forward_vel = 25.0f;
 inline constexpr float coasting_brake_factor = 0.15f;
 inline constexpr float braking_no_throttle_speed_thresh = 0.01f;
@@ -137,6 +137,7 @@ namespace autoflip {
 inline constexpr float impulse = 200.0f;
 inline constexpr float ang_vel_delta = 1000.0f;
 inline constexpr float time = 0.4f;
+inline constexpr float three_wheel_time = 0.2f;
 inline constexpr float norm_z_thresh = 0.707f;
 inline constexpr float roll_thresh = 2.8f;
 inline constexpr float up_dot_thresh = -0.966f;
@@ -361,10 +362,13 @@ RS_HD const LinearPieceCurve<2> &plank_powerslide_steer_angle_from_speed() {
   static constexpr LinearPieceCurve<2> c = LinearPieceCurve<2>::make(pts);
   return c;
 }
-RS_HD const LinearPieceCurve<3> &drive_speed_torque_factor() {
-  static constexpr float pts[3][2] = {
-      {0.0f, 1.0f}, {1400.0f, 0.1f}, {1410.0f, 0.0f}};
-  static constexpr LinearPieceCurve<3> c = LinearPieceCurve<3>::make(pts);
+RS_HD const LinearPieceCurve<5> &drive_speed_torque_factor() {
+  static constexpr float pts[5][2] = {{-1410.0f, 0.0f},
+                                      {-1400.0f, 0.1f},
+                                      {0.0f, 1.0f},
+                                      {1400.0f, 0.1f},
+                                      {1410.0f, 0.0f}};
+  static constexpr LinearPieceCurve<5> c = LinearPieceCurve<5>::make(pts);
   return c;
 }
 RS_HD const LinearPieceCurve<5> &ball_car_extra_impulse_factor() {

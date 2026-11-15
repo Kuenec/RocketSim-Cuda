@@ -1,6 +1,6 @@
 RocketSim-CUDA V3
 
-This project is a C++ and CUDA port of RocketSim v0.3.5 (Rust), created by
+This project is a C++ and CUDA port of RocketSim v0.3.6 (Rust), created by
 ZealanL and ported to Rust by VirxEC (https://github.com/ZealanL/RocketSim,
 MIT License, see LICENSE). RocketSim's physics are derived from the Bullet
 Physics library.

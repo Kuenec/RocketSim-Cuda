@@ -27,6 +27,7 @@ struct Options {
     bench_ticks: u32,
     bench_warmup: u32,
     bench_hybrid_cpu_share: f64,
+    bench_seed: u64,
     backends: Vec<Backend>,
     filter: Vec<String>,
     quick: bool,
@@ -48,6 +49,7 @@ fn parse_args() -> Result<Options, String> {
         bench_ticks: 240,
         bench_warmup: 1200,
         bench_hybrid_cpu_share: 0.4,
+        bench_seed: 0,
         backends: vec![Backend::Cpu, Backend::Cuda, Backend::Hybrid],
         filter: Vec::new(),
         quick: false,
@@ -60,7 +62,7 @@ fn parse_args() -> Result<Options, String> {
         Some("bench") => Command::Bench,
         other => {
             return Err(format!(
-                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|hybrid|both|all] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cpu-mt,cuda,hybrid] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N] [--hybrid-cpu-share F]"
+                "unknown command {other:?}; usage: rsv3_harness gate [--backend cpu|cuda|hybrid|both|all] [--filter NAME]... [--quick] [--meshes DIR] [--recordings DIR] | rsv3_harness bench [--targets upstream,cpu,cpu-mt,cuda,hybrid] [--arenas 100,1000,10000] [--reps N] [--ticks N] [--warmup N] [--hybrid-cpu-share F] [--seed N]"
             ));
         }
     };
@@ -134,6 +136,10 @@ fn parse_args() -> Result<Options, String> {
                 let v = args.next().ok_or("--ticks needs a value")?;
                 opts.bench_ticks = v.parse().map_err(|e| format!("invalid --ticks {v}: {e}"))?;
             }
+            "--seed" => {
+                let v = args.next().ok_or("--seed needs a value")?;
+                opts.bench_seed = v.parse().map_err(|e| format!("invalid --seed {v}: {e}"))?;
+            }
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -196,6 +202,7 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
         ticks_per_step: 1,
         actions: Vec::new(),
         seed: 1,
+        physics_access: false,
     };
 
     let mut long = base(
@@ -294,6 +301,7 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
                 (scale(2400), Action::CloneArena),
                 (scale(300), Action::CarsCollide),
                 (scale(2000), Action::CarsCollide),
+                (scale(2200), Action::CarsOnRoof),
             ];
             s.actions.push((scale(2700), Action::KickoffMaskedRng));
             if mode == GameMode::Dropshot {
@@ -400,8 +408,84 @@ fn scenarios(quick: bool, recordings: &[(String, Arc<Vec<Vec<CarControls>>>)]) -
     idle.ticks = scale(1200);
     idle.controls = ControlSource::Idle;
     idle.seed = 400;
-    idle.actions = vec![(scale(600), Action::KickoffUnseeded)];
+    idle.actions = vec![
+        (scale(400), Action::BallNudge),
+        (scale(600), Action::KickoffUnseeded),
+        (scale(1000), Action::BallNudge),
+        (scale(1100), Action::BallWake),
+    ];
     out.push(idle);
+
+    let mut ball_sleep = base(
+        "soccar_ball_sleep".into(),
+        GameMode::Soccar,
+        team_layout(2, 2, 0),
+    );
+    ball_sleep.arenas = 16;
+    ball_sleep.ticks = scale(2400);
+    ball_sleep.seed = 410;
+    ball_sleep.actions = vec![
+        (scale(300), Action::BallSleep),
+        (scale(900), Action::BallNudge),
+        (scale(1200), Action::BallSleep),
+        (scale(1800), Action::BallSleep),
+    ];
+    out.push(ball_sleep);
+
+    let mut ball_wake = base(
+        "soccar_ball_wake".into(),
+        GameMode::Soccar,
+        team_layout(1, 1, 0),
+    );
+    ball_wake.arenas = 16;
+    ball_wake.ticks = scale(2400);
+    ball_wake.controls = ControlSource::Idle;
+    ball_wake.seed = 420;
+    ball_wake.actions = vec![
+        (scale(200), Action::BallNudge),
+        (scale(300), Action::BallSleep),
+        (scale(600), Action::BallWake),
+        (scale(1500), Action::BallNudge),
+        (scale(1600), Action::BallSleep),
+        (scale(2000), Action::BallWake),
+    ];
+    out.push(ball_wake);
+
+    let mut solver_boundaries = base(
+        "soccar_solver_boundaries".into(),
+        GameMode::Soccar,
+        team_layout(1, 1, 0),
+    );
+    solver_boundaries.arenas = 8;
+    solver_boundaries.ticks = scale(4000);
+    solver_boundaries.controls = ControlSource::Idle;
+    solver_boundaries.seed = 430;
+    solver_boundaries.actions = vec![
+        (scale(200), Action::SleepingBallNearMiss),
+        (scale(1500), Action::NegativeZeroVelocities),
+        (scale(2500), Action::SleepingBallNearMiss),
+        (scale(3500), Action::NegativeZeroVelocities),
+    ];
+    out.push(solver_boundaries);
+
+    for (mode, cars) in [
+        (GameMode::Soccar, team_layout(2, 2, 0)),
+        (GameMode::Snowday, team_layout(1, 1, 0)),
+    ] {
+        let mut physics = base(format!("{}_physics_access", mode_name(mode)), mode, cars);
+        physics.arenas = 8;
+        physics.ticks = scale(3000);
+        physics.seed = 430;
+        physics.physics_access = true;
+        physics.actions = vec![
+            (scale(600), Action::PhysicsEdit),
+            (scale(1000), Action::CarsCollide),
+            (scale(1500), Action::PhysicsEdit),
+            (scale(2000), Action::CarsCollide),
+            (scale(2400), Action::KickoffSeeded),
+        ];
+        out.push(physics);
+    }
     out
 }
 
@@ -423,6 +507,7 @@ fn run_bench(opts: &Options, meshes: &ffi::MeshSet) -> ExitCode {
                 opts.bench_ticks,
                 opts.bench_warmup,
                 opts.bench_hybrid_cpu_share,
+                opts.bench_seed,
             ) {
                 Ok(s) => println!(
                     "bench soccar_1v1 {:<14} arenas {:>6}  median {:>12.0}  min {:>12.0}  max {:>12.0} arena-ticks/s  samples {:?}",

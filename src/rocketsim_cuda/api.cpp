@@ -1141,6 +1141,380 @@ void ArenaBatch::set_ball_state(uint32_t arena, const BallState &state) {
   impl_->apply(arena, op);
 }
 
+void ArenaBatch::sleep_ball(uint32_t arena) {
+  rsc::ArenaOp op{};
+  op.kind = rsc::ArenaOpKind::SleepBall;
+  impl_->apply(arena, op);
+}
+
+void ArenaBatch::wake_ball(uint32_t arena) {
+  rsc::ArenaOp op{};
+  op.kind = rsc::ArenaOpKind::WakeBall;
+  impl_->apply(arena, op);
+}
+
+namespace {
+
+std::string state_error_text(const StateErrorInfo &error) {
+  switch (error.kind) {
+  case StateErrorKind::UnknownBody:
+    return "unknown body " + std::to_string(error.body);
+  case StateErrorKind::UnknownManifoldBody:
+    return "manifold " + std::to_string(error.manifold) +
+           " names unknown body " + std::to_string(error.body);
+  case StateErrorKind::SameBodyPair:
+    return "manifold " + std::to_string(error.manifold) +
+           " names the same body twice";
+  case StateErrorKind::DuplicateBodyPair:
+    return "manifold " + std::to_string(error.manifold) +
+           " repeats an earlier body pair";
+  case StateErrorKind::TooManyPoints:
+    return "manifold " + std::to_string(error.manifold) + " has " +
+           std::to_string(error.points) + " points";
+  case StateErrorKind::NonFinitePoint:
+    return "manifold " + std::to_string(error.manifold) + " point " +
+           std::to_string(error.point) + " is not finite";
+  case StateErrorKind::NormalNotUnit:
+    return "manifold " + std::to_string(error.manifold) + " point " +
+           std::to_string(error.point) + " has a normal that is not unit";
+  case StateErrorKind::NegativeAppliedImpulse:
+    return "manifold " + std::to_string(error.manifold) + " point " +
+           std::to_string(error.point) + " has a negative applied impulse";
+  case StateErrorKind::InvalidBreakingThreshold:
+    return "manifold " + std::to_string(error.manifold) +
+           " has an invalid contact breaking threshold";
+  case StateErrorKind::InvalidProcessingThreshold:
+    return "manifold " + std::to_string(error.manifold) +
+           " has an invalid contact processing threshold";
+  case StateErrorKind::NonFiniteBodyState:
+    return "body state field " +
+           std::to_string(static_cast<uint32_t>(error.field)) +
+           " is not finite";
+  case StateErrorKind::NegativeSleepingThreshold:
+    return "body state field " +
+           std::to_string(static_cast<uint32_t>(error.field)) + " is negative";
+  }
+  return "invalid state";
+}
+
+StateErrorInfo state_error(StateErrorKind kind) {
+  StateErrorInfo error{};
+  error.kind = kind;
+  return error;
+}
+
+StateErrorInfo body_error(StateErrorKind kind, uint32_t body) {
+  StateErrorInfo error = state_error(kind);
+  error.body = body;
+  return error;
+}
+
+StateErrorInfo field_error(StateErrorKind kind, BodyStateField field) {
+  StateErrorInfo error = state_error(kind);
+  error.field = field;
+  return error;
+}
+
+StateErrorInfo manifold_error(StateErrorKind kind, uint32_t manifold) {
+  StateErrorInfo error = state_error(kind);
+  error.manifold = manifold;
+  return error;
+}
+
+StateErrorInfo point_error(StateErrorKind kind, uint32_t manifold,
+                           uint32_t point) {
+  StateErrorInfo error = manifold_error(kind, manifold);
+  error.point = point;
+  return error;
+}
+
+bool mat3_is_finite(const rsc::Mat3A &m) {
+  return m.x_axis.is_finite() && m.y_axis.is_finite() && m.z_axis.is_finite();
+}
+
+void validate_sleeping_threshold(float threshold, BodyStateField field) {
+  if (!rsc::is_finite_f32(threshold)) {
+    throw StateError(field_error(StateErrorKind::NonFiniteBodyState, field));
+  }
+  if (threshold < 0.0f) {
+    throw StateError(
+        field_error(StateErrorKind::NegativeSleepingThreshold, field));
+  }
+}
+
+rsc::BodyStateOp validated_body_state(const BodyState &state) {
+  rsc::BodyStateOp op{mat3_to_internal(state.inv_inertia_tensor_world),
+                      mat3_to_internal(state.interp_world_basis),
+                      state.linear_sleeping_threshold,
+                      state.angular_sleeping_threshold};
+  if (!mat3_is_finite(op.inv_inertia_tensor_world)) {
+    throw StateError(field_error(StateErrorKind::NonFiniteBodyState,
+                                 BodyStateField::InvInertiaTensorWorld));
+  }
+  if (!mat3_is_finite(op.interp_world_basis)) {
+    throw StateError(field_error(StateErrorKind::NonFiniteBodyState,
+                                 BodyStateField::InterpWorldBasis));
+  }
+  validate_sleeping_threshold(op.linear_sleeping_threshold,
+                              BodyStateField::LinearSleepingThreshold);
+  validate_sleeping_threshold(op.angular_sleeping_threshold,
+                              BodyStateField::AngularSleepingThreshold);
+  return op;
+}
+
+bool threshold_is_valid(float threshold) {
+  return rsc::is_finite_f32(threshold) && !(threshold < 0.0f);
+}
+
+rsc::ManifoldPoint validated_contact_point(const ContactPoint &point,
+                                           uint32_t manifold, uint32_t index) {
+  rsc::ManifoldPoint p;
+  p.local_point_a = to_internal(point.local_point_a);
+  p.local_point_b = to_internal(point.local_point_b);
+  p.pos_world_on_a = to_internal(point.pos_world_on_a);
+  p.pos_world_on_b = to_internal(point.pos_world_on_b);
+  p.normal_world_on_b = to_internal(point.normal_world_on_b);
+  p.distance_1 = point.distance;
+  p.combined_friction = point.combined_friction;
+  p.combined_restitution = point.combined_restitution;
+  p.applied_impulse = point.applied_impulse;
+  p.is_special = point.is_special;
+  bool finite = p.local_point_a.is_finite() && p.local_point_b.is_finite() &&
+                p.pos_world_on_a.is_finite() && p.pos_world_on_b.is_finite() &&
+                p.normal_world_on_b.is_finite() &&
+                rsc::is_finite_f32(p.distance_1) &&
+                rsc::is_finite_f32(p.combined_friction) &&
+                rsc::is_finite_f32(p.combined_restitution) &&
+                rsc::is_finite_f32(p.applied_impulse);
+  if (!finite) {
+    throw StateError(
+        point_error(StateErrorKind::NonFinitePoint, manifold, index));
+  }
+  if (!(rsc::abs_f32(p.normal_world_on_b.length_squared() - 1.0f) <= 2e-4f)) {
+    throw StateError(
+        point_error(StateErrorKind::NormalNotUnit, manifold, index));
+  }
+  if (p.applied_impulse < 0.0f) {
+    throw StateError(
+        point_error(StateErrorKind::NegativeAppliedImpulse, manifold, index));
+  }
+  return p;
+}
+
+std::vector<rsc::PersistentManifold>
+validated_contact_manifolds(std::span<const ContactManifold> manifolds,
+                            uint32_t body_count) {
+  std::vector<rsc::PersistentManifold> out;
+  out.reserve(manifolds.size());
+  for (uint32_t i = 0; i < manifolds.size(); ++i) {
+    const ContactManifold &m = manifolds[i];
+    for (uint32_t body : {m.body0, m.body1}) {
+      if (body >= body_count) {
+        StateErrorInfo error =
+            manifold_error(StateErrorKind::UnknownManifoldBody, i);
+        error.body = body;
+        throw StateError(error);
+      }
+    }
+    if (m.body0 == m.body1) {
+      throw StateError(manifold_error(StateErrorKind::SameBodyPair, i));
+    }
+    for (const rsc::PersistentManifold &earlier : out) {
+      if ((earlier.body0_idx == m.body0 && earlier.body1_idx == m.body1) ||
+          (earlier.body0_idx == m.body1 && earlier.body1_idx == m.body0)) {
+        throw StateError(manifold_error(StateErrorKind::DuplicateBodyPair, i));
+      }
+    }
+    rsc::PersistentManifold stored;
+    stored.body0_idx = m.body0;
+    stored.body1_idx = m.body1;
+    stored.contact_breaking_threshold = m.contact_breaking_threshold;
+    stored.contact_processing_threshold = m.contact_processing_threshold;
+    stored.num_points = 0;
+    out.push_back(stored);
+    if (!threshold_is_valid(m.contact_breaking_threshold)) {
+      throw StateError(
+          manifold_error(StateErrorKind::InvalidBreakingThreshold, i));
+    }
+    if (!threshold_is_valid(m.contact_processing_threshold)) {
+      throw StateError(
+          manifold_error(StateErrorKind::InvalidProcessingThreshold, i));
+    }
+    if (m.num_points > k_max_contact_points) {
+      StateErrorInfo error = manifold_error(StateErrorKind::TooManyPoints, i);
+      error.points = m.num_points;
+      throw StateError(error);
+    }
+    rsc::PersistentManifold &target = out.back();
+    for (uint32_t p = 0; p < m.num_points; ++p) {
+      target.points[p] = validated_contact_point(m.points[p], i, p);
+    }
+    target.num_points = static_cast<int>(m.num_points);
+  }
+  return out;
+}
+
+ContactManifold contact_manifold_to_public(const rsc::PersistentManifold &m) {
+  ContactManifold out{};
+  out.body0 = m.body0_idx;
+  out.body1 = m.body1_idx;
+  out.contact_breaking_threshold = m.contact_breaking_threshold;
+  out.contact_processing_threshold = m.contact_processing_threshold;
+  out.num_points = static_cast<uint32_t>(m.num_points);
+  for (int i = 0; i < m.num_points; ++i) {
+    const rsc::ManifoldPoint &p = m.points[i];
+    out.points[i] = {to_public(p.local_point_a),
+                     to_public(p.local_point_b),
+                     to_public(p.pos_world_on_a),
+                     to_public(p.pos_world_on_b),
+                     to_public(p.normal_world_on_b),
+                     p.distance_1,
+                     p.combined_friction,
+                     p.combined_restitution,
+                     p.applied_impulse,
+                     p.is_special};
+  }
+  return out;
+}
+
+constexpr size_t k_dyn_bodies_offset =
+    offsetof(rsc::Arena, phys) + offsetof(rsc::ArenaPhysics, dyn_bodies);
+
+}
+
+StateError::StateError(const StateErrorInfo &error)
+    : std::runtime_error(state_error_text(error)), info(error) {}
+
+Vec3 BodyInfo::world_point(Vec3 local_point) const {
+  if (collision_flags & rsc::k_flag_identity_transform) {
+    return local_point;
+  }
+  rsc::Vec3A translation = to_internal(world_transform.translation);
+  if (collision_flags & rsc::k_flag_no_angular_motion) {
+    return to_public(to_internal(local_point) + translation);
+  }
+  rsc::Affine3A trans{mat3_to_internal(world_transform.matrix3), translation};
+  return to_public(trans.transform_point3a(to_internal(local_point)));
+}
+
+uint32_t ArenaBatch::physics_body_count(uint32_t arena) {
+  Impl &im = *impl_;
+  im.check_arena(arena);
+  return im.st->view().world.num_static_bodies + im.num_cars + 1;
+}
+
+uint32_t ArenaBatch::ball_body_id(uint32_t arena) {
+  uint32_t body = 0;
+  impl_->read_raw(
+      arena, offsetof(rsc::Arena, ball) + offsetof(rsc::Ball, rigid_body_idx),
+      sizeof(body), &body);
+  return body;
+}
+
+std::optional<uint32_t> ArenaBatch::car_body_id(uint32_t arena, uint32_t car) {
+  Impl &im = *impl_;
+  im.check_arena(arena);
+  if (car >= im.num_cars) {
+    return std::nullopt;
+  }
+  uint32_t body = 0;
+  im.read_raw(arena,
+              offsetof(rsc::Arena, cars) + car * sizeof(rsc::Car) +
+                  offsetof(rsc::Car, rigid_body_idx),
+              sizeof(body), &body);
+  return body;
+}
+
+static rsc::RigidBody read_body(ArenaBatch::Impl &im, uint32_t arena,
+                                uint32_t body) {
+  im.check_arena(arena);
+  const rsc::StaticWorldData &world = im.st->view().world;
+  if (body >= world.num_static_bodies + im.num_cars + 1) {
+    throw StateError(body_error(StateErrorKind::UnknownBody, body));
+  }
+  if (body < world.num_static_bodies) {
+    return world.static_bodies[body];
+  }
+  rsc::RigidBody rb;
+  im.read_raw(arena,
+              k_dyn_bodies_offset +
+                  (body - world.num_static_bodies) * sizeof(rsc::RigidBody),
+              sizeof(rb), &rb);
+  return rb;
+}
+
+BodyInfo ArenaBatch::body_info(uint32_t arena, uint32_t body) {
+  rsc::RigidBody rb = read_body(*impl_, arena, body);
+  rsc::Aabb aabb = rb.shape.get_aabb(rb.world_trans);
+  return {static_cast<UserInfoType>(static_cast<uint8_t>(rb.user_idx)),
+          {mat3_to_public(rb.world_trans.matrix3),
+           to_public(rb.world_trans.translation)},
+          {to_public(aabb.min), to_public(aabb.max)},
+          rb.contact_breaking_threshold,
+          rb.contact_processing_threshold,
+          rb.broadphase_handle,
+          rb.collision_flags};
+}
+
+BodyState ArenaBatch::body_state(uint32_t arena, uint32_t body) {
+  rsc::RigidBody rb = read_body(*impl_, arena, body);
+  return {mat3_to_public(rb.inv_inertia_tensor_world),
+          mat3_to_public(rb.interp_world_trans.matrix3),
+          rb.linear_sleeping_threshold, rb.angular_sleeping_threshold};
+}
+
+void ArenaBatch::set_body_state(uint32_t arena, uint32_t body,
+                                const BodyState &state) {
+  Impl &im = *impl_;
+  rsc::ArenaOp op{};
+  op.kind = rsc::ArenaOpKind::SetBodyState;
+  op.body_state = validated_body_state(state);
+  im.check_arena(arena);
+  uint32_t num_static = im.st->view().world.num_static_bodies;
+  if (body >= num_static + im.num_cars + 1) {
+    throw StateError(body_error(StateErrorKind::UnknownBody, body));
+  }
+  if (body < num_static) {
+    throw std::logic_error("static bodies are shared by all arenas of a batch "
+                           "and cannot be changed");
+  }
+  op.index = body - num_static;
+  im.apply(arena, op);
+}
+
+std::vector<ContactManifold> ArenaBatch::contact_manifolds(uint32_t arena) {
+  Impl &im = *impl_;
+  size_t phys = offsetof(rsc::Arena, phys);
+  uint32_t count = 0;
+  im.read_raw(arena, phys + offsetof(rsc::ArenaPhysics, num_manifolds),
+              sizeof(count), &count);
+  std::vector<rsc::PersistentManifold> stored(count);
+  if (count != 0) {
+    im.read_raw(arena, phys + offsetof(rsc::ArenaPhysics, manifolds),
+                sizeof(rsc::PersistentManifold) * count, stored.data());
+  }
+  std::vector<ContactManifold> out;
+  out.reserve(count);
+  for (const rsc::PersistentManifold &m : stored) {
+    out.push_back(contact_manifold_to_public(m));
+  }
+  return out;
+}
+
+void ArenaBatch::set_contact_manifolds(
+    uint32_t arena, std::span<const ContactManifold> manifolds) {
+  Impl &im = *impl_;
+  im.check_arena(arena);
+  uint32_t body_count = im.st->view().world.num_static_bodies + im.num_cars + 1;
+  for (const rsc::PersistentManifold &m :
+       validated_contact_manifolds(manifolds, body_count)) {
+    rsc::ArenaOp op{};
+    op.kind = rsc::ArenaOpKind::SetContactManifold;
+    op.manifold = m;
+    im.apply(arena, op);
+  }
+}
+
 void ArenaBatch::set_boost_pad_state(uint32_t arena, uint32_t pad,
                                      const BoostPadState &state) {
   Impl &im = *impl_;

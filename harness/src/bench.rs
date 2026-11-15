@@ -51,8 +51,12 @@ fn stats(mut samples: Vec<f64>) -> Stats {
     }
 }
 
-fn control_pool(arenas: usize, cars: usize) -> Vec<Vec<CarControls>> {
-    let mut rng = SplitMix::new(0xbe7c_4a11);
+const CONTROL_SEED: u64 = 0xbe7c_4a11;
+const CONTROL_SEED_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
+const ARENA_SEED_STRIDE: u64 = 1_000_003;
+
+fn control_pool(arenas: usize, cars: usize, seed: u64) -> Vec<Vec<CarControls>> {
+    let mut rng = SplitMix::new(CONTROL_SEED ^ seed.wrapping_mul(CONTROL_SEED_STRIDE));
     (0..CONTROL_POOL)
         .map(|_| {
             (0..arenas * cars)
@@ -79,17 +83,20 @@ pub fn run(
     ticks: u32,
     warmup_ticks: u32,
     hybrid_cpu_share: f64,
+    seed: u64,
 ) -> Result<Stats, String> {
+    let arena_seed = |arena: u64| seed.wrapping_mul(ARENA_SEED_STRIDE).wrapping_add(arena);
     let mode = GameMode::Soccar;
     let mutators = MutatorConfig::new(mode);
     let teams = [Team::Blue, Team::Orange];
-    let pool = control_pool(arenas, teams.len());
+    let pool = control_pool(arenas, teams.len(), seed);
     let chunks = ticks / TICKS_PER_ACTION;
     let warmup_chunks = warmup_ticks / TICKS_PER_ACTION;
     let mut samples = Vec::new();
     match target {
         Target::Upstream => {
             let mut sims: Vec<Arena> = (0..arenas as u64)
+                .map(arena_seed)
                 .map(|seed| {
                     let config = ArenaConfig::new(mode)
                         .with_mutators(mutators)
@@ -155,13 +162,13 @@ pub fn run(
                     game_mode: mode_code(mode),
                     mutators: to_ffi_mutators(&mutators),
                     cars,
-                    rng_seeds: (0..arenas as u64).collect(),
+                    rng_seeds: (0..arenas as u64).map(arena_seed).collect(),
                     cpu_threads,
                     hybrid_cpu_arenas,
                 },
             )?;
             for a in 0..arenas as u32 {
-                batch.reset_kickoff(a, Some(a as u64))?;
+                batch.reset_kickoff(a, Some(arena_seed(a as u64)))?;
             }
             let ffi_pool: Vec<Vec<ffi::CarControls>> = pool
                 .iter()

@@ -20,6 +20,8 @@ constexpr uint32_t k_max_block_size = 32;
 constexpr uint32_t k_target_blocks_per_sm = 4;
 constexpr size_t k_callee_stack_headroom = 1024;
 constexpr uint32_t k_max_lanes_per_arena = 32;
+constexpr uint64_t k_queued_threads_numerator = 5;
+constexpr uint64_t k_queued_threads_denominator = 2;
 constexpr uint32_t k_timed_launches = 64;
 constexpr uint32_t k_cost_buckets = 64;
 constexpr uint32_t k_copy_block_size = 256;
@@ -263,7 +265,9 @@ struct CudaBatch::Impl {
   DeviceArray<BroadphaseProxy> static_proxies;
   DeviceArray<Vec3A> hull_points;
   DeviceArray<uint32_t> cell_masks;
+#ifdef RSC_NATIVE_MATH
   DeviceArray<float> sin_table;
+#endif
   DeviceArray<BoostPadConfig> pad_configs;
   DeviceArray<Aabb> pad_aabbs;
   DeviceArray<BvhWideNode> pad_nodes;
@@ -311,6 +315,7 @@ struct CudaBatch::Impl {
   uint32_t blocks = 0;
   uint32_t slot_blocks = 0;
   uint32_t car_lanes = 1;
+  uint32_t wheel_lanes = 1;
   uint32_t resident_threads = 0;
   uint32_t sm_count = 0;
   size_t team_sat_capacity = 0;
@@ -320,11 +325,20 @@ struct CudaBatch::Impl {
   cudaEvent_t launch_events[2 * k_timed_launches] = {};
   uint32_t timed_launches = 0;
 
+  bool lanes_fit(uint32_t active, uint32_t lanes) const {
+    uint64_t threads = static_cast<uint64_t>(active) * lanes;
+    if (threads <= resident_threads) {
+      return true;
+    }
+    return lanes <= wheel_lanes &&
+           threads * k_queued_threads_denominator <=
+               resident_threads * k_queued_threads_numerator;
+  }
+
   void configure(uint32_t active) {
     num_arenas = active;
     lanes_per_arena = k_max_lanes_per_arena;
-    while (lanes_per_arena > car_lanes &&
-           active * lanes_per_arena > resident_threads) {
+    while (lanes_per_arena > car_lanes && !lanes_fit(active, lanes_per_arena)) {
       lanes_per_arena /= 2;
     }
     uint32_t threads = active * lanes_per_arena;
@@ -407,13 +421,17 @@ struct CudaBatch::Impl {
     static_proxies.upload(st.static_proxies.data(), st.static_proxies.size());
     hull_points.upload(st.hull_points.data(), st.hull_points.size());
     cell_masks.upload(st.cell_masks.data(), st.cell_masks.size());
+#ifdef RSC_NATIVE_MATH
     sin_table.upload(st.sin_table.data(), st.sin_table.size());
+#endif
     view.world.meshes = mesh_views.get();
     view.world.static_bodies = static_bodies.get();
     view.world.static_proxies = static_proxies.get();
     view.world.hull_points = hull_points.get();
     view.world.cell_static_masks = cell_masks.get();
+#ifdef RSC_NATIVE_MATH
     view.world.sin_table = sin_table.get();
+#endif
     if (view.has_pads) {
       pad_configs.upload(st.pad_configs.data(), st.pad_configs.size());
       pad_aabbs.upload(st.pad_aabbs.data(), st.pad_aabbs.size());
@@ -442,6 +460,7 @@ struct CudaBatch::Impl {
     resident_threads =
         static_cast<uint32_t>(blocks_per_sm) * k_max_block_size * sm_count;
     car_lanes = pow2_lanes(cars);
+    wheel_lanes = pow2_lanes(k_num_wheels * cars);
     for (cudaEvent_t &e : launch_events) {
       check(cudaEventCreate(&e), "cudaEventCreate");
     }

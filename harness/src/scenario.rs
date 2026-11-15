@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rocketsim::physics::{BodyState, ContactManifold, ContactPoint, StateError};
 use rocketsim::{
     Arena, ArenaConfig, ArenaEvent, ArenaState, BallState, BoostPadState, CarBodyConfig,
     CarControls, CarCore, DemoMode, GameMode, Mat3A, MutatorConfig, PhysState, Team,
@@ -99,9 +100,16 @@ pub enum Action {
     PadStates,
     Tiles,
     BallIntoGoal,
+    BallNudge,
+    BallWake,
+    BallSleep,
+    SleepingBallNearMiss,
+    NegativeZeroVelocities,
+    PhysicsEdit,
     KickoffMaskedSeeded,
     KickoffMaskedRng,
     CarsCollide,
+    CarsOnRoof,
     SnapshotRoundTrip,
     CrossBatchCopy,
     CrossBackendCopy,
@@ -121,6 +129,7 @@ pub struct Scenario {
     pub ticks_per_step: u32,
     pub actions: Vec<(u32, Action)>,
     pub seed: u64,
+    pub physics_access: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -172,6 +181,322 @@ fn upstream_flat(arena: &Arena) -> crate::flatten::Flat {
         mutators: *arena.mutator_config(),
         ball_scored: arena.is_ball_scored(),
     })
+}
+
+fn upstream_manifold_view(m: &ContactManifold) -> mirror::ManifoldView {
+    mirror::ManifoldView {
+        body0: m.body0.index() as u64,
+        body1: m.body1.index() as u64,
+        contact_breaking_threshold: m.contact_breaking_threshold,
+        contact_processing_threshold: m.contact_processing_threshold,
+        points: m
+            .points
+            .iter()
+            .map(|p| mirror::ContactPointView {
+                local_point_a: p.local_point_a.to_array(),
+                local_point_b: p.local_point_b.to_array(),
+                pos_world_on_a: p.pos_world_on_a.to_array(),
+                pos_world_on_b: p.pos_world_on_b.to_array(),
+                normal_world_on_b: p.normal_world_on_b.to_array(),
+                distance: p.distance,
+                combined_friction: p.combined_friction,
+                combined_restitution: p.combined_restitution,
+                applied_impulse: p.applied_impulse,
+                is_special: p.is_special,
+            })
+            .collect(),
+    }
+}
+
+fn upstream_physics_view(arena: &Arena, num_cars: usize) -> Result<mirror::PhysicsView, String> {
+    let mut bodies = Vec::new();
+    for id in arena.physics_body_ids() {
+        let info = arena.body_info(id).map_err(|e| e.to_string())?;
+        let state = arena.body_state(id).map_err(|e| e.to_string())?;
+        let mut world_transform = [0.0; 12];
+        world_transform[..9].copy_from_slice(&info.world_transform.matrix3.to_cols_array());
+        world_transform[9..].copy_from_slice(&info.world_transform.translation.to_array());
+        let (min, max) = (info.aabb.min.to_array(), info.aabb.max.to_array());
+        bodies.push(mirror::BodyView {
+            kind: info.kind as u8,
+            world_transform,
+            aabb: [min[0], min[1], min[2], max[0], max[1], max[2]],
+            contact_breaking_threshold: info.contact_breaking_threshold,
+            contact_processing_threshold: info.contact_processing_threshold,
+            collision_order: info.collision_order as u64,
+            world_points: mirror::WORLD_POINT_PROBES
+                .iter()
+                .map(|p| info.world_point(Vec3A::from_array(*p)).to_array())
+                .collect(),
+            inv_inertia_tensor_world: state.inv_inertia_tensor_world.to_cols_array(),
+            interp_world_basis: state.interp_world_basis.to_cols_array(),
+            linear_sleeping_threshold: state.linear_sleeping_threshold,
+            angular_sleeping_threshold: state.angular_sleeping_threshold,
+        });
+    }
+    Ok(mirror::PhysicsView {
+        body_count: arena.physics_body_ids().len() as u64,
+        ball_body: arena.ball_body_id().index() as u64,
+        car_bodies: (0..=num_cars)
+            .map(|car| arena.car_body_id(car).map(|id| id.index() as u64))
+            .collect(),
+        bodies,
+        manifolds: arena
+            .contact_manifolds()
+            .map(|m| upstream_manifold_view(&m))
+            .collect(),
+    })
+}
+
+fn to_ffi_mat3(m: Mat3A) -> ffi::Mat3 {
+    ffi::Mat3 {
+        x_axis: to_ffi_vec(m.x_axis),
+        y_axis: to_ffi_vec(m.y_axis),
+        z_axis: to_ffi_vec(m.z_axis),
+    }
+}
+
+fn to_ffi_body_state(s: &BodyState) -> ffi::BodyState {
+    ffi::BodyState {
+        inv_inertia_tensor_world: to_ffi_mat3(s.inv_inertia_tensor_world),
+        interp_world_basis: to_ffi_mat3(s.interp_world_basis),
+        linear_sleeping_threshold: s.linear_sleeping_threshold,
+        angular_sleeping_threshold: s.angular_sleeping_threshold,
+    }
+}
+
+fn to_ffi_manifold(m: &ContactManifold) -> ffi::ContactManifold {
+    let mut out = ffi::ContactManifold {
+        body0: m.body0.index() as u32,
+        body1: m.body1.index() as u32,
+        contact_breaking_threshold: m.contact_breaking_threshold,
+        contact_processing_threshold: m.contact_processing_threshold,
+        num_points: m.points.len() as u32,
+        ..Default::default()
+    };
+    for (slot, p) in out.points.iter_mut().zip(&m.points) {
+        *slot = ffi::ContactPoint {
+            local_point_a: to_ffi_vec(p.local_point_a),
+            local_point_b: to_ffi_vec(p.local_point_b),
+            pos_world_on_a: to_ffi_vec(p.pos_world_on_a),
+            pos_world_on_b: to_ffi_vec(p.pos_world_on_b),
+            normal_world_on_b: to_ffi_vec(p.normal_world_on_b),
+            distance: p.distance,
+            combined_friction: p.combined_friction,
+            combined_restitution: p.combined_restitution,
+            applied_impulse: p.applied_impulse,
+            is_special: p.is_special,
+        };
+    }
+    out
+}
+
+fn state_error_field(field: &str) -> u8 {
+    match field {
+        "inv_inertia_tensor_world" => 0,
+        "interp_world_basis" => 1,
+        "linear_sleeping_threshold" => 2,
+        _ => 3,
+    }
+}
+
+fn to_ffi_state_error(e: StateError) -> ffi::StateErrorInfo {
+    let mut out = ffi::StateErrorInfo::default();
+    match e {
+        StateError::UnknownBody { body } => {
+            out.kind = 0;
+            out.body = body as u32;
+        }
+        StateError::UnknownManifoldBody { manifold, body } => {
+            out.kind = 1;
+            out.manifold = manifold as u32;
+            out.body = body as u32;
+        }
+        StateError::SameBodyPair { manifold } => {
+            out.kind = 2;
+            out.manifold = manifold as u32;
+        }
+        StateError::DuplicateBodyPair { manifold } => {
+            out.kind = 3;
+            out.manifold = manifold as u32;
+        }
+        StateError::TooManyPoints { manifold, points } => {
+            out.kind = 4;
+            out.manifold = manifold as u32;
+            out.points = points as u32;
+        }
+        StateError::NonFinitePoint { manifold, point } => {
+            out.kind = 5;
+            out.manifold = manifold as u32;
+            out.point = point as u32;
+        }
+        StateError::NormalNotUnit { manifold, point } => {
+            out.kind = 6;
+            out.manifold = manifold as u32;
+            out.point = point as u32;
+        }
+        StateError::NegativeAppliedImpulse { manifold, point } => {
+            out.kind = 7;
+            out.manifold = manifold as u32;
+            out.point = point as u32;
+        }
+        StateError::InvalidBreakingThreshold { manifold } => {
+            out.kind = 8;
+            out.manifold = manifold as u32;
+        }
+        StateError::InvalidProcessingThreshold { manifold } => {
+            out.kind = 9;
+            out.manifold = manifold as u32;
+        }
+        StateError::NonFiniteBodyState { field } => {
+            out.kind = 10;
+            out.field = state_error_field(field);
+        }
+        StateError::NegativeSleepingThreshold { field } => {
+            out.kind = 11;
+            out.field = state_error_field(field);
+        }
+    }
+    out
+}
+
+fn expect_same_outcome(
+    what: &str,
+    expected: Result<(), StateError>,
+    actual: Result<(), ffi::StateErrorInfo>,
+) -> Result<(), String> {
+    let expected = expected.map_err(to_ffi_state_error);
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(format!("{what}: expected {expected:?}, got {actual:?}"))
+    }
+}
+
+fn set_manifolds_both(
+    what: &str,
+    arena: &mut Arena,
+    ours: &mut ffi::Batch,
+    i: u32,
+    manifolds: &[ContactManifold],
+) -> Result<(), String> {
+    let ffi_manifolds: Vec<ffi::ContactManifold> = manifolds.iter().map(to_ffi_manifold).collect();
+    expect_same_outcome(
+        what,
+        arena.set_contact_manifolds(manifolds),
+        ours.set_contact_manifolds(i, &ffi_manifolds)?,
+    )
+}
+
+fn physics_edit(
+    arena: &mut Arena,
+    ours: &mut ffi::Batch,
+    i: u32,
+    rng: &mut SplitMix,
+) -> Result<(), String> {
+    let ball = arena.ball_body_id();
+    let car = arena
+        .car_body_id(0)
+        .ok_or_else(|| "physics edit needs a car".to_string())?;
+    let probe = ContactPoint {
+        local_point_a: Vec3A::new(0.0, 0.0, -1.8),
+        local_point_b: Vec3A::new(0.0, 0.0, 0.3),
+        pos_world_on_a: Vec3A::new(1.0, 2.0, 0.5),
+        pos_world_on_b: Vec3A::new(1.0, 2.0, 0.49),
+        normal_world_on_b: Vec3A::Z,
+        distance: 0.01,
+        combined_friction: 0.3,
+        combined_restitution: 0.1,
+        applied_impulse: 0.25,
+        is_special: false,
+    };
+    let probe_manifold = |points: Vec<ContactPoint>| ContactManifold {
+        body0: ball,
+        body1: car,
+        contact_breaking_threshold: 0.02,
+        contact_processing_threshold: 0.02,
+        points,
+    };
+
+    let mut manifolds: Vec<ContactManifold> = arena.contact_manifolds().collect();
+    for (k, m) in manifolds.iter_mut().enumerate() {
+        m.contact_processing_threshold *= 1.25;
+        if k % 2 == 1 {
+            std::mem::swap(&mut m.body0, &mut m.body1);
+        }
+        for p in &mut m.points {
+            p.applied_impulse *= 0.5;
+            p.combined_friction *= 0.75;
+        }
+    }
+    let pair = |m: &ContactManifold| {
+        let (a, b) = (m.body0.index(), m.body1.index());
+        (a.min(b), a.max(b))
+    };
+    let probe_pair = (ball.index().min(car.index()), ball.index().max(car.index()));
+    if !manifolds.iter().any(|m| pair(m) == probe_pair) {
+        manifolds.push(probe_manifold(vec![probe]));
+    }
+    set_manifolds_both("valid manifolds", arena, ours, i, &manifolds)?;
+
+    for id in [ball, car] {
+        let mut state = arena.body_state(id).map_err(|e| e.to_string())?;
+        state.linear_sleeping_threshold *= 2.0;
+        state.angular_sleeping_threshold *= 0.5;
+        state.interp_world_basis = random_rot(rng);
+        state.inv_inertia_tensor_world *= 1.125;
+        expect_same_outcome(
+            "valid body state",
+            arena.set_body_state(id, state),
+            ours.set_body_state(i, id.index() as u32, &to_ffi_body_state(&state))?,
+        )?;
+
+        let mut invalid = [state; 4];
+        invalid[0].inv_inertia_tensor_world.y_axis.x = f32::NAN;
+        invalid[1].interp_world_basis.z_axis.y = f32::INFINITY;
+        invalid[2].linear_sleeping_threshold = -1.0;
+        invalid[3].angular_sleeping_threshold = f32::NEG_INFINITY;
+        for bad in invalid {
+            expect_same_outcome(
+                "invalid body state",
+                arena.set_body_state(id, bad),
+                ours.set_body_state(i, id.index() as u32, &to_ffi_body_state(&bad))?,
+            )?;
+        }
+    }
+
+    let with = |edit: &dyn Fn(&mut ContactPoint)| {
+        let mut p = probe;
+        edit(&mut p);
+        p
+    };
+    let mut reversed = probe_manifold(vec![probe]);
+    std::mem::swap(&mut reversed.body0, &mut reversed.body1);
+    let mut same_body = probe_manifold(vec![probe]);
+    same_body.body1 = same_body.body0;
+    let mut bad_breaking = probe_manifold(vec![probe]);
+    bad_breaking.contact_breaking_threshold = -1.0;
+    let mut bad_processing = probe_manifold(vec![probe]);
+    bad_processing.contact_processing_threshold = f32::NAN;
+    let invalid_lists = [
+        vec![same_body],
+        vec![probe_manifold(vec![probe]), reversed],
+        vec![probe_manifold(vec![
+            probe,
+            with(&|p| p.distance = f32::NAN),
+        ])],
+        vec![probe_manifold(vec![with(&|p| {
+            p.normal_world_on_b = Vec3A::new(0.0, 0.0, 2.0)
+        })])],
+        vec![probe_manifold(vec![with(&|p| p.applied_impulse = -0.5)])],
+        vec![bad_breaking],
+        vec![bad_processing],
+        vec![probe_manifold(vec![probe; 5])],
+    ];
+    for list in &invalid_lists {
+        set_manifolds_both("invalid manifolds", arena, ours, i, list)?;
+    }
+    Ok(())
 }
 
 fn to_ffi_vec(v: Vec3A) -> ffi::Vec3 {
@@ -442,6 +767,15 @@ pub fn run(
                 return Err(format!(
                     "{label}: arena {i} after tick {tick}: first difference {diff}"
                 ));
+            }
+            if scenario.physics_access {
+                let expected = flatten(&upstream_physics_view(arena, num_cars)?);
+                let actual = flatten(&mirror::physics_view(ours, i as u32, num_cars)?);
+                if let Some(diff) = first_difference(&expected, &actual) {
+                    return Err(format!(
+                        "{label}: arena {i} after tick {tick}: physics access first difference {diff}"
+                    ));
+                }
             }
         }
         Ok(upstream.len() as u64)
@@ -795,6 +1129,8 @@ fn apply_action(
                     last_damage_tick: ball.ds_info.last_damage_tick.unwrap_or(0),
                 };
                 ours_ball.tick_count_since_kickoff = ball.tick_count_since_kickoff;
+                ours_ball.activation_state = ball.activation_state as u8;
+                ours_ball.deactivation_time = ball.deactivation_time;
                 ours.set_ball_state(i as u32, &ours_ball)?;
             }
         }
@@ -939,6 +1275,31 @@ fn apply_action(
                 }
             }
         }
+        Action::CarsOnRoof => {
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                for c in 0..scenario.cars.len() {
+                    let yaw = rng.range(-std::f32::consts::PI, std::f32::consts::PI);
+                    let roll = std::f32::consts::PI + rng.range(-0.2, 0.2);
+                    let phys = PhysState {
+                        pos: Vec3A::new(
+                            -1500.0 + c as f32 * 400.0 + rng.range(-40.0, 40.0),
+                            rng.range(-2000.0, 2000.0),
+                            40.0,
+                        ),
+                        rot_mat: Mat3A::from_rotation_z(yaw) * Mat3A::from_rotation_x(roll),
+                        vel: Vec3A::ZERO,
+                        ang_vel: Vec3A::ZERO,
+                    };
+                    let core = CarCore {
+                        phys,
+                        boost: 30.0,
+                        ..CarCore::DEFAULT
+                    };
+                    arena.set_car_state(c, core);
+                    ours.set_car_state(i as u32, c as u32, &ffi_core(&core))?;
+                }
+            }
+        }
         Action::KickoffMaskedSeeded | Action::KickoffMaskedRng => {
             let mask: Vec<u8> = (0..n)
                 .map(|i| ((i + tick as usize) % 3 != 1) as u8)
@@ -1007,6 +1368,100 @@ fn apply_action(
             }
             ours.copy_from(None, &srcs, &dsts)?;
         }
+        Action::BallNudge => {
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                let mut ball = *arena.get_ball_state();
+                ball.phys.pos.z += 40.0;
+                arena.set_ball_state(ball);
+                let mut ours_ball = ours.snapshot(i as u32)?.ball;
+                ours_ball.phys = to_ffi_phys(&ball.phys);
+                ours.set_ball_state(i as u32, &ours_ball)?;
+            }
+        }
+        Action::BallWake => {
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                arena.wake_ball();
+                ours.wake_ball(i as u32)?;
+            }
+        }
+        Action::BallSleep => {
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                arena.sleep_ball();
+                ours.sleep_ball(i as u32)?;
+            }
+        }
+        Action::SleepingBallNearMiss => {
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                let mut ball = *arena.get_ball_state();
+                ball.phys = PhysState {
+                    pos: Vec3A::new(0.0, 0.0, 600.0),
+                    rot_mat: Mat3A::IDENTITY,
+                    vel: Vec3A::ZERO,
+                    ang_vel: Vec3A::ZERO,
+                };
+                arena.set_ball_state(ball);
+                let mut ours_ball = ours.snapshot(i as u32)?.ball;
+                ours_ball.phys = to_ffi_phys(&ball.phys);
+                ours.set_ball_state(i as u32, &ours_ball)?;
+                arena.sleep_ball();
+                ours.sleep_ball(i as u32)?;
+                let side = 140.0 + rng.range(0.0, 8.0);
+                let phys = PhysState {
+                    pos: Vec3A::new(side, side, 750.0),
+                    rot_mat: Mat3A::from_rotation_z(std::f32::consts::FRAC_PI_4),
+                    vel: Vec3A::new(0.0, 0.0, -200.0),
+                    ang_vel: Vec3A::ZERO,
+                };
+                let core = CarCore {
+                    phys,
+                    ..CarCore::DEFAULT
+                };
+                arena.set_car_state(0, core);
+                ours.set_car_state(i as u32, 0, &ffi_core(&core))?;
+            }
+        }
+        Action::NegativeZeroVelocities => {
+            let negative_zero = Vec3A::new(-0.0, -0.0, -0.0);
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                arena.wake_ball();
+                ours.wake_ball(i as u32)?;
+                let mut ball = *arena.get_ball_state();
+                ball.phys = PhysState {
+                    pos: Vec3A::new(rng.range(-500.0, 500.0), rng.range(-500.0, 500.0), 900.0),
+                    rot_mat: Mat3A::IDENTITY,
+                    vel: negative_zero,
+                    ang_vel: negative_zero,
+                };
+                arena.set_ball_state(ball);
+                let mut ours_ball = ours.snapshot(i as u32)?.ball;
+                ours_ball.phys = to_ffi_phys(&ball.phys);
+                ours.set_ball_state(i as u32, &ours_ball)?;
+                for c in 0..scenario.cars.len() {
+                    let phys = PhysState {
+                        pos: Vec3A::new(
+                            -1500.0 + c as f32 * 600.0,
+                            rng.range(-1000.0, 1000.0),
+                            500.0,
+                        ),
+                        rot_mat: Mat3A::from_rotation_z(rng.range(-3.0, 3.0)),
+                        vel: negative_zero,
+                        ang_vel: negative_zero,
+                    };
+                    let core = CarCore {
+                        phys,
+                        ..CarCore::DEFAULT
+                    };
+                    arena.set_car_state(c, core);
+                    ours.set_car_state(i as u32, c as u32, &ffi_core(&core))?;
+                }
+            }
+        }
+        Action::PhysicsEdit => {
+            for (i, arena) in upstream.iter_mut().enumerate() {
+                physics_edit(arena, ours, i as u32, rng)
+                    .map_err(|e| format!("physics edit, arena {i} at tick {tick}: {e}"))?;
+            }
+        }
         Action::BallIntoGoal => {
             for (i, arena) in upstream.iter_mut().enumerate() {
                 let side = if (i + tick as usize).is_multiple_of(2) {
@@ -1048,6 +1503,8 @@ fn apply_action(
                     last_damage_tick: ball.ds_info.last_damage_tick.unwrap_or(0),
                 };
                 ours_ball.tick_count_since_kickoff = ball.tick_count_since_kickoff;
+                ours_ball.activation_state = ball.activation_state as u8;
+                ours_ball.deactivation_time = ball.deactivation_time;
                 ours.set_ball_state(i as u32, &ours_ball)?;
             }
         }

@@ -22,8 +22,9 @@
 
 namespace rocketsim_cuda {
 
-void step_arena(const rsc::ArenaStatic &view, rsc::Arena &arena,
-                rsc::StepScratch &scratch, uint32_t ticks) {
+__attribute__((aligned(k_step_code_alignment))) void
+step_arena(const rsc::ArenaStatic &view, rsc::Arena &arena,
+           rsc::StepScratch &scratch, uint32_t ticks) {
   rsc::arena_step_ticks(view, arena, scratch, ticks);
 }
 

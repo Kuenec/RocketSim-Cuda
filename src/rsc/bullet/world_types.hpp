@@ -76,7 +76,9 @@ struct StaticWorldData {
   uint32_t num_cells[3];
   uint32_t cell_mask_words;
   const uint32_t *cell_static_masks;
+#ifdef RSC_NATIVE_MATH
   const float *sin_table;
+#endif
 };
 
 struct ArenaPhysics {

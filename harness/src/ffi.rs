@@ -8,6 +8,90 @@ pub struct Vec3 {
     pub z: f32,
 }
 
+pub const MAX_CONTACT_POINTS: usize = 4;
+pub const MAX_CONTACT_MANIFOLDS: usize = 128;
+pub const STATE_ERROR: i32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Mat3 {
+    pub x_axis: Vec3,
+    pub y_axis: Vec3,
+    pub z_axis: Vec3,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Transform {
+    pub matrix3: Mat3,
+    pub translation: Vec3,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Aabb {
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BodyInfo {
+    pub kind: u8,
+    pub world_transform: Transform,
+    pub aabb: Aabb,
+    pub contact_breaking_threshold: f32,
+    pub contact_processing_threshold: f32,
+    pub collision_order: u32,
+    pub collision_flags: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BodyState {
+    pub inv_inertia_tensor_world: Mat3,
+    pub interp_world_basis: Mat3,
+    pub linear_sleeping_threshold: f32,
+    pub angular_sleeping_threshold: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ContactPoint {
+    pub local_point_a: Vec3,
+    pub local_point_b: Vec3,
+    pub pos_world_on_a: Vec3,
+    pub pos_world_on_b: Vec3,
+    pub normal_world_on_b: Vec3,
+    pub distance: f32,
+    pub combined_friction: f32,
+    pub combined_restitution: f32,
+    pub applied_impulse: f32,
+    pub is_special: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct ContactManifold {
+    pub body0: u32,
+    pub body1: u32,
+    pub contact_breaking_threshold: f32,
+    pub contact_processing_threshold: f32,
+    pub num_points: u32,
+    pub points: [ContactPoint; MAX_CONTACT_POINTS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct StateErrorInfo {
+    pub kind: u8,
+    pub field: u8,
+    pub manifold: u32,
+    pub body: u32,
+    pub point: u32,
+    pub points: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct RotMat {
@@ -187,6 +271,8 @@ pub struct BallState {
     pub hs_info: HeatseekerInfo,
     pub ds_info: DropshotInfo,
     pub tick_count_since_kickoff: u64,
+    pub activation_state: u8,
+    pub deactivation_time: f32,
 }
 
 #[repr(C)]
@@ -470,6 +556,53 @@ unsafe extern "C" {
         state: *const CarState,
     ) -> i32;
     fn rsc_batch_set_ball_state(batch: *mut RscBatch, arena: u32, state: *const BallState) -> i32;
+    fn rsc_batch_sleep_ball(batch: *mut RscBatch, arena: u32) -> i32;
+    fn rsc_batch_wake_ball(batch: *mut RscBatch, arena: u32) -> i32;
+    fn rsc_batch_physics_body_count(batch: *mut RscBatch, arena: u32, out: *mut u32) -> i32;
+    fn rsc_batch_ball_body_id(batch: *mut RscBatch, arena: u32, out: *mut u32) -> i32;
+    fn rsc_batch_car_body_id(
+        batch: *mut RscBatch,
+        arena: u32,
+        car: u32,
+        out: *mut u32,
+        found: *mut u8,
+    ) -> i32;
+    fn rsc_batch_body_info(
+        batch: *mut RscBatch,
+        arena: u32,
+        body: u32,
+        out: *mut BodyInfo,
+        error: *mut StateErrorInfo,
+    ) -> i32;
+    fn rsc_body_info_world_point(info: *const BodyInfo, local_point: *const Vec3, out: *mut Vec3);
+    fn rsc_batch_body_state(
+        batch: *mut RscBatch,
+        arena: u32,
+        body: u32,
+        out: *mut BodyState,
+        error: *mut StateErrorInfo,
+    ) -> i32;
+    fn rsc_batch_set_body_state(
+        batch: *mut RscBatch,
+        arena: u32,
+        body: u32,
+        state: *const BodyState,
+        error: *mut StateErrorInfo,
+    ) -> i32;
+    fn rsc_batch_contact_manifolds(
+        batch: *mut RscBatch,
+        arena: u32,
+        out: *mut ContactManifold,
+        capacity: u32,
+        count: *mut u32,
+    ) -> i32;
+    fn rsc_batch_set_contact_manifolds(
+        batch: *mut RscBatch,
+        arena: u32,
+        manifolds: *const ContactManifold,
+        count: u32,
+        error: *mut StateErrorInfo,
+    ) -> i32;
     fn rsc_batch_set_pad_state(
         batch: *mut RscBatch,
         arena: u32,
@@ -498,6 +631,26 @@ fn last_error() -> String {
     unsafe { CStr::from_ptr(rsc_last_error()) }
         .to_string_lossy()
         .into_owned()
+}
+
+fn check_state(
+    code: i32,
+    error: StateErrorInfo,
+    what: &str,
+) -> Result<Result<(), StateErrorInfo>, String> {
+    match code {
+        0 => Ok(Ok(())),
+        STATE_ERROR => Ok(Err(error)),
+        _ => Err(format!("{what}: {}", last_error())),
+    }
+}
+
+impl BodyInfo {
+    pub fn world_point(&self, local_point: Vec3) -> Vec3 {
+        let mut out = Vec3::default();
+        unsafe { rsc_body_info_world_point(self, &local_point, &mut out) };
+        out
+    }
 }
 
 fn check(code: i32, what: &str) -> Result<(), String> {
@@ -533,8 +686,13 @@ pub fn check_abi() -> Result<(), String> {
         size_of::<ArenaInfo>(),
         size_of::<PadStateView>(),
         size_of::<StateBuffers>(),
+        size_of::<BodyInfo>(),
+        size_of::<BodyState>(),
+        size_of::<ContactPoint>(),
+        size_of::<ContactManifold>(),
+        size_of::<StateErrorInfo>(),
     ];
-    let mut actual = [0u32; 22];
+    let mut actual = [0u32; 27];
     check(
         unsafe { rsc_abi_sizes(actual.as_mut_ptr(), actual.len() as u32) },
         "rsc_abi_sizes",
@@ -1042,6 +1200,118 @@ impl Batch {
             unsafe { rsc_batch_set_ball_state(self.0, arena, state) },
             "rsc_batch_set_ball_state",
         )
+    }
+
+    pub fn sleep_ball(&mut self, arena: u32) -> Result<(), String> {
+        check(
+            unsafe { rsc_batch_sleep_ball(self.0, arena) },
+            "rsc_batch_sleep_ball",
+        )
+    }
+
+    pub fn wake_ball(&mut self, arena: u32) -> Result<(), String> {
+        check(
+            unsafe { rsc_batch_wake_ball(self.0, arena) },
+            "rsc_batch_wake_ball",
+        )
+    }
+
+    pub fn physics_body_count(&mut self, arena: u32) -> Result<u32, String> {
+        let mut out = 0;
+        check(
+            unsafe { rsc_batch_physics_body_count(self.0, arena, &mut out) },
+            "rsc_batch_physics_body_count",
+        )?;
+        Ok(out)
+    }
+
+    pub fn ball_body_id(&mut self, arena: u32) -> Result<u32, String> {
+        let mut out = 0;
+        check(
+            unsafe { rsc_batch_ball_body_id(self.0, arena, &mut out) },
+            "rsc_batch_ball_body_id",
+        )?;
+        Ok(out)
+    }
+
+    pub fn car_body_id(&mut self, arena: u32, car: u32) -> Result<Option<u32>, String> {
+        let mut out = 0;
+        let mut found = 0;
+        check(
+            unsafe { rsc_batch_car_body_id(self.0, arena, car, &mut out, &mut found) },
+            "rsc_batch_car_body_id",
+        )?;
+        Ok((found != 0).then_some(out))
+    }
+
+    pub fn body_info(
+        &mut self,
+        arena: u32,
+        body: u32,
+    ) -> Result<Result<BodyInfo, StateErrorInfo>, String> {
+        let mut out = BodyInfo::default();
+        let mut error = StateErrorInfo::default();
+        let code = unsafe { rsc_batch_body_info(self.0, arena, body, &mut out, &mut error) };
+        Ok(check_state(code, error, "rsc_batch_body_info")?.map(|()| out))
+    }
+
+    pub fn body_state(
+        &mut self,
+        arena: u32,
+        body: u32,
+    ) -> Result<Result<BodyState, StateErrorInfo>, String> {
+        let mut out = BodyState::default();
+        let mut error = StateErrorInfo::default();
+        let code = unsafe { rsc_batch_body_state(self.0, arena, body, &mut out, &mut error) };
+        Ok(check_state(code, error, "rsc_batch_body_state")?.map(|()| out))
+    }
+
+    pub fn set_body_state(
+        &mut self,
+        arena: u32,
+        body: u32,
+        state: &BodyState,
+    ) -> Result<Result<(), StateErrorInfo>, String> {
+        let mut error = StateErrorInfo::default();
+        let code = unsafe { rsc_batch_set_body_state(self.0, arena, body, state, &mut error) };
+        check_state(code, error, "rsc_batch_set_body_state")
+    }
+
+    pub fn contact_manifolds(&mut self, arena: u32) -> Result<Vec<ContactManifold>, String> {
+        let mut out = vec![ContactManifold::default(); MAX_CONTACT_MANIFOLDS];
+        let mut count = 0;
+        check(
+            unsafe {
+                rsc_batch_contact_manifolds(
+                    self.0,
+                    arena,
+                    out.as_mut_ptr(),
+                    out.len() as u32,
+                    &mut count,
+                )
+            },
+            "rsc_batch_contact_manifolds",
+        )?;
+        out.truncate(count as usize);
+        Ok(out)
+    }
+
+    pub fn set_contact_manifolds(
+        &mut self,
+        arena: u32,
+        manifolds: &[ContactManifold],
+    ) -> Result<Result<(), StateErrorInfo>, String> {
+        let mut error = StateErrorInfo::default();
+        let code = unsafe {
+            rsc_batch_set_contact_manifolds(
+                self.0,
+                arena,
+                manifolds.as_ptr(),
+                manifolds.len() as u32,
+                &mut error,
+            )
+        };
+        check_state(code, error, "rsc_batch_set_contact_manifolds")
     }
 
     pub fn set_pad_state(

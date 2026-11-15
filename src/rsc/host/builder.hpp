@@ -81,7 +81,9 @@ public:
   std::vector<BoostPadConfig> pad_configs;
   std::vector<Aabb> pad_aabbs;
   BvhStorage pad_bvh;
+#ifdef RSC_NATIVE_MATH
   std::vector<float> sin_table;
+#endif
 
 private:
   void build_statics(const MeshLibrary &library);

@@ -32,6 +32,22 @@ template <typename F> int guarded(F &&f) {
   }
 }
 
+constexpr int k_state_error = 1;
+
+template <typename F> int guarded_state(StateErrorInfo *error, F &&f) {
+  try {
+    f();
+    return 0;
+  } catch (const StateError &e) {
+    *error = e.info;
+    g_last_error = e.what();
+    return k_state_error;
+  } catch (const std::exception &e) {
+    g_last_error = e.what();
+    return -1;
+  }
+}
+
 }
 
 extern "C" {
@@ -128,7 +144,12 @@ int rsc_abi_sizes(uint32_t *out, uint32_t count) {
                               sizeof(RscArenaScalars),
                               sizeof(ArenaInfo),
                               sizeof(PadStateView),
-                              sizeof(StateBuffers)};
+                              sizeof(StateBuffers),
+                              sizeof(BodyInfo),
+                              sizeof(BodyState),
+                              sizeof(ContactPoint),
+                              sizeof(ContactManifold),
+                              sizeof(StateErrorInfo)};
     if (count != sizeof(sizes) / sizeof(sizes[0])) {
       throw std::invalid_argument("ABI size table length mismatch");
     }
@@ -363,6 +384,75 @@ int rsc_batch_set_car_state_full(RscBatch *batch, uint32_t arena, uint32_t car,
 int rsc_batch_set_ball_state(RscBatch *batch, uint32_t arena,
                              const BallState *state) {
   return guarded([&] { batch->batch->set_ball_state(arena, *state); });
+}
+
+int rsc_batch_sleep_ball(RscBatch *batch, uint32_t arena) {
+  return guarded([&] { batch->batch->sleep_ball(arena); });
+}
+
+int rsc_batch_wake_ball(RscBatch *batch, uint32_t arena) {
+  return guarded([&] { batch->batch->wake_ball(arena); });
+}
+
+int rsc_batch_physics_body_count(RscBatch *batch, uint32_t arena,
+                                 uint32_t *out) {
+  return guarded([&] { *out = batch->batch->physics_body_count(arena); });
+}
+
+int rsc_batch_ball_body_id(RscBatch *batch, uint32_t arena, uint32_t *out) {
+  return guarded([&] { *out = batch->batch->ball_body_id(arena); });
+}
+
+int rsc_batch_car_body_id(RscBatch *batch, uint32_t arena, uint32_t car,
+                          uint32_t *out, uint8_t *found) {
+  return guarded([&] {
+    std::optional<uint32_t> body = batch->batch->car_body_id(arena, car);
+    *found = body.has_value() ? 1 : 0;
+    *out = body.value_or(0);
+  });
+}
+
+int rsc_batch_body_info(RscBatch *batch, uint32_t arena, uint32_t body,
+                        BodyInfo *out, StateErrorInfo *error) {
+  return guarded_state(error,
+                       [&] { *out = batch->batch->body_info(arena, body); });
+}
+
+void rsc_body_info_world_point(const BodyInfo *info, const Vec3 *local_point,
+                               Vec3 *out) {
+  *out = info->world_point(*local_point);
+}
+
+int rsc_batch_body_state(RscBatch *batch, uint32_t arena, uint32_t body,
+                         BodyState *out, StateErrorInfo *error) {
+  return guarded_state(error,
+                       [&] { *out = batch->batch->body_state(arena, body); });
+}
+
+int rsc_batch_set_body_state(RscBatch *batch, uint32_t arena, uint32_t body,
+                             const BodyState *state, StateErrorInfo *error) {
+  return guarded_state(
+      error, [&] { batch->batch->set_body_state(arena, body, *state); });
+}
+
+int rsc_batch_contact_manifolds(RscBatch *batch, uint32_t arena,
+                                ContactManifold *out, uint32_t capacity,
+                                uint32_t *count) {
+  return guarded([&] {
+    std::vector<ContactManifold> manifolds =
+        batch->batch->contact_manifolds(arena);
+    *count = static_cast<uint32_t>(manifolds.size());
+    std::copy_n(manifolds.begin(), std::min<size_t>(capacity, manifolds.size()),
+                out);
+  });
+}
+
+int rsc_batch_set_contact_manifolds(RscBatch *batch, uint32_t arena,
+                                    const ContactManifold *manifolds,
+                                    uint32_t count, StateErrorInfo *error) {
+  return guarded_state(error, [&] {
+    batch->batch->set_contact_manifolds(arena, {manifolds, count});
+  });
 }
 
 int rsc_batch_set_pad_state(RscBatch *batch, uint32_t arena, uint32_t pad,

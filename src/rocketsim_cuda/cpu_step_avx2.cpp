@@ -21,7 +21,7 @@
 
 namespace rocketsim_cuda {
 
-bool cpu_supports_avx2_step() {
+__attribute__((aligned(k_step_code_alignment))) bool cpu_supports_avx2_step() {
   return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
 }
 

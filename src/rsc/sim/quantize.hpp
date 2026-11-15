@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #include "rsc/bullet/rigid_body.hpp"
-#include "rsc/math/glibc_atan2_hypot.hpp"
+#include "rsc/bullet/world_types.hpp"
 #include "rsc/math/libm.hpp"
 #include "rsc/math/shared.hpp"
 #include "rsc/math/vec.hpp"
@@ -11,10 +11,25 @@
 
 namespace rsc {
 
-inline constexpr int k_sin_table_size = 16384;
+struct QuatAxes {
+  Vec3A forward;
+  Vec3A right;
+  Vec3A up;
+};
 
-RS_HDI float sin_tab_angle(const float *table, int32_t angle) {
-  return table[(angle >> 2) & 0x3fff];
+#ifdef RSC_NATIVE_MATH
+
+inline constexpr int k_sin_table_size = 16384;
+inline constexpr int32_t k_rotator_quarter_turn = 0x4000;
+
+struct Rotator {
+  int32_t pitch;
+  int32_t yaw;
+  int32_t roll;
+};
+
+RS_HDI float rotator_sin(const StaticWorldData &st, int32_t angle) {
+  return st.sin_table[(angle >> 2) & 0x3fff];
 }
 
 RS_HD int32_t rotator_units(float y, float x) {
@@ -28,42 +43,103 @@ RS_HD int32_t dodge_yaw_units(float y, float x) {
   return sat_f32_to_i32(round_ties_even(units));
 }
 
-RS_HD Vec3A rotator_forward(const float *table, Vec3A forward) {
+RS_HD Vec3A rotator_forward(const StaticWorldData &st, Vec3A forward) {
   int32_t yaw = rotator_units(forward.y, forward.x);
   float xy = static_cast<float>(sqrt_f64(
       static_cast<double>(forward.y * forward.y + forward.x * forward.x)));
   int32_t pitch = rotator_units(forward.z, xy);
-  float cos_pitch = sin_tab_angle(table, pitch + 0x4000);
-  return {cos_pitch * sin_tab_angle(table, yaw + 0x4000),
-          cos_pitch * sin_tab_angle(table, yaw), sin_tab_angle(table, pitch)};
+  float cos_pitch = rotator_sin(st, pitch + k_rotator_quarter_turn);
+  return {cos_pitch * rotator_sin(st, yaw + k_rotator_quarter_turn),
+          cos_pitch * rotator_sin(st, yaw), rotator_sin(st, pitch)};
 }
 
-RS_HD int32_t axis_angle_to_int(float a0, float a1) {
-  double ang = atan2_glibc(static_cast<double>(a0), static_cast<double>(a1));
-  float u = (static_cast<float>(ang) * 32768.0f) / k_pi;
-  float v = u * 2.0f + 0.5f;
-  return sat_f32_to_i32(round_ties_even(v)) >> 1;
+RS_HD Vec3A dodge_direction(const StaticWorldData &st, Vec3A forward) {
+  int32_t yaw = dodge_yaw_units(forward.y, forward.x);
+  return {rotator_sin(st, yaw + k_rotator_quarter_turn), rotator_sin(st, yaw),
+          0.0f};
 }
 
-RS_HD float autoflip_impulse_sign(const float *table, const Mat3A &rot) {
-  Vec3A col0 = rot.x_axis;
-  Vec3A col1 = rot.y_axis;
-  Vec3A col2 = rot.z_axis;
-  int32_t yaw = axis_angle_to_int(col0.y, col0.x);
-  float len = static_cast<float>(
-      hypot_glibc(static_cast<double>(col0.x), static_cast<double>(col0.y)));
-  int32_t pitch = axis_angle_to_int(col0.z, len);
-  float tp = sin_tab_angle(table, pitch);
-  float ty = sin_tab_angle(table, yaw);
-  float tr = sin_tab_angle(table, 0);
-  float tpq = sin_tab_angle(table, pitch + 0x4000);
-  float tyq = sin_tab_angle(table, yaw + 0x4000);
-  float trq = sin_tab_angle(table, 0x4000);
-  Vec3A r1{tp * tr * tyq - trq * ty, tyq * trq + tp * tr * ty, -tr * tpq};
-  int32_t roll = axis_angle_to_int(col2.dot(r1), col1.dot(r1));
-  int16_t roll16 = static_cast<int16_t>(static_cast<uint16_t>(roll));
-  return roll16 > 0 ? 1.0f : -1.0f;
+RS_HD Vec3A rotator_up_axis(const StaticWorldData &st, Rotator r) {
+  float sy = rotator_sin(st, r.yaw);
+  float cy = rotator_sin(st, r.yaw + k_rotator_quarter_turn);
+  float sp = rotator_sin(st, r.pitch);
+  float cp = rotator_sin(st, r.pitch + k_rotator_quarter_turn);
+  float sr = rotator_sin(st, r.roll);
+  float cr = rotator_sin(st, r.roll + k_rotator_quarter_turn);
+  float cr_sp = cr * sp;
+  return {-(cr_sp * cy + sy * sr), cy * sr - cr_sp * sy, cp * cr};
 }
+
+RS_HD Rotator rotator_from_axes(const StaticWorldData &st, Vec3A forward,
+                                Vec3A right, Vec3A up) {
+  int32_t yaw = rotator_units(forward.y, forward.x);
+  float forward_xy = static_cast<float>(sqrt_f64(
+      static_cast<double>(forward.y * forward.y + forward.x * forward.x)));
+  int32_t pitch = rotator_units(forward.z, forward_xy);
+  float sy = rotator_sin(st, yaw);
+  float cy = rotator_sin(st, yaw + k_rotator_quarter_turn);
+  float z_dot = (up.y * cy + up.x * -sy) + up.z * -0.0f;
+  float y_dot = (right.y * cy + right.x * -sy) + right.z * -0.0f;
+  return {pitch, yaw, rotator_units(z_dot, y_dot)};
+}
+
+RS_HD QuatAxes quat_axes(Quat q) {
+  float z2 = q.z + q.z;
+  float y2 = q.y + q.y;
+  float x2x = (q.x + q.x) * q.x;
+  float x2w = (q.x + q.x) * q.w;
+  return {
+      {1.0f - (z2 * q.z + y2 * q.y), z2 * q.w + y2 * q.x, z2 * q.x - y2 * q.w},
+      {y2 * q.x - z2 * q.w, 1.0f - (z2 * q.z + x2x), x2w + z2 * q.y},
+      {y2 * q.w + z2 * q.x, z2 * q.y - x2w, 1.0f - (y2 * q.y + x2x)}};
+}
+
+RS_HD Vec3A quat_rotate(Quat q, Vec3A v) {
+  float qq = (q.y * q.y + q.x * q.x) + q.z * q.z;
+  float d = q.w * q.w - qq;
+  float w2 = q.w + q.w;
+  float dot = (v.x * q.x + v.y * q.y) + v.z * q.z;
+  float t = dot + dot;
+  float cx = v.z * q.y - v.y * q.z;
+  float cy = v.x * q.z - v.z * q.x;
+  float cz = v.y * q.x - v.x * q.y;
+  return {(cx * w2 + d * v.x) + t * q.x, (cy * w2 + d * v.y) + t * q.y,
+          (cz * w2 + d * v.z) + t * q.z};
+}
+
+RS_HD Vec3A auto_flip_up(const StaticWorldData &st, Quat q) {
+  Mat3A m = mat3a_from_quat(q);
+  return rotator_up_axis(st,
+                         rotator_from_axes(st, m.x_axis, m.y_axis, m.z_axis));
+}
+
+#else
+
+RS_HD Vec3A rotator_forward(const StaticWorldData &, Vec3A forward) {
+  return forward.normalize_or_zero();
+}
+
+RS_HD Vec3A dodge_direction(const StaticWorldData &, Vec3A forward) {
+  Vec3A horizontal = Vec3A{forward.x, forward.y, 0.0f}.normalize_or_zero();
+  if (horizontal == Vec3A::zero()) {
+    float yaw = atan2f_glibc(forward.y, forward.x);
+    return {cosf_glibc(yaw), sinf_glibc(yaw), 0.0f};
+  }
+  return horizontal;
+}
+
+RS_HD QuatAxes quat_axes(Quat q) {
+  Mat3A m = mat3a_from_quat(q);
+  return {m.x_axis, m.y_axis, m.z_axis};
+}
+
+RS_HD Vec3A quat_rotate(Quat q, Vec3A v) { return quat_mul_vec3a(q, v); }
+
+RS_HD Vec3A auto_flip_up(const StaticWorldData &, Quat q) {
+  return quat_mul_vec3a(q, {0.0f, 0.0f, 1.0f});
+}
+
+#endif
 
 RS_HD Vec3A quantize_axis_inputs(Vec3A ctrls) {
   Vec3A upper = Vec3A::splat(128.0f);
@@ -119,27 +195,6 @@ RS_HD Vec3A quantize_velocity(Vec3A vec, float scale) {
   return rounded + (sign3(rounded) * offset_mag);
 }
 
-RS_HD Mat3A set_rotation_scalar(Quat q) {
-  float d = ((q.x * q.x + q.y * q.y) + q.z * q.z) + q.w * q.w;
-  float s = 2.0f / d;
-  float xs = q.x * s, ys = q.y * s, zs = q.z * s;
-  float wx = q.w * xs, wy = q.w * ys, wz = q.w * zs;
-  float xx = q.x * xs, xy = q.x * ys, xz = q.x * zs;
-  float yy = q.y * ys, yz = q.y * zs, zz = q.z * zs;
-  return Mat3A::from_cols({1.0f - (yy + zz), xy + wz, xz - wy},
-                          {xy - wz, 1.0f - (xx + zz), yz + wx},
-                          {xz + wy, yz - wx, 1.0f - (xx + yy)});
-}
-
-RS_HD Quat normalize_scalar(Quat q, float min_len_sq) {
-  float len_sq = ((q.x * q.x + q.y * q.y) + q.z * q.z) + q.w * q.w;
-  if (!(len_sq > min_len_sq)) {
-    return Quat::identity();
-  }
-  float s = 1.0f / sqrt_f32(len_sq);
-  return {q.x * s, q.y * s, q.z * s, q.w * s};
-}
-
 RS_HD float quantize_component(float c) {
   constexpr int32_t max = (1 << 18) - 1;
   float max_f = static_cast<float>(max);
@@ -162,7 +217,7 @@ struct QuatSplit {
 };
 
 RS_HD QuatSplit split_quat(Quat q_in) {
-  Quat q = normalize_scalar(q_in, 1e-8f);
+  Quat q = game_quat_normalize_scalar(q_in, 1e-8f);
   float c[4] = {q.x, q.y, q.z, q.w};
   float a[4] = {abs_f32(c[0]), abs_f32(c[1]), abs_f32(c[2]), abs_f32(c[3])};
   int i01 = a[0] < a[1] ? 1 : 0;
@@ -183,7 +238,7 @@ RS_HD void quantize_split(QuatSplit &s) {
 RS_HD Quat join_quat(const QuatSplit &s) {
   float rest = ((1.0f - s.d[0] * s.d[0]) - s.d[1] * s.d[1]) - s.d[2] * s.d[2];
   float dropped = sqrt_f32(rest);
-  return normalize_scalar(
+  return game_quat_normalize_scalar(
       {s.big == 0 ? dropped : s.d[0],
        s.big == 1 ? dropped : (s.big == 0 ? s.d[0] : s.d[1]),
        s.big == 2 ? dropped : (s.big <= 1 ? s.d[1] : s.d[2]),
@@ -197,6 +252,53 @@ RS_HD Quat quantize_quat(Quat q_in) {
   return join_quat(s);
 }
 
+#ifdef RSC_HOST_LANES
+
+inline FloatLanes quantize_component_lanes(FloatLanes c, LaneMask &exact) {
+  constexpr int32_t max = (1 << 18) - 1;
+  FloatLanes max_f = FloatLanes::splat(static_cast<float>(max));
+  FloatLanes half = FloatLanes::splat(0.5f);
+  FloatLanes v = ((c * FloatLanes::splat(k_sqrt_2)) * half + half) * max_f;
+  v = (v + v) + half;
+  exact = exact & (abs(v) < FloatLanes::splat(1073741824.0f));
+  FloatLanes r =
+      to_float(clamp(round_ties_even_to_int(v) >> 1, 0, max)) / max_f - half;
+  return (r + r) * FloatLanes::splat(0.70710677f);
+}
+
+inline QuatLanes quantize_quat_lanes(const QuatLanes &q_in, LaneMask &exact) {
+  QuatLanes q = game_quat_normalize_lanes(q_in, 1e-8f, exact);
+  FloatLanes abs_x = abs(q.x), abs_y = abs(q.y), abs_z = abs(q.z),
+             abs_w = abs(q.w);
+  LaneMask y_over_x = abs_x < abs_y;
+  LaneMask w_over_z = abs_z < abs_w;
+  LaneMask big_is_xy =
+      select(y_over_x, abs_y, abs_x) >= select(w_over_z, abs_w, abs_z);
+  LaneMask big_is_x = and_not(y_over_x, big_is_xy);
+  LaneMask big_is_y = big_is_xy & y_over_x;
+  LaneMask big_is_w = and_not(big_is_xy, w_over_z);
+  FloatLanes big =
+      select(big_is_xy, select(y_over_x, q.y, q.x), select(w_over_z, q.w, q.z));
+  FloatLanes sign = select(big < FloatLanes::splat(0.0f),
+                           FloatLanes::splat(-1.0f), FloatLanes::splat(1.0f));
+  FloatLanes d0 =
+      quantize_component_lanes(select(big_is_x, q.y, q.x) * sign, exact);
+  FloatLanes d1 =
+      quantize_component_lanes(select(big_is_xy, q.z, q.y) * sign, exact);
+  FloatLanes d2 =
+      quantize_component_lanes(select(big_is_w, q.z, q.w) * sign, exact);
+  FloatLanes dropped =
+      sqrt(((FloatLanes::splat(1.0f) - d0 * d0) - d1 * d1) - d2 * d2);
+  return game_quat_normalize_lanes(
+      {select(big_is_x, dropped, d0),
+       select(big_is_y, dropped, select(big_is_x, d0, d1)),
+       select(big_is_xy, d1, select(w_over_z, d2, dropped)),
+       select(big_is_w, dropped, d2)},
+      1e-8f, exact);
+}
+
+#else
+
 RS_HD void quantize_quats(Quat *q, uint32_t n) {
   QuatSplit s[k_max_dyn_bodies];
   for (uint32_t i = 0; i < n; ++i) {
@@ -209,6 +311,8 @@ RS_HD void quantize_quats(Quat *q, uint32_t n) {
     q[i] = join_quat(s[i]);
   }
 }
+
+#endif
 
 }
 
@@ -227,18 +331,73 @@ RS_HD void quantize_body_motion(RigidBody &body) {
   body.ang_vel = new_ang_vel;
 }
 
+RS_HD Quat body_rotation_from_basis(const RigidBody &body) {
+  return game_basis_rotation(body.world_trans.matrix3);
+}
+
 RS_HD void quantize_body_rotation(RigidBody &body, Quat rot) {
   Affine3A trans = body.world_trans;
-  trans.matrix3 = quant::set_rotation_scalar(rot);
+  trans.matrix3 = game_set_rotation_scalar_columns(rot);
   body.set_world_trans_and_rot(trans, rot);
 }
+
+#ifdef RSC_HOST_LANES
+
+inline void quantize_body_rotations(RigidBody *const *bodies, uint32_t n) {
+  for (uint32_t first = 0; first < n; first += k_lane_count) {
+    uint32_t count = n - first < k_lane_count ? n - first : k_lane_count;
+    const Mat3A *bases[k_lane_count];
+    for (uint32_t lane = 0; lane < k_lane_count; ++lane) {
+      uint32_t source = lane < count ? lane : count - 1;
+      bases[lane] = &bodies[first + source]->world_trans.matrix3;
+    }
+    LaneMask exact = LaneMask::all_set();
+    QuatLanes rot_lanes = quant::quantize_quat_lanes(
+        game_basis_rotation_lanes(
+            BasisLanes::gather(*bases[0], *bases[1], *bases[2], *bases[3]),
+            exact),
+        exact);
+    Quat rots[k_lane_count];
+    Mat3A columns[k_lane_count];
+    rot_lanes.scatter(rots);
+    game_rotation_columns_lanes(rot_lanes).scatter(columns);
+    int exact_bits = exact.bits();
+    for (uint32_t lane = 0; lane < count; ++lane) {
+      RigidBody &body = *bodies[first + lane];
+      if ((exact_bits >> lane) & 1) {
+        Affine3A trans = body.world_trans;
+        trans.matrix3 = columns[lane];
+        body.set_world_trans_and_rot(trans, rots[lane]);
+      } else {
+        quantize_body_rotation(
+            body, quant::quantize_quat(body_rotation_from_basis(body)));
+      }
+    }
+  }
+}
+
+#else
+
+RS_HD void quantize_body_rotations(RigidBody *const *bodies, uint32_t n) {
+  Quat rots[k_max_dyn_bodies];
+  for (uint32_t i = 0; i < n; ++i) {
+    rots[i] = body_rotation_from_basis(*bodies[i]);
+  }
+  quant::quantize_quats(rots, n);
+  for (uint32_t i = 0; i < n; ++i) {
+    quantize_body_rotation(*bodies[i], rots[i]);
+  }
+}
+
+#endif
 
 RS_HD void quantize_body(RigidBody &body) {
   quantize_body_motion(body);
   if (body.collision_flags & k_flag_no_angular_motion) {
     return;
   }
-  quantize_body_rotation(body, quant::quantize_quat(body.world_quat));
+  quantize_body_rotation(body,
+                         quant::quantize_quat(body_rotation_from_basis(body)));
 }
 
 }

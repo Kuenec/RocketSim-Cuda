@@ -333,34 +333,64 @@ RS_HD void car_respawn(Car &car, RigidBody &rb, Rng &rng, GameMode mode,
   car.state.cache.demoer_idx = -1;
 }
 
-RS_HD void car_update_contact_state(Car &car, const World &w) {
+struct WheelGroundContact {
+  bool touching;
+  bool touching_world;
+};
+
+RS_HD WheelGroundContact car_wheel_ground_contact(const WheelInfo &wheel) {
+  return {wheel.has_raycast,
+          wheel.has_raycast && wheel.raycast_info.is_in_contact_with_world};
+}
+
+struct CarGroundContacts {
   int num_in_contact = 0;
-  bool any_world = false;
   uint8_t world_count = 0;
-  for (int i = 0; i < 4; ++i) {
-    const WheelInfo &wheel = car.vehicle.wheels[i];
-    if (!wheel.has_raycast) {
-      car.state.cache.wheel_has_contact[i] = false;
-      car.state.cache.wheels_with_contact[i] = {Vec3A::zero(), Vec3A::zero(),
-                                                0.0f, UserInfoType::None};
-      continue;
-    }
-    const RaycastInfo &info = wheel.raycast_info;
-    if (info.is_in_contact_with_world) {
-      any_world = true;
-      ++world_count;
-    }
-    float trace_len = (wheel.hard_point - info.contact_point).length();
-    car.state.cache.wheel_has_contact[i] = true;
-    car.state.cache.wheels_with_contact[i] = {
-        info.contact_point * consts::bt_to_uu, info.contact_normal,
-        trace_len / wheel.real_ray_length,
-        w.body(info.ground_body_idx).user_idx};
-    ++num_in_contact;
+
+  RS_HD void add(WheelGroundContact contact) {
+    num_in_contact += contact.touching ? 1 : 0;
+    world_count += contact.touching_world ? 1 : 0;
   }
-  car.state.cache.is_on_ground = num_in_contact >= 3;
-  car.sticky_gate_prev = any_world;
-  car.state.cache.world_wheels_prev = world_count;
+
+  RS_HD void store(Car &car) const {
+    car.state.cache.is_on_ground = num_in_contact >= 3;
+    car.sticky_gate_prev = world_count != 0;
+    car.state.cache.world_wheels_prev = world_count;
+  }
+};
+
+RS_HD WheelGroundContact car_update_wheel_contact_state(Car &car,
+                                                        const World &w, int i) {
+  const WheelInfo &wheel = car.vehicle.wheels[i];
+  if (!wheel.has_raycast) {
+    car.state.cache.wheel_has_contact[i] = false;
+    car.state.cache.wheels_with_contact[i] = {Vec3A::zero(), Vec3A::zero(),
+                                              0.0f, UserInfoType::None};
+    return car_wheel_ground_contact(wheel);
+  }
+  const RaycastInfo &info = wheel.raycast_info;
+  float trace_len = (wheel.hard_point - info.contact_point).length();
+  car.state.cache.wheel_has_contact[i] = true;
+  car.state.cache.wheels_with_contact[i] = {
+      info.contact_point * consts::bt_to_uu, info.contact_normal,
+      trace_len / wheel.real_ray_length, w.body(info.ground_body_idx).user_idx};
+  return car_wheel_ground_contact(wheel);
+}
+
+RS_HD void car_update_ground_state(Car &car) {
+  CarGroundContacts contacts;
+  for (int i = 0; i < 4; ++i) {
+    contacts.add(car_wheel_ground_contact(car.vehicle.wheels[i]));
+  }
+  contacts.store(car);
+}
+
+RS_HD void car_update_contact_state(Car &car, const World &w) {
+  CarGroundContacts contacts;
+  for (int i = 0; i < 4; ++i) {
+    contacts.add(car_update_wheel_contact_state(car, w, i));
+  }
+  contacts.store(car);
 }
 
 RS_HD void car_update_wheels(Car &car, RigidBody &rb, float forward_speed_uu,
@@ -385,11 +415,7 @@ RS_HD void car_update_wheels(Car &car, RigidBody &rb, float forward_speed_uu,
     proc_throttle = quant_throttle;
     proc_steer = quantize_axis_input(s.controls.steer);
   }
-  bool all_wheels_contact = s.num_wheels_in_contact() == k_num_wheels;
-  float real_throttle =
-      (s.controls.boost && s.boost > 0.0f && all_wheels_contact)
-          ? 1.0f
-          : proc_throttle;
+  float real_throttle = proc_throttle;
   float abs_speed = abs_f32(forward_speed_uu);
   float engine_throttle = real_throttle;
   if (!s.controls.handbrake) {
@@ -409,12 +435,15 @@ RS_HD void car_update_wheels(Car &car, RigidBody &rb, float forward_speed_uu,
     }
   }
   float drive_speed_scale =
-      curves::drive_speed_torque_factor().get_output(abs_speed);
-  constexpr float engine_amount = car::drive::throttle_torque_amount * uu_to_bt;
-  constexpr float brake_amount = car::drive::brake_torque_amount * uu_to_bt;
+      engine_throttle != 0.0f
+          ? curves::drive_speed_torque_factor().get_output(forward_speed_uu)
+          : 1.0f;
   float drive_engine_force =
-      engine_throttle * engine_amount * drive_speed_scale;
-  float drive_brake_force = real_brake * brake_amount;
+      ((drive_speed_scale * (engine_throttle * car::drive::engine_force_uu)) *
+       0.25f) *
+      uu_to_bt;
+  float drive_brake_force =
+      ((real_brake * car::drive::brake_force_uu) * 0.25f) * uu_to_bt;
   for (int i = 0; i < k_num_wheels; ++i) {
     car.vehicle.wheels[i].engine_force = drive_engine_force;
     car.vehicle.wheels[i].brake = drive_brake_force;
@@ -435,23 +464,26 @@ RS_HD void car_update_wheels(Car &car, RigidBody &rb, float forward_speed_uu,
     }
     Vec3A upwards_dir = cached_up;
     bool full_stick =
-        raw_throttle != 0.0f || abs_speed > car::drive::stopping_forward_vel;
+        proc_throttle != 0.0f || abs_speed > car::drive::stopping_forward_vel;
+    float sticky_base = car.info.config.three_wheels ? 0.0f : 0.5f;
+    float sticky_full =
+        car.info.config.three_wheels ? 1.5f : sticky_base + 1.0f;
+    float sticky_target = full_stick ? sticky_full : sticky_base;
     float sticky_force_scale =
-        (car.info.config.three_wheels ? 0.0f : 1.0f) * 0.5f;
-    if (full_stick) {
-      sticky_force_scale += 1.0f - abs_f32(upwards_dir.z);
-    }
+        abs_f32(upwards_dir.z) * (sticky_base - sticky_target) + sticky_target;
     rb.add_linear_impulse(upwards_dir * sticky_force_scale *
                               -abs_f32(mut.gravity.z) * tick_time * uu_to_bt,
                           false, true);
   }
 }
 
-RS_HD void car_update_air_torque(Car &car, RigidBody &rb, int num_in_contact,
+RS_HD void car_update_air_torque(Car &car, RigidBody &rb,
+                                 const MutatorConfig &mut, int num_in_contact,
                                  float quant_throttle, bool prev_is_flipping,
                                  float prev_flip_time) {
   using namespace consts;
   CarState &s = car.state;
+  QuatAxes axes = quat_axes(rb.world_quat);
   bool allow_dodge = num_in_contact < 3;
   bool allow_air = num_in_contact == 0;
   if (s.is_flipping && allow_dodge && s.flip_rel_torque != Vec3A::zero()) {
@@ -468,7 +500,14 @@ RS_HD void car_update_air_torque(Car &car, RigidBody &rb, int num_in_contact,
         {rel.x * car::flip::torque_x, rel.y * car::flip::torque_y, 0.0f});
     dodge_torque.y *= pitch_scale;
     dodge_torque *= tick_time;
-    rb.add_angular_impulse(rb.world_trans.matrix3 * dodge_torque, false, true);
+    Vec3A world_torque{
+        (dodge_torque.y * axes.right.x + dodge_torque.x * axes.forward.x) +
+            dodge_torque.z * axes.up.x,
+        (dodge_torque.y * axes.right.y + dodge_torque.x * axes.forward.y) +
+            dodge_torque.z * axes.up.y,
+        (dodge_torque.y * axes.right.z + dodge_torque.x * axes.forward.z) +
+            dodge_torque.z * axes.up.z};
+    rb.add_angular_impulse(world_torque, false, true);
   }
   if (allow_air) {
     Vec3A inputs = quantize_axis_inputs(s.controls.pyr());
@@ -478,7 +517,7 @@ RS_HD void car_update_air_torque(Car &car, RigidBody &rb, int num_in_contact,
          prev_flip_time < car::flip::pitchlock_extra_time)) {
       pitch_torque_scale = 0.0f;
     }
-    Mat3A dirs = Mat3A::from_cols(-s.right_dir(), s.up_dir(), -s.forward_dir());
+    Mat3A dirs = Mat3A::from_cols(-axes.right, axes.up, -axes.forward);
     Vec3A scaled = inputs * Vec3A{pitch_torque_scale, 1.0f, 1.0f};
     Vec3A torque_const{car::air_control::torque_x, car::air_control::torque_y,
                        car::air_control::torque_z};
@@ -497,9 +536,12 @@ RS_HD void car_update_air_torque(Car &car, RigidBody &rb, int num_in_contact,
   if (allow_air) {
     float throttle_scale = s.is_boosting ? 1.0f : quant_throttle;
     if (throttle_scale != 0.0f) {
-      Vec3A force = s.forward_dir() * throttle_scale *
-                    car::drive::throttle_air_accel * uu_to_bt * tick_time;
-      rb.add_linear_impulse(force, false, true);
+      float mass = mut.car_mass;
+      float inv_mass = 1.0f / mass;
+      Vec3A force = ((axes.forward * (car::drive::throttle_air_accel * mass)) *
+                     throttle_scale) *
+                    uu_to_bt;
+      rb.add_linear_impulse((force * inv_mass) * tick_time, false, true);
     }
   }
 }
@@ -508,7 +550,6 @@ RS_HD void car_update_jump(Car &car, RigidBody &rb, const MutatorConfig &mut,
                            bool jump_pressed) {
   using namespace consts;
   CarState &s = car.state;
-  Vec3A up_dir = s.up_dir();
   if (!s.has_jumped && s.cache.is_on_ground && jump_pressed) {
     s.is_jumping = true;
     s.has_jumped = true;
@@ -528,13 +569,17 @@ RS_HD void car_update_jump(Car &car, RigidBody &rb, const MutatorConfig &mut,
     }
   }
   if (s.is_jumping) {
+    Vec3A up_dir = quat_axes(rb.world_quat).up;
+    float mass = mut.car_mass;
+    float inv_mass = 1.0f / mass;
     if (s.jump_ticks == 1) {
-      rb.add_linear_impulse(up_dir * mut.jump_immediate_force * uu_to_bt, false,
-                            false);
+      Vec3A jump_impulse =
+          (up_dir * (mut.jump_immediate_force * mass)) * uu_to_bt;
+      rb.add_linear_impulse(jump_impulse * inv_mass, false, false);
       rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
     }
-    constexpr float scale = uu_to_bt * tick_time;
-    rb.add_linear_impulse(up_dir * mut.jump_accel * scale, false, true);
+    Vec3A jump_force = (up_dir * (mut.jump_accel * mass)) * uu_to_bt;
+    rb.add_linear_impulse((jump_force * inv_mass) * tick_time, false, true);
   }
 }
 
@@ -593,26 +638,32 @@ car_update_double_jump_or_flip(Car &car, RigidBody &rb, const World &w,
               backwards ? car::flip::backward_impulse_max_speed_scale
                         : car::flip::forward_impulse_max_speed_scale;
           float ratio = abs_f32(forward_speed_uu) / car::max_speed;
-          Vec3A initial = deadzone_dir * car::flip::initial_vel_scale;
+          float mass = mut.car_mass;
+          float inv_mass = 1.0f / mass;
+          float dodge_imp = car::flip::initial_vel_scale * mass;
+          float dodge_imp_x =
+              backwards ? round_ties_even(dodge_imp *
+                                          car::flip::backward_impulse_scale_x)
+                        : dodge_imp;
+          Vec3A initial{deadzone_dir.x * dodge_imp_x,
+                        deadzone_dir.y * dodge_imp, 0.0f};
           initial.x *= ((max_speed_scale_x - 1.0f) * ratio) + 1.0f;
           initial.y *=
               ((car::flip::side_impulse_max_speed_scale - 1.0f) * ratio) + 1.0f;
-          if (backwards) {
-            initial.x *= car::flip::backward_impulse_scale_x;
-          }
-          Vec3A forward = s.forward_dir();
-          int32_t dodge_yaw = dodge_yaw_units(forward.y, forward.x);
-          const float *table = w.s->sin_table;
-          Vec3A forward_2d{sin_tab_angle(table, dodge_yaw + 0x4000),
-                           sin_tab_angle(table, dodge_yaw), 0.0f};
+          Vec3A forward_2d =
+              dodge_direction(*w.s, quat_axes(rb.world_quat).forward);
           Vec3A right_2d{-forward_2d.y, forward_2d.x, 0.0f};
           Vec3A final_delta = initial.x * forward_2d + initial.y * right_2d;
-          rb.add_linear_impulse(final_delta * uu_to_bt, false, false);
+          Vec3A impulse_bt = final_delta * uu_to_bt;
+          rb.add_linear_impulse(impulse_bt * inv_mass, false, false);
           rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
         }
       } else {
-        rb.add_linear_impulse(s.up_dir() * mut.jump_immediate_force * uu_to_bt,
-                              false, false);
+        float mass = mut.car_mass;
+        Vec3A jump_impulse =
+            (quat_axes(rb.world_quat).up * (mut.jump_immediate_force * mass)) *
+            uu_to_bt;
+        rb.add_linear_impulse(jump_impulse * (1.0f / mass), false, false);
         rb.limit_vels(car::max_speed * uu_to_bt, car::max_ang_speed);
         s.has_double_jumped = true;
       }
@@ -668,10 +719,11 @@ RS_HD void car_update_boost(Car &car, RigidBody &rb, const MutatorConfig &mut) {
   using namespace consts;
   CarState &s = car.state;
   auto apply_accel = [&]() {
-    float accel =
-        s.cache.is_on_ground ? mut.boost_accel_ground : mut.boost_accel_air;
-    rb.add_linear_impulse(accel * s.forward_dir() * (uu_to_bt * tick_time),
-                          false, true);
+    float mass = mut.car_mass;
+    float inv_mass = 1.0f / mass;
+    Vec3A boost_dir = quat_rotate(rb.world_quat, {1.0f, 0.0f, 0.0f});
+    Vec3A force = (boost_dir * (mut.boost_accel_ground * mass)) * uu_to_bt;
+    rb.add_linear_impulse((force * inv_mass) * tick_time, false, true);
   };
   auto recharge = [&]() {
     if (mut.recharge_boost_enabled &&
@@ -711,24 +763,30 @@ RS_HD void car_update_boost(Car &car, RigidBody &rb, const MutatorConfig &mut) {
 }
 
 RS_HD void car_update_auto_flip(Car &car, RigidBody &rb, const World &w,
-                                bool jump_pressed) {
+                                const MutatorConfig &mut, bool jump_pressed) {
   using namespace consts;
   CarState &s = car.state;
   if (jump_pressed && s.cache.has_world_contact_normal &&
       s.cache.world_contact_normal.z > car::autoflip::norm_z_thresh) {
     Vec3A wcn = s.cache.world_contact_normal;
     const Mat3A &rot = s.phys.rot_mat;
-    float y_z = rot.y_axis.z;
-    float z_z = rot.z_axis.z;
-    float cy = sqrt_f32(z_z * z_z + y_z * y_z);
-    float roll = cy > 16.0f * k_f32_epsilon ? atan2f_glibc(y_z, z_z) : 0.0f;
+    float roll = -game_atan2f(rot.y_axis.z, rot.z_axis.z);
     float abs_roll = abs_f32(roll);
-    if (wcn.dot(s.up_dir()) < car::autoflip::up_dot_thresh) {
-      s.auto_flip_timer = car::autoflip::time * (abs_roll / k_pi);
-      s.auto_flip_torque_scale = autoflip_impulse_sign(w.s->sin_table, rot);
+    Vec3A tick_start_up = auto_flip_up(*w.s, rb.world_quat);
+    if (wcn.dot(tick_start_up) < car::autoflip::up_dot_thresh) {
+      float flip_time = car.info.config.three_wheels
+                            ? car::autoflip::three_wheel_time
+                            : car::autoflip::time;
+      s.auto_flip_timer = static_cast<float>(
+          static_cast<double>(flip_time) *
+          (static_cast<double>(abs_roll) / 3.14159265358979323846));
+      s.auto_flip_torque_scale = roll > 0.0f ? 1.0f : -1.0f;
       s.is_auto_flipping = true;
-      constexpr float scale = car::autoflip::impulse * uu_to_bt;
-      rb.add_linear_impulse(-s.up_dir() * scale, false, false);
+      float mass = mut.car_mass;
+      Vec3A impulse =
+          ((quat_axes(rb.world_quat).up * -car::autoflip::impulse) * uu_to_bt) *
+          mass;
+      rb.add_linear_impulse(impulse * (1.0f / mass), false, false);
     }
   }
   if (s.is_auto_flipping) {
@@ -796,13 +854,13 @@ RS_HDI bool car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
   }
   bool was_is_jumping = s.is_jumping;
   car_update_jump(car, rb, mut, jump_pressed);
-  car_update_auto_flip(car, rb, w, jump_pressed);
+  car_update_auto_flip(car, rb, w, mut, jump_pressed);
   bool prev_is_flipping = s.is_flipping;
   float prev_flip_time = s.flip_time;
   bool flip_ended = car_update_double_jump_or_flip(
       car, rb, w, mut, jump_pressed, forward_speed_uu, was_is_jumping);
   if (!s.cache.is_on_ground) {
-    car_update_air_torque(car, rb, num_in_contact, quant_throttle,
+    car_update_air_torque(car, rb, mut, num_in_contact, quant_throttle,
                           prev_is_flipping, prev_flip_time);
   }
   int world_wheels = s.cache.world_wheels_prev;
@@ -814,13 +872,11 @@ RS_HDI bool car_pre_tick_update(Car &car, World &w, Rng &rng, GameMode mode,
   s.cache.has_world_contact_normal = false;
   s.cache.world_contact_normal = Vec3A::zero();
   car_update_boost(car, rb, mut);
-  float real_throttle =
-      (s.controls.boost && s.boost > 0.0f) ? 1.0f : quant_throttle;
   if (deferred_throttle) {
-    *deferred_throttle = real_throttle;
+    *deferred_throttle = quant_throttle;
     return true;
   }
-  car.vehicle.update(w, tick_time, s.handbrake_val, real_throttle,
+  car.vehicle.update(w, tick_time, s.handbrake_val, quant_throttle,
                      car.info.config.three_wheels, precomputed_hits);
   car_update_contact_state(car, w);
   return true;

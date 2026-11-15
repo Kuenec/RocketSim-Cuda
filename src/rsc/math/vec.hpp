@@ -424,32 +424,30 @@ RS_HD Quat quat_from_mat3a(const Mat3A &m) {
   float m00 = m.x_axis.x, m01 = m.x_axis.y, m02 = m.x_axis.z;
   float m10 = m.y_axis.x, m11 = m.y_axis.y, m12 = m.y_axis.z;
   float m20 = m.z_axis.x, m21 = m.z_axis.y, m22 = m.z_axis.z;
-  if (m22 <= 0.0f) {
-    float dif10 = m11 - m00;
-    float omm22 = 1.0f - m22;
-    if (dif10 <= 0.0f) {
-      float four_xsq = omm22 - dif10;
-      float inv4x = 0.5f / sqrt_f32(four_xsq);
-      return {four_xsq * inv4x, (m01 + m10) * inv4x, (m02 + m20) * inv4x,
-              (m12 - m21) * inv4x};
-    }
-    float four_ysq = omm22 + dif10;
-    float inv4y = 0.5f / sqrt_f32(four_ysq);
-    return {(m01 + m10) * inv4y, four_ysq * inv4y, (m12 + m21) * inv4y,
-            (m20 - m02) * inv4y};
-  }
-  float sum10 = m11 + m00;
-  float opm22 = 1.0f + m22;
-  if (sum10 <= 0.0f) {
-    float four_zsq = opm22 - sum10;
-    float inv4z = 0.5f / sqrt_f32(four_zsq);
-    return {(m02 + m20) * inv4z, (m12 + m21) * inv4z, four_zsq * inv4z,
-            (m01 - m10) * inv4z};
-  }
-  float four_wsq = opm22 + sum10;
-  float inv4w = 0.5f / sqrt_f32(four_wsq);
-  return {(m12 - m21) * inv4w, (m20 - m02) * inv4w, (m01 - m10) * inv4w,
-          four_wsq * inv4w};
+  bool xy_largest = m22 <= 0.0f;
+  float diagonal = xy_largest ? m11 - m00 : m11 + m00;
+  float base = xy_largest ? 1.0f - m22 : 1.0f + m22;
+  bool first_largest = diagonal <= 0.0f;
+  float four_sq = first_largest ? base - diagonal : base + diagonal;
+  float inv = 0.5f / sqrt_f32(four_sq);
+  float xy_sum = m01 + m10;
+  float xz_sum = m02 + m20;
+  float yz_sum = m12 + m21;
+  float yz_diff = m12 - m21;
+  float zx_diff = m20 - m02;
+  float xy_diff = m01 - m10;
+  return {(xy_largest ? (first_largest ? four_sq : xy_sum)
+                      : (first_largest ? xz_sum : yz_diff)) *
+              inv,
+          (xy_largest ? (first_largest ? xy_sum : four_sq)
+                      : (first_largest ? yz_sum : zx_diff)) *
+              inv,
+          (xy_largest ? (first_largest ? xz_sum : yz_sum)
+                      : (first_largest ? four_sq : xy_diff)) *
+              inv,
+          (xy_largest ? (first_largest ? yz_diff : zx_diff)
+                      : (first_largest ? xy_diff : four_sq)) *
+              inv};
 }
 
 RS_HD Mat3A mat3a_from_euler_zyx(float a, float b, float c) {

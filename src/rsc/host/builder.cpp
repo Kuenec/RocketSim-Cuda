@@ -605,7 +605,7 @@ MeshLibrary::meshes(GameMode mesh_mode) const {
 
 float damping_factor_for(float linear_damping) {
   float clamped = clamp_f32(linear_damping, 0.0f, 1.0f);
-  return ::powf(1.0f - clamped, consts::tick_time);
+  return ::powf(max_f32(1.0f - clamped, 0.0f), consts::tick_time);
 }
 
 MutatorConfig default_mutators(GameMode mode) {
@@ -814,6 +814,7 @@ HostStatic::HostStatic(const MeshLibrary &library, const ArenaSetup &setup)
   build_statics(library);
   build_grid();
   build_pads();
+#ifdef RSC_NATIVE_MATH
   sin_table.resize(k_sin_table_size);
   for (int j = 0; j < k_sin_table_size; ++j) {
     float jf = static_cast<float>(j);
@@ -821,6 +822,7 @@ HostStatic::HostStatic(const MeshLibrary &library, const ArenaSetup &setup)
     sin_table[j] = static_cast<float>(::sin(static_cast<double>(angle)));
   }
   view_.world.sin_table = sin_table.data();
+#endif
   view_.mode = setup_.mode;
 
   ArenaPhysics &a = *template_phys_;

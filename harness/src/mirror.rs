@@ -4,6 +4,13 @@ use crate::ffi;
 
 const USER_INFO_NAMES: [&str; 4] = ["None", "Car", "Ball", "DropshotTile"];
 const TEAM_NAMES: [&str; 2] = ["Blue", "Orange"];
+const ACTIVATION_STATE_NAMES: [&str; 4] = [
+    "Active",
+    "Sleeping",
+    "DisableSimulation",
+    "WantsDeactivation",
+];
+
 const GAME_MODE_NAMES: [&str; 6] = [
     "Soccar",
     "Hoops",
@@ -270,6 +277,8 @@ struct BallState {
     hs_info: HeatseekerInfo,
     ds_info: DropshotInfo,
     tick_count_since_kickoff: u64,
+    activation_state: Variant,
+    deactivation_time: f32,
 }
 
 fn ball_state(b: &ffi::BallState) -> BallState {
@@ -290,6 +299,8 @@ fn ball_state(b: &ffi::BallState) -> BallState {
                 .then_some(b.ds_info.last_damage_tick),
         },
         tick_count_since_kickoff: b.tick_count_since_kickoff,
+        activation_state: Variant(ACTIVATION_STATE_NAMES[b.activation_state as usize]),
+        deactivation_time: b.deactivation_time,
     }
 }
 
@@ -541,4 +552,146 @@ pub fn snapshot(game_mode: u8, s: &ffi::ArenaSnapshot) -> Snapshot {
         mutators: mutators(&s.mutators),
         ball_scored: s.scalars.ball_scored,
     }
+}
+
+pub const WORLD_POINT_PROBES: [[f32; 3]; 2] = [[0.25, -0.5, 0.125], [-3.0, 1.5, 2.0]];
+
+#[derive(Serialize)]
+pub struct BodyView {
+    pub kind: u8,
+    pub world_transform: [f32; 12],
+    pub aabb: [f32; 6],
+    pub contact_breaking_threshold: f32,
+    pub contact_processing_threshold: f32,
+    pub collision_order: u64,
+    pub world_points: Vec<[f32; 3]>,
+    pub inv_inertia_tensor_world: [f32; 9],
+    pub interp_world_basis: [f32; 9],
+    pub linear_sleeping_threshold: f32,
+    pub angular_sleeping_threshold: f32,
+}
+
+#[derive(Serialize)]
+pub struct ContactPointView {
+    pub local_point_a: [f32; 3],
+    pub local_point_b: [f32; 3],
+    pub pos_world_on_a: [f32; 3],
+    pub pos_world_on_b: [f32; 3],
+    pub normal_world_on_b: [f32; 3],
+    pub distance: f32,
+    pub combined_friction: f32,
+    pub combined_restitution: f32,
+    pub applied_impulse: f32,
+    pub is_special: bool,
+}
+
+#[derive(Serialize)]
+pub struct ManifoldView {
+    pub body0: u64,
+    pub body1: u64,
+    pub contact_breaking_threshold: f32,
+    pub contact_processing_threshold: f32,
+    pub points: Vec<ContactPointView>,
+}
+
+#[derive(Serialize)]
+pub struct PhysicsView {
+    pub body_count: u64,
+    pub ball_body: u64,
+    pub car_bodies: Vec<Option<u64>>,
+    pub bodies: Vec<BodyView>,
+    pub manifolds: Vec<ManifoldView>,
+}
+
+fn mat3(m: ffi::Mat3) -> [f32; 9] {
+    let (x, y, z) = (v3(m.x_axis), v3(m.y_axis), v3(m.z_axis));
+    [x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]]
+}
+
+fn body_view(batch: &mut ffi::Batch, arena: u32, body: u32) -> Result<BodyView, String> {
+    let info = batch
+        .body_info(arena, body)?
+        .map_err(|e| format!("body_info({body}) failed: {e:?}"))?;
+    let state = batch
+        .body_state(arena, body)?
+        .map_err(|e| format!("body_state({body}) failed: {e:?}"))?;
+    let basis = mat3(info.world_transform.matrix3);
+    let translation = v3(info.world_transform.translation);
+    let mut world_transform = [0.0; 12];
+    world_transform[..9].copy_from_slice(&basis);
+    world_transform[9..].copy_from_slice(&translation);
+    let (min, max) = (v3(info.aabb.min), v3(info.aabb.max));
+    Ok(BodyView {
+        kind: info.kind,
+        world_transform,
+        aabb: [min[0], min[1], min[2], max[0], max[1], max[2]],
+        contact_breaking_threshold: info.contact_breaking_threshold,
+        contact_processing_threshold: info.contact_processing_threshold,
+        collision_order: info.collision_order as u64,
+        world_points: WORLD_POINT_PROBES
+            .iter()
+            .map(|p| {
+                v3(info.world_point(ffi::Vec3 {
+                    x: p[0],
+                    y: p[1],
+                    z: p[2],
+                }))
+            })
+            .collect(),
+        inv_inertia_tensor_world: mat3(state.inv_inertia_tensor_world),
+        interp_world_basis: mat3(state.interp_world_basis),
+        linear_sleeping_threshold: state.linear_sleeping_threshold,
+        angular_sleeping_threshold: state.angular_sleeping_threshold,
+    })
+}
+
+fn manifold_view(m: &ffi::ContactManifold) -> ManifoldView {
+    ManifoldView {
+        body0: m.body0 as u64,
+        body1: m.body1 as u64,
+        contact_breaking_threshold: m.contact_breaking_threshold,
+        contact_processing_threshold: m.contact_processing_threshold,
+        points: m.points[..(m.num_points as usize).min(ffi::MAX_CONTACT_POINTS)]
+            .iter()
+            .map(|p| ContactPointView {
+                local_point_a: v3(p.local_point_a),
+                local_point_b: v3(p.local_point_b),
+                pos_world_on_a: v3(p.pos_world_on_a),
+                pos_world_on_b: v3(p.pos_world_on_b),
+                normal_world_on_b: v3(p.normal_world_on_b),
+                distance: p.distance,
+                combined_friction: p.combined_friction,
+                combined_restitution: p.combined_restitution,
+                applied_impulse: p.applied_impulse,
+                is_special: p.is_special,
+            })
+            .collect(),
+    }
+}
+
+pub fn physics_view(
+    batch: &mut ffi::Batch,
+    arena: u32,
+    num_cars: usize,
+) -> Result<PhysicsView, String> {
+    let body_count = batch.physics_body_count(arena)?;
+    let mut car_bodies = Vec::with_capacity(num_cars + 1);
+    for car in 0..=num_cars {
+        car_bodies.push(batch.car_body_id(arena, car as u32)?.map(u64::from));
+    }
+    let mut bodies = Vec::with_capacity(body_count as usize);
+    for body in 0..body_count {
+        bodies.push(body_view(batch, arena, body)?);
+    }
+    Ok(PhysicsView {
+        body_count: body_count as u64,
+        ball_body: batch.ball_body_id(arena)? as u64,
+        car_bodies,
+        bodies,
+        manifolds: batch
+            .contact_manifolds(arena)?
+            .iter()
+            .map(manifold_view)
+            .collect(),
+    })
 }

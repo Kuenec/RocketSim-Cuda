@@ -29,6 +29,8 @@ struct BallState {
   HeatseekerInfo hs_info;
   DropshotInfo ds_info;
   uint64_t tick_count_since_kickoff;
+  ActivationState activation_state;
+  float deactivation_time;
 };
 
 RS_HD BallState ball_state_default() {
@@ -40,6 +42,8 @@ RS_HD BallState ball_state_default() {
   s.hs_info = {0, consts::heatseeker::initial_target_speed, 0.0f};
   s.ds_info = {1, 0.0f, 0, false, 0};
   s.tick_count_since_kickoff = 0;
+  s.activation_state = ActivationState::Active;
+  s.deactivation_time = 0.0f;
   return s;
 }
 
@@ -58,7 +62,8 @@ RS_HD void ball_sync_state_to_body(Ball &ball, RigidBody &rb) {
   rb.ang_vel = ball.state.phys.ang_vel;
   rb.clear_accum_vels();
   rb.update_inertia_tensor();
-  rb.force_activate();
+  rb.activation = ball.state.activation_state;
+  rb.deactivation_time = ball.state.deactivation_time;
 }
 
 RS_HD void ball_set_state(Ball &ball, RigidBody &rb, const BallState &state) {
@@ -128,15 +133,17 @@ RS_HD void ball_finish_physics_tick(Ball &ball, const RigidBody &rb) {
   ball.state.phys.ang_vel = rb.ang_vel;
   ball.state.phys.pos = rb.world_trans.translation * bt_to_uu;
   ball.state.phys.rot_mat = rb.world_trans.matrix3;
+  ball.state.activation_state = rb.activation;
+  ball.state.deactivation_time = rb.deactivation_time;
   ball.state.tick_count_since_kickoff += 1;
 }
 
 RS_HDI void ball_on_hit(Ball &ball, Car &car, GameMode mode,
                         const MutatorConfig &mut, uint64_t tick_count,
-                        RigidBody &rb, const float *sin_table) {
+                        RigidBody &rb, const StaticWorldData &world) {
   using namespace consts;
   BallState &s = ball.state;
-  Vec3A car_forward = rotator_forward(sin_table, car.state.phys.rot_mat.x_axis);
+  Vec3A car_forward = rotator_forward(world, car.state.phys.rot_mat.x_axis);
   Vec3A rel_pos = s.phys.pos - car.state.phys.pos;
   Vec3A rel_vel = s.phys.vel - car.state.phys.vel;
   float rel_speed =

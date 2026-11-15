@@ -8,12 +8,72 @@
 
 #include "rsc/math/glibc_atan2_hypot.hpp"
 #include "rsc/math/libm.hpp"
+#ifdef RSC_NATIVE_MATH
+#include "rsc/math/ucrt_math.hpp"
+#endif
 
 namespace {
 
-enum class UnaryFn { Sin, Cos, Acos };
+enum class UnaryFn {
+  Sin,
+  Cos,
+  Acos,
+#ifdef RSC_NATIVE_MATH
+  UcrtSin,
+  UcrtCos,
+  UcrtAcos,
+#endif
+};
 
-enum class BinaryFn { Atan2f, Atan2, Hypot };
+enum class BinaryFn {
+  Atan2f,
+  Atan2,
+  Hypot,
+#ifdef RSC_NATIVE_MATH
+  UcrtAtan2f,
+  UcrtPowf,
+#endif
+};
+
+RS_HD float port_unary(UnaryFn fn, float x) {
+  switch (fn) {
+  case UnaryFn::Sin:
+    return rsc::sinf_glibc(x);
+  case UnaryFn::Cos:
+    return rsc::cosf_glibc(x);
+  case UnaryFn::Acos:
+    return rsc::acosf_glibc(x);
+#ifdef RSC_NATIVE_MATH
+  case UnaryFn::UcrtSin:
+    return rsc::sinf_ucrt(x);
+  case UnaryFn::UcrtCos:
+    return rsc::cosf_ucrt(x);
+  case UnaryFn::UcrtAcos:
+    return rsc::ucrt_acosf(x);
+#endif
+  }
+  return 0.0f;
+}
+
+RS_HD uint64_t port_binary(BinaryFn fn, float y, float x) {
+  switch (fn) {
+  case BinaryFn::Atan2f:
+    return rsc::f32_to_u32(rsc::atan2f_glibc(y, x));
+  case BinaryFn::Atan2:
+    return rsc::f64_to_u64(
+        rsc::atan2_glibc(static_cast<double>(y), static_cast<double>(x)));
+  case BinaryFn::Hypot:
+    return rsc::f64_to_u64(
+        rsc::hypot_glibc(static_cast<double>(y), static_cast<double>(x)));
+#ifdef RSC_NATIVE_MATH
+  case BinaryFn::UcrtAtan2f:
+    return rsc::f32_to_u32(rsc::ucrt_atan2f(y, x));
+  case BinaryFn::UcrtPowf:
+    return rsc::f32_to_u32(rsc::ucrt_powf(y, x));
+#endif
+  }
+  return 0;
+}
 
 constexpr uint64_t k_chunk = 1ULL << 24;
 
@@ -32,19 +92,7 @@ __global__ void unary_kernel(UnaryFn fn, uint64_t base, uint64_t count,
     return;
   }
   float x = rsc::u32_to_f32(static_cast<uint32_t>(base + idx));
-  float r = 0.0f;
-  switch (fn) {
-  case UnaryFn::Sin:
-    r = rsc::sinf_glibc(x);
-    break;
-  case UnaryFn::Cos:
-    r = rsc::cosf_glibc(x);
-    break;
-  case UnaryFn::Acos:
-    r = rsc::acosf_glibc(x);
-    break;
-  }
-  out[idx] = rsc::f32_to_u32(r);
+  out[idx] = rsc::f32_to_u32(port_unary(fn, x));
 }
 
 __global__ void binary_kernel(BinaryFn fn, const uint32_t *ys,
@@ -54,21 +102,8 @@ __global__ void binary_kernel(BinaryFn fn, const uint32_t *ys,
   if (idx >= count) {
     return;
   }
-  float y = rsc::u32_to_f32(ys[idx]);
-  float x = rsc::u32_to_f32(xs[idx]);
-  switch (fn) {
-  case BinaryFn::Atan2f:
-    out[idx] = rsc::f32_to_u32(rsc::atan2f_glibc(y, x));
-    break;
-  case BinaryFn::Atan2:
-    out[idx] = rsc::f64_to_u64(
-        rsc::atan2_glibc(static_cast<double>(y), static_cast<double>(x)));
-    break;
-  case BinaryFn::Hypot:
-    out[idx] = rsc::f64_to_u64(
-        rsc::hypot_glibc(static_cast<double>(y), static_cast<double>(x)));
-    break;
-  }
+  out[idx] =
+      port_binary(fn, rsc::u32_to_f32(ys[idx]), rsc::u32_to_f32(xs[idx]));
 }
 
 bool is_nan_bits32(uint32_t u) { return (u & 0x7fffffffu) > 0x7f800000u; }
@@ -85,18 +120,12 @@ uint32_t host_ref_unary(UnaryFn fn, float x) {
     return rsc::f32_to_u32(::cosf(x));
   case UnaryFn::Acos:
     return rsc::f32_to_u32(::acosf(x));
-  }
-  return 0;
-}
-
-uint32_t host_port_unary(UnaryFn fn, float x) {
-  switch (fn) {
-  case UnaryFn::Sin:
-    return rsc::f32_to_u32(rsc::sinf_glibc(x));
-  case UnaryFn::Cos:
-    return rsc::f32_to_u32(rsc::cosf_glibc(x));
-  case UnaryFn::Acos:
-    return rsc::f32_to_u32(rsc::acosf_glibc(x));
+#ifdef RSC_NATIVE_MATH
+  case UnaryFn::UcrtSin:
+  case UnaryFn::UcrtCos:
+  case UnaryFn::UcrtAcos:
+    return rsc::f32_to_u32(port_unary(fn, x));
+#endif
   }
   return 0;
 }
@@ -111,20 +140,11 @@ uint64_t host_ref_binary(BinaryFn fn, float y, float x) {
   case BinaryFn::Hypot:
     return rsc::f64_to_u64(
         ::hypot(static_cast<double>(y), static_cast<double>(x)));
-  }
-  return 0;
-}
-
-uint64_t host_port_binary(BinaryFn fn, float y, float x) {
-  switch (fn) {
-  case BinaryFn::Atan2f:
-    return rsc::f32_to_u32(rsc::atan2f_glibc(y, x));
-  case BinaryFn::Atan2:
-    return rsc::f64_to_u64(
-        rsc::atan2_glibc(static_cast<double>(y), static_cast<double>(x)));
-  case BinaryFn::Hypot:
-    return rsc::f64_to_u64(
-        rsc::hypot_glibc(static_cast<double>(y), static_cast<double>(x)));
+#ifdef RSC_NATIVE_MATH
+  case BinaryFn::UcrtAtan2f:
+  case BinaryFn::UcrtPowf:
+    return port_binary(fn, y, x);
+#endif
   }
   return 0;
 }
@@ -152,7 +172,7 @@ bool same_bits(uint64_t a, uint64_t b, bool wide, Tally &tally) {
 
 bool report(const char *name, const Tally &tally) {
   bool pass = tally.device_mismatch == 0 && tally.host_mismatch == 0;
-  std::printf("%-8s %-4s tested=%llu device_mismatch=%llu host_mismatch=%llu "
+  std::printf("%-11s %-4s tested=%llu device_mismatch=%llu host_mismatch=%llu "
               "nan_payload_diff=%llu\n",
               name, pass ? "PASS" : "FAIL",
               static_cast<unsigned long long>(tally.tested),
@@ -180,7 +200,7 @@ bool check_unary(UnaryFn fn, const char *name, uint64_t limit) {
       uint32_t bits = static_cast<uint32_t>(base + i);
       float x = rsc::u32_to_f32(bits);
       uint32_t ref = host_ref_unary(fn, x);
-      uint32_t port = host_port_unary(fn, x);
+      uint32_t port = rsc::f32_to_u32(port_unary(fn, x));
       bool dev_ok = same_bits(h_out[i], ref, false, tally);
       bool host_ok = same_bits(port, ref, false, tally);
       tally.device_mismatch += dev_ok ? 0 : 1;
@@ -242,7 +262,7 @@ bool check_binary(BinaryFn fn, const char *name, uint64_t samples,
   std::vector<uint32_t> ys(k_chunk);
   std::vector<uint32_t> xs(k_chunk);
   std::vector<uint64_t> h_out(k_chunk);
-  bool wide = fn != BinaryFn::Atan2f;
+  bool wide = fn == BinaryFn::Atan2 || fn == BinaryFn::Hypot;
   Tally tally;
   uint64_t printed = 0;
   uint64_t state = seed;
@@ -269,7 +289,7 @@ bool check_binary(BinaryFn fn, const char *name, uint64_t samples,
       float y = rsc::u32_to_f32(ys[i]);
       float x = rsc::u32_to_f32(xs[i]);
       uint64_t ref = host_ref_binary(fn, y, x);
-      uint64_t port = host_port_binary(fn, y, x);
+      uint64_t port = port_binary(fn, y, x);
       bool dev_ok = same_bits(h_out[i], ref, wide, tally);
       bool host_ok = same_bits(port, ref, wide, tally);
       tally.device_mismatch += dev_ok ? 0 : 1;
@@ -325,6 +345,13 @@ int main(int argc, char **argv) {
   pass &= check_binary(BinaryFn::Atan2f, "atan2f", binary_samples, 1);
   pass &= check_binary(BinaryFn::Atan2, "atan2", binary_samples, 2);
   pass &= check_binary(BinaryFn::Hypot, "hypot", binary_samples, 3);
+#ifdef RSC_NATIVE_MATH
+  pass &= check_unary(UnaryFn::UcrtSin, "ucrt_sinf", unary_limit);
+  pass &= check_unary(UnaryFn::UcrtCos, "ucrt_cosf", unary_limit);
+  pass &= check_unary(UnaryFn::UcrtAcos, "ucrt_acosf", unary_limit);
+  pass &= check_binary(BinaryFn::UcrtAtan2f, "ucrt_atan2f", binary_samples, 4);
+  pass &= check_binary(BinaryFn::UcrtPowf, "ucrt_powf", binary_samples, 5);
+#endif
   std::printf("LIBM %s\n", pass ? "PASS" : "FAIL");
   return pass ? 0 : 1;
 }

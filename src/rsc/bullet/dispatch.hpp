@@ -234,7 +234,7 @@ struct PairSetup {
 inline constexpr uint32_t k_max_gate_jobs = 16;
 inline constexpr uint32_t k_max_gate_triangles = 256;
 
-enum class GateTarget : uint8_t { Plane, Mesh, Hull };
+enum class GateTarget : uint8_t { Plane, Mesh, Leader };
 
 struct GateJob {
   uint32_t pair;
@@ -375,6 +375,10 @@ RS_HD void finish_pair(World &w, uint32_t rb0_idx, uint32_t rb1_idx,
   int active_idx;
   if (cached_idx >= 0) {
     PersistentManifold &m = w.a->manifolds[cached_idx];
+    if (m.num_points == 0 && !has_fresh) {
+      push_active(w, cached_idx);
+      return;
+    }
     if (m.num_points != 0) {
       m.refresh_contact_points(w.body(m.body0_idx), w.body(m.body1_idx));
     }
@@ -404,27 +408,24 @@ RS_HD void finish_pair(World &w, uint32_t rb0_idx, uint32_t rb1_idx,
   push_active(w, active_idx);
 }
 
-template <typename Callback>
-RS_HD void dispatch_plan_pairs(const World &w, Callback &callback,
-                               uint32_t first, uint32_t stride) {
-  PairPlan *plans = callback.pair_plans();
-  for (uint32_t i = first; i < w.a->num_pairs; i += stride) {
-    BroadphasePair pair = w.a->pairs[i];
-    plans[i] = plan_pair(w, w.proxy(pair.proxy0), w.proxy(pair.proxy1)).plan;
-  }
-}
-
-RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
+RS_HD void gate_job_setup(const World &w, uint32_t pair_idx,
+                          const PairSetup &setup, GateJob &job) {
   job.pair = pair_idx;
   BroadphasePair pair = w.a->pairs[pair_idx];
   const BroadphaseProxy &proxy0 = w.proxy(pair.proxy0);
   const BroadphaseProxy &proxy1 = w.proxy(pair.proxy1);
-  PairSetup setup = plan_pair(w, proxy0, proxy1);
   const RigidBody &rb0 = w.body(proxy0.client_obj_idx);
   const RigidBody &rb1 = w.body(proxy1.client_obj_idx);
+  job.compound_side = setup.compound_side;
+  job.params.box_trans = setup.child_world;
+#ifdef RSC_BOX_TRIANGLE_GJK
+  const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
+  job.target = other.shape.kind == ShapeKind::StaticPlane ? GateTarget::Plane
+                                                          : GateTarget::Leader;
+#else
   const RigidBody &compound_obj = setup.compound_side == 0 ? rb0 : rb1;
   const RigidBody &other = setup.compound_side == 0 ? rb1 : rb0;
-  job.target = other.shape.kind == ShapeKind::ConvexHull ? GateTarget::Hull
+  job.target = other.shape.kind == ShapeKind::ConvexHull ? GateTarget::Leader
                                                          : GateTarget::Plane;
   if (other.shape.kind == ShapeKind::TriangleMesh) {
     job.target = GateTarget::Mesh;
@@ -437,8 +438,8 @@ RS_HD void gate_job_setup(const World &w, uint32_t pair_idx, GateJob &job) {
     job.bvh = &mesh.bvh;
     job.memo_owner = compound_obj.world_array_idx - w.num_static();
     job.memo_mesh = other.shape.mesh.mesh_idx;
-    job.compound_side = setup.compound_side;
   }
+#endif
 }
 
 RS_HD void gate_collect_job_serial(GateJob &job, uint32_t job_idx,
@@ -507,7 +508,7 @@ RS_HD void dispatch_compute_jobs(const World &w, Callback &callback,
   const GateItems &items = callback.gate_items();
   for (uint32_t j = first; j < num_jobs; j += stride) {
     GateJob &job = jobs[j];
-    if (job.target == GateTarget::Hull) {
+    if (job.target == GateTarget::Leader) {
       job.computed = false;
       continue;
     }
@@ -532,9 +533,10 @@ RS_HD void dispatch_compute_jobs(const World &w, Callback &callback,
       }
       job.has_fresh = builder.finish(job.fresh);
     } else {
-      job.has_fresh =
-          gate_narrowphase(w, proxy0, proxy1, plan_pair(w, proxy0, proxy1),
-                           job_callback, job.fresh);
+      job.has_fresh = gate_narrowphase(
+          w, proxy0, proxy1,
+          {PairPlan::Gate, job.compound_side, job.params.box_trans},
+          job_callback, job.fresh);
     }
     job.computed = !callback.job_overflowed(j);
   }

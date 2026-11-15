@@ -20,6 +20,15 @@ RS_HD RotMat to_public(const rsc::Mat3A &m) {
   return {to_public(m.x_axis), to_public(m.y_axis), to_public(m.z_axis)};
 }
 
+RS_HD rsc::Mat3A mat3_to_internal(const Mat3 &m) {
+  return rsc::Mat3A::from_cols(to_internal(m.x_axis), to_internal(m.y_axis),
+                               to_internal(m.z_axis));
+}
+
+RS_HD Mat3 mat3_to_public(const rsc::Mat3A &m) {
+  return {to_public(m.x_axis), to_public(m.y_axis), to_public(m.z_axis)};
+}
+
 RS_HD rsc::GameMode to_internal(GameMode m) {
   return static_cast<rsc::GameMode>(static_cast<uint8_t>(m));
 }
@@ -200,6 +209,8 @@ RS_HD rsc::BallState to_internal(const BallState &b) {
                b.ds_info.y_target_dir, b.ds_info.has_last_damage_tick,
                b.ds_info.last_damage_tick};
   r.tick_count_since_kickoff = b.tick_count_since_kickoff;
+  r.activation_state = static_cast<rsc::ActivationState>(b.activation_state);
+  r.deactivation_time = b.deactivation_time;
   return r;
 }
 
@@ -212,6 +223,8 @@ RS_HD BallState to_public(const rsc::BallState &r) {
                r.ds_info.y_target_dir, r.ds_info.has_last_damage_tick,
                r.ds_info.last_damage_tick};
   b.tick_count_since_kickoff = r.tick_count_since_kickoff;
+  b.activation_state = static_cast<ActivationState>(r.activation_state);
+  b.deactivation_time = r.deactivation_time;
   return b;
 }
 

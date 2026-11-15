@@ -10,6 +10,8 @@ struct StepScratch;
 
 namespace rocketsim_cuda {
 
+inline constexpr int k_step_code_alignment = 64;
+
 void step_arena(const rsc::ArenaStatic &view, rsc::Arena &arena,
                 rsc::StepScratch &scratch, uint32_t ticks);
 

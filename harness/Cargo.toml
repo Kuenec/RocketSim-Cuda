@@ -6,9 +6,13 @@ publish = false
 
 [dependencies]
 glam = "0.34"
-rocketsim = { git = "https://github.com/ZealanL/RocketSim", tag = "v0.3.5", features = ["serde"] }
-rocketsim_test = { git = "https://github.com/ZealanL/RocketSim", tag = "v0.3.5" }
+rocketsim = { git = "https://github.com/ZealanL/RocketSim", tag = "v0.3.6", features = ["serde"] }
+rocketsim_test = { git = "https://github.com/ZealanL/RocketSim", tag = "v0.3.6" }
 serde = { version = "1", features = ["derive"] }
+
+[features]
+native-math = ["rocketsim/native-math"]
+box-triangle-gjk = ["rocketsim/box-triangle-gjk"]
 
 [profile.release]
 debug = true
