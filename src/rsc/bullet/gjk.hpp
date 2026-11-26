@@ -718,78 +718,87 @@ struct Gjk {
     return status;
   }
 
+  RS_HD bool tetrahedron_encloses_origin(int si) {
+    Vec3A w3 = store[simplices[si].c[3]].w;
+    float d =
+        det(store[simplices[si].c[0]].w - w3, store[simplices[si].c[1]].w - w3,
+            store[simplices[si].c[2]].w - w3);
+    return abs_f32(d) > 0.0f;
+  }
+
+  template <bool Margin> RS_HD bool enclose_origin_from_triangle(int si) {
+    Vec3A w0 = store[simplices[si].c[0]].w;
+    Vec3A n = (store[simplices[si].c[1]].w - w0)
+                  .cross(store[simplices[si].c[2]].w - w0);
+    if (n.length_squared() > 0.0f) {
+      append_vertex<Margin>(si, n);
+      if (tetrahedron_encloses_origin(si)) {
+        return true;
+      }
+      remove_vertex(si);
+      append_vertex<Margin>(si, -n);
+      if (tetrahedron_encloses_origin(si)) {
+        return true;
+      }
+      remove_vertex(si);
+    }
+    return false;
+  }
+
+  template <bool Margin> RS_HD bool enclose_origin_from_segment(int si) {
+    Vec3A d = store[simplices[si].c[1]].w - store[simplices[si].c[0]].w;
+    for (int i = 0; i < 3; ++i) {
+      Vec3A axis = Vec3A::zero();
+      axis[i] = 1.0f;
+      Vec3A pp = d.cross(axis);
+      if (pp.length_squared() > 0.0f) {
+        append_vertex<Margin>(si, pp);
+        if (enclose_origin_from_triangle<Margin>(si)) {
+          return true;
+        }
+        remove_vertex(si);
+        append_vertex<Margin>(si, -pp);
+        if (enclose_origin_from_triangle<Margin>(si)) {
+          return true;
+        }
+        remove_vertex(si);
+      }
+    }
+    return false;
+  }
+
+  template <bool Margin> RS_HD bool enclose_origin_from_point(int si) {
+    for (int i = 0; i < 3; ++i) {
+      Vec3A axis = Vec3A::zero();
+      axis[i] = 1.0f;
+      append_vertex<Margin>(si, axis);
+      if (enclose_origin_from_segment<Margin>(si)) {
+        return true;
+      }
+      remove_vertex(si);
+      append_vertex<Margin>(si, -axis);
+      if (enclose_origin_from_segment<Margin>(si)) {
+        return true;
+      }
+      remove_vertex(si);
+    }
+    return false;
+  }
+
   template <bool Margin> RS_HD bool enclose_origin() {
     int si = simplex_idx;
     switch (simplices[si].rank) {
     case 1:
-      for (int i = 0; i < 3; ++i) {
-        Vec3A axis = Vec3A::zero();
-        axis[i] = 1.0f;
-        append_vertex<Margin>(si, axis);
-        if (enclose_origin<Margin>()) {
-          return true;
-        }
-        remove_vertex(si);
-        append_vertex<Margin>(si, -axis);
-        if (enclose_origin<Margin>()) {
-          return true;
-        }
-        remove_vertex(si);
-      }
-      break;
-    case 2: {
-      Vec3A d = store[simplices[si].c[1]].w - store[simplices[si].c[0]].w;
-      for (int i = 0; i < 3; ++i) {
-        Vec3A axis = Vec3A::zero();
-        axis[i] = 1.0f;
-        Vec3A pp = d.cross(axis);
-        if (pp.length_squared() > 0.0f) {
-          append_vertex<Margin>(si, pp);
-          if (enclose_origin<Margin>()) {
-            return true;
-          }
-          remove_vertex(si);
-          append_vertex<Margin>(si, -pp);
-          if (enclose_origin<Margin>()) {
-            return true;
-          }
-          remove_vertex(si);
-        }
-      }
-      break;
-    }
-    case 3: {
-      Vec3A w0 = store[simplices[si].c[0]].w;
-      Vec3A n = (store[simplices[si].c[1]].w - w0)
-                    .cross(store[simplices[si].c[2]].w - w0);
-      if (n.length_squared() > 0.0f) {
-        append_vertex<Margin>(si, n);
-        if (enclose_origin<Margin>()) {
-          return true;
-        }
-        remove_vertex(si);
-        append_vertex<Margin>(si, -n);
-        if (enclose_origin<Margin>()) {
-          return true;
-        }
-        remove_vertex(si);
-      }
-      break;
-    }
-    case 4: {
-      Vec3A w3 = store[simplices[si].c[3]].w;
-      float d = det(store[simplices[si].c[0]].w - w3,
-                    store[simplices[si].c[1]].w - w3,
-                    store[simplices[si].c[2]].w - w3);
-      if (abs_f32(d) > 0.0f) {
-        return true;
-      }
-      break;
-    }
+      return enclose_origin_from_point<Margin>(si);
+    case 2:
+      return enclose_origin_from_segment<Margin>(si);
+    case 3:
+      return enclose_origin_from_triangle<Margin>(si);
+    case 4:
+      return tetrahedron_encloses_origin(si);
     default:
-      break;
+      return false;
     }
-    return false;
   }
 };
 
